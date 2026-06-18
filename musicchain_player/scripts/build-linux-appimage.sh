@@ -12,6 +12,13 @@
 #   LINUXDEPLOY            Path to linuxdeploy (auto-includes runtime
 #                          libs from /usr). If unset, we skip linuxdeploy
 #                          and just bundle the absolute minimum.
+#   STATIC_RUNTIME         Path to a type2-runtime binary
+#                          (https://github.com/AppImage/type2-runtime/releases).
+#                          When set, appimagetool embeds this instead of
+#                          using the default libfuse2-based runtime, so
+#                          the AppImage runs on hosts that don't have
+#                          libfuse2 installed. This is what the user
+#                          asked for with "self-extracting (static)".
 #   VERSION=0.7            Version stamped into the AppImage name.
 #
 # Usage:
@@ -72,14 +79,32 @@ Terminal=false
 DESKTOP
 cp "$APPDIR/musicchain.desktop" "$APPDIR/usr/share/applications/musicchain.desktop"
 
-# Icon. Use a placeholder if the player doesn't ship one.
-ICON_SRC="assets/icon.png"
-if [ -f "$ICON_SRC" ]; then
-    cp "$ICON_SRC" "$APPDIR/musicchain.png"
-    cp "$ICON_SRC" "$APPDIR/usr/share/icons/hicolor/256x256/apps/musicchain.png"
+# Icon. Probe order:
+#   1. assets/icon.png — preferred location once the player ships a real icon
+#   2. android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png — 192×192,
+#      already in the repo via Android scaffold, reused so we don't have to
+#      hand-author a separate file for the Linux side.
+#   3. embedded 1×1 PNG placeholder so appimagetool / linuxdeploy don't
+#      refuse to build at all.
+#
+# Whichever wins, the file is copied to BOTH the AppDir root (where the
+# .desktop file's Icon= entry resolves) AND to usr/share/icons/hicolor/...
+# (which is where linuxdeploy specifically scans).
+ICON_DEST_HICOLOR="$APPDIR/usr/share/icons/hicolor/256x256/apps/musicchain.png"
+mkdir -p "$(dirname "$ICON_DEST_HICOLOR")"
+if [ -f "assets/icon.png" ]; then
+    ICON_SRC="assets/icon.png"
+elif [ -f "android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" ]; then
+    ICON_SRC="android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
 else
-    # Empty 1×1 PNG so appimagetool doesn't refuse to build.
+    ICON_SRC=""
+fi
+if [ -n "$ICON_SRC" ]; then
+    cp "$ICON_SRC" "$APPDIR/musicchain.png"
+    cp "$ICON_SRC" "$ICON_DEST_HICOLOR"
+else
     printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\xdac\xf8\x00\x00\x00\x01\x00\x01\x5c\xcd\xff\x69\x00\x00\x00\x00IEND\xaeB`\x82' > "$APPDIR/musicchain.png"
+    cp "$APPDIR/musicchain.png" "$ICON_DEST_HICOLOR"
 fi
 
 if [ -n "${LINUXDEPLOY:-}" ] && [ -x "$LINUXDEPLOY" ]; then
@@ -89,5 +114,10 @@ fi
 
 OUTPUT="build/musicchain-player-${VERSION}-x86_64.AppImage"
 echo "[appimage] building $OUTPUT"
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT"
+APPIMAGETOOL_ARGS=("$APPDIR" "$OUTPUT")
+if [ -n "${STATIC_RUNTIME:-}" ] && [ -f "$STATIC_RUNTIME" ]; then
+    echo "[appimage] embedding static runtime $STATIC_RUNTIME (libfuse2-free)"
+    APPIMAGETOOL_ARGS=(--runtime-file "$STATIC_RUNTIME" "${APPIMAGETOOL_ARGS[@]}")
+fi
+ARCH=x86_64 "$APPIMAGETOOL" "${APPIMAGETOOL_ARGS[@]}"
 echo "[done] $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"

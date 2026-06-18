@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(musicchain VERSION 0.1.0 LANGUAGES CXX C)
 
+# Position-independent code globally — required on Linux so the static
+# libwally + librats + secp256k1 archives can be linked into the shared
+# libmusicchain.so. Without this the linker errors with R_X86_64_PC32
+# "can not be used when making a shared object" deep inside libwally's
+# secp256k1 internals. Harmless on Windows (MSVC ignores -fPIC; PE/COFF
+# is position-independent by construction).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -279,12 +287,13 @@ if(NOT MSVC)
   list(APPEND MC_LINK_LIBS Threads::Threads)
 endif()
 
-# cpp-httplib (single-header) for the JSON-RPC HTTP shim. Quiet because
-# vcpkg ships the CONFIG target on Windows but pkg-config on Linux.
-find_package(httplib CONFIG QUIET)
-if(TARGET httplib::httplib)
-  list(APPEND MC_LINK_LIBS httplib::httplib)
-endif()
+# cpp-httplib for the JSON-RPC HTTP shim (eth_chainId / eth_blockNumber /
+# eth_getBalance / etc on 127.0.0.1:8545). Single-header, vendored at
+# deps/cpp-httplib so we don't depend on the distro packaging that
+# variously ships a CONFIG target (vcpkg, Arch), a -dev split (Debian),
+# or nothing at all. The vendored copy is mit-licensed and pinned at
+# yhirose/cpp-httplib v0.15.3.
+list(APPEND MC_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/deps/cpp-httplib)
 
 # libwally-core: Bitcoin/Liquid wallet primitives. Vendored under
 # deps/libwally-core (git clone + secp256k1-zkp submodule). We force a

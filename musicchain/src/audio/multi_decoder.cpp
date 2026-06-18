@@ -107,9 +107,17 @@ DecodedPcm decode_any(const uint8_t* data, size_t len) {
 
     // Set up swresample to push everything to int16 interleaved at the
     // source rate / channel count.
+    //
+    // FFmpeg 5+ replaced the int64 channel-layout mask with an
+    // AVChannelLayout struct and renamed the swresample setup function.
+    // We support both via LIBAVUTIL_VERSION_INT so the same source builds
+    // against Ubuntu 22.04's 4.x and any 5.x/6.x distro packaging.
     SwrContext* swr = nullptr;
+    int nb_channels = 0;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100)
+    nb_channels = cctx->ch_layout.nb_channels;
     AVChannelLayout out_layout;
-    av_channel_layout_default(&out_layout, cctx->ch_layout.nb_channels);
+    av_channel_layout_default(&out_layout, nb_channels);
     if (swr_alloc_set_opts2(&swr,
             &out_layout, AV_SAMPLE_FMT_S16, cctx->sample_rate,
             &cctx->ch_layout, cctx->sample_fmt, cctx->sample_rate,
@@ -119,9 +127,26 @@ DecodedPcm decode_any(const uint8_t* data, size_t len) {
         avformat_close_input(&fmt); av_free(avio->buffer);
         avio_context_free(&avio); return out;
     }
+#else
+    nb_channels = cctx->channels;
+    int64_t in_layout  = cctx->channel_layout
+        ? cctx->channel_layout
+        : av_get_default_channel_layout(nb_channels);
+    int64_t out_layout = in_layout;
+    swr = swr_alloc_set_opts(nullptr,
+            out_layout, AV_SAMPLE_FMT_S16, cctx->sample_rate,
+            in_layout,  cctx->sample_fmt, cctx->sample_rate,
+            0, nullptr);
+    if (!swr || swr_init(swr) < 0) {
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&cctx);
+        avformat_close_input(&fmt); av_free(avio->buffer);
+        avio_context_free(&avio); return out;
+    }
+#endif
 
     out.sample_rate = cctx->sample_rate;
-    out.channels    = cctx->ch_layout.nb_channels;
+    out.channels    = nb_channels;
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame*  frm = av_frame_alloc();

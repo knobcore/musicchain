@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Build ONLY the VPS mini-node on Linux. Lighter than build-node-linux.sh
-# because it skips chromaprint / ffmpeg / libwally — the mini-node is a
-# stateless relay.
+# Build ONLY the VPS mini-node on Linux using system packages (NO vcpkg).
+# The mini-node skips chromaprint / ffmpeg / leveldb / curses entirely —
+# it's a librats relay.
 #
-# Required env vars:
-#   VCPKG_ROOT
+# Run install-deps-debian.sh or install-deps-arch.sh first; this script
+# uses what those install (openssl + base toolchain + json header).
 #
-# Optional:
+# Optional env vars:
 #   CMAKE=cmake
 #   BUILD_DIR=build-linux-mini
 #   OUTPUT_DIR=$BUILD_DIR/Release
@@ -16,7 +16,6 @@
 
 set -euo pipefail
 
-: "${VCPKG_ROOT:?VCPKG_ROOT not set}"
 CMAKE="${CMAKE:-cmake}"
 BUILD_DIR="${BUILD_DIR:-build-linux-mini}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BUILD_DIR/Release}"
@@ -26,8 +25,6 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Strip Windows PATH (mingw/msys64) so find_package doesn't try to use
-# Win32 cmake configs in a Linux build. See build-node-linux.sh comment.
 PATH="$(echo "$PATH" | tr ':' '\n' | grep -vE '^/mnt/c/' | paste -sd: -)"
 export PATH
 unset CMAKE_PREFIX_PATH
@@ -36,8 +33,6 @@ if [ "$CLEAN" = "1" ]; then rm -rf "$BUILD_DIR"; fi
 
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     "$CMAKE" -S . -B "$BUILD_DIR" \
-        -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-        -DVCPKG_TARGET_TRIPLET=x64-linux \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_IGNORE_PATH=/mnt/c/msys64 \
         -DMC_MINI_NODE_ONLY=ON

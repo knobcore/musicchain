@@ -270,9 +270,17 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
             }
         }
         const auto out = hashes_after_locator(locator);
-        json hashes = json::array();
-        for (const auto& h : out) hashes.push_back(crypto::to_hex(h));
-        return {{"hashes", hashes}};
+        // Send the hashes back as a separate block.inv push (NOT in the
+        // reply body — the rats_api reply lane is single-shot and the
+        // requester's BlockPropagator only listens for inbound
+        // musicchain.requests, not replies). Receiver treats the
+        // resulting inv the same as any other live announce.
+        if (!out.empty()) {
+            json inv_body = {{"hashes", json::array()}};
+            for (const auto& h : out) inv_body["hashes"].push_back(crypto::to_hex(h));
+            send_request(peer_id, "block.inv", inv_body);
+        }
+        return json::object();
     }
 
     if (type == "block.inv") {

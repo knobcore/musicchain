@@ -88,6 +88,17 @@ Hash256 BlockHeader::hash() const {
     return crypto::sha256(hdr.data(), hdr.size());
 }
 
+Hash256 BlockHeader::signing_hash() const {
+    // Re-serialize with the confirmations field cleared so producers
+    // and validators can sign a stable hash that doesn't change as more
+    // confirmations accumulate. The on-wire confirmations.size() takes
+    // 2 bytes; with no entries the length encoding is just 0x00 0x00.
+    BlockHeader stripped = *this;
+    stripped.confirmations.clear();
+    auto hdr = stripped.serialize();
+    return crypto::sha256(hdr.data(), hdr.size());
+}
+
 // ---- Block serialization --------------------------------------------
 
 std::vector<uint8_t> Block::serialize() const {

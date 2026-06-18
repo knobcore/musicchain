@@ -927,10 +927,13 @@ bool Chain::rebuild_derived_state() {
         {
             std::set<Hash256> seen_ids;
             uint32_t valid_sigs = 0;
-            const auto block_hash = block->hash();
+            // Sigs were made over signing_hash() (header without
+            // confirmations); the canonical hash() includes them and
+            // would mismatch.
+            const auto sign_hash = block->signing_hash();
             for (const auto& c : block->header.confirmations) {
                 if (!seen_ids.insert(c.validator_id).second) continue;
-                if (crypto::verify_ecdsa(block_hash, c.signature, c.pubkey))
+                if (crypto::verify_ecdsa(sign_hash, c.signature, c.pubkey))
                     ++valid_sigs;
             }
             // h == 1 is the genesis-bootstrap window (solo self-sign was

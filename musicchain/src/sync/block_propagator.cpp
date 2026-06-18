@@ -479,11 +479,16 @@ bool BlockPropagator::ingest_block_bytes(const std::vector<uint8_t>& bytes,
     // saw, so we only verify authenticity here.
     const bool is_genesis = (block.header.prev_hash == Hash256{});
     if (!is_genesis) {
+        // Producer signed block.signing_hash() (header with the
+        // confirmations field cleared); verifier must use the same so
+        // signature verification doesn't fail because the header now
+        // carries the very sigs it's being verified against.
+        const Hash256 sh = block.signing_hash();
         std::set<Hash256> seen;
         uint32_t valid_sigs = 0;
         for (const auto& c : block.header.confirmations) {
             if (!seen.insert(c.validator_id).second) continue;
-            if (crypto::verify_ecdsa(block.hash(), c.signature, c.pubkey))
+            if (crypto::verify_ecdsa(sh, c.signature, c.pubkey))
                 ++valid_sigs;
         }
         if (valid_sigs < 1) {

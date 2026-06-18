@@ -153,8 +153,15 @@ struct BlockHeader {
 
     // Serialise header to bytes (used for hash calculation)
     std::vector<uint8_t> serialize() const;
-    // Compute block hash = SHA256(header bytes)
+    // Compute block hash = SHA256(header bytes including confirmations).
+    // The chain-canonical identifier — used as the leveldb key and what
+    // the inv/getdata protocol references.
     Hash256 hash() const;
+    // SHA256 of the header bytes with confirmations CLEARED. This is
+    // what producers and validators sign; verifiers must use the same
+    // hash so the signature lookup converges regardless of how many
+    // confirmations were appended to the header after signing.
+    Hash256 signing_hash() const;
 };
 
 // ---- Full block -----------------------------------------------------
@@ -171,8 +178,11 @@ struct Block {
     // Parse block from bytes; returns false on malformed input
     static bool deserialize(const uint8_t* data, size_t len, Block& out);
 
-    // Convenience: block hash
-    Hash256 hash() const { return header.hash(); }
+    // Convenience: block hash (full header, used as the canonical id)
+    Hash256 hash()         const { return header.hash(); }
+    // Convenience: signing hash (header with confirmations cleared) —
+    // see BlockHeader::signing_hash docstring for why this is separate.
+    Hash256 signing_hash() const { return header.signing_hash(); }
 
     // Compute merkle root over transactions
     static Hash256 compute_merkle_root(const std::vector<std::vector<uint8_t>>& txs);

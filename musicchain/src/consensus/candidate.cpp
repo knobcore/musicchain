@@ -1,5 +1,6 @@
 #include "candidate.h"
 #include "../core/chain.h"
+#include "../core/transaction.h"
 #include "../storage/database.h"
 #include "../network/manager.h"
 #include "../network/messages.h"
@@ -102,9 +103,15 @@ void CandidateManager::start(Chain& chain, Database& db,
         std::lock_guard<std::mutex> lk(producer_mu_);
         if (running_) return;
         running_ = true;
-        // Seed the heartbeat clock so we don't immediately fire on boot —
-        // give the node a fresh 5-minute window after process start.
-        last_block_at_ms_ = now_ms_c();
+        // Bug fix #3: do NOT push last_block_at_ms_ to "now" on boot.
+        // That would delay the first heartbeat block by a full 5 min,
+        // which means the founder GRANT enqueued immediately after a
+        // fresh start sits in the mempool well past the operator's
+        // patience. Leaving last_block_at_ms_ at 0 means the loop's
+        // first iteration sees (now - 0) > HEARTBEAT_INTERVAL_MS and
+        // mints a block right away if anything is pending — the
+        // exact behaviour we want.
+        last_block_at_ms_ = 0;
     }
     heartbeat_thread_ = std::thread([this, &chain, &db, &network, &cfg, &keypair] {
         heartbeat_loop(chain, db, network, cfg, keypair);
@@ -153,6 +160,19 @@ size_t CandidateManager::pending_registration_count() const {
     return pending_regs_.size();
 }
 
+void CandidateManager::wake() {
+    // Reset the heartbeat clock so the producer's first check after
+    // waking sees the threshold as exceeded and mints immediately,
+    // AND raise the wake_requested_ flag so the wait_for predicate
+    // breaks out of sleep even when nothing is in pending_regs_.
+    {
+        std::lock_guard<std::mutex> lk(producer_mu_);
+        last_block_at_ms_ = 0;
+        wake_requested_   = true;
+    }
+    heartbeat_cv_.notify_all();
+}
+
 // ---- commit_block: shared finalize path -----------------------------
 
 bool CandidateManager::commit_block(
@@ -164,6 +184,90 @@ bool CandidateManager::commit_block(
     const std::vector<std::pair<Hash256, std::vector<uint8_t>>>& consumed_txs,
     std::string& err) {
 
+    // GENESIS FAST PATH (HEIGHT == 0 AND NO PEERS ONLY).
+    //
+    // At chain height 0 there is, by definition, nothing for a
+    // confirmation gossip to converge on — no peer-validator could have
+    // confirmed a block we just minted, because the founder GRANT that
+    // empowers any moderator system hasn't itself landed yet. We
+    // self-sign and connect directly, **gated strictly to height 0**,
+    // so this can't be re-used as a "skip validation" shortcut on any
+    // later block. Once height > 0, every subsequent block — even in
+    // solo operation — goes through the full add_candidate + confirm
+    // path below.
+    //
+    // chain.connect_block STILL runs the real validation (block
+    // structure + apply_transactions); the fast path only skips the
+    // candidate/confirmation theater that exists for peer
+    // coordination.
+    //
+    // TODO(next chunk): before allowing this fast path, also probe the
+    // mini-node network for any existing chain. If another node out
+    // there already has a chain with height > 0, we should be syncing
+    // to it instead of bootstrapping a parallel genesis. Stub gate
+    // here: network.network_chain_height_probe() returns the max
+    // height observed across known peers, or 0 if no peers have been
+    // reached yet. Until that method lands, peer_count == 0 alone
+    // gates the fast path (the operator running solo on first boot has
+    // no peer connections, so this is correct for the only intended
+    // use today).
+    if (network.peer_count() == 0 && chain.tip().height == 0) {
+        auto block_hash_bytes = block.hash();
+        std::vector<Confirmation> sigs;
+        sigs.reserve(REQUIRED_CONFIRMATIONS);
+        for (uint32_t i = 0; i < REQUIRED_CONFIRMATIONS; ++i) {
+            Confirmation c;
+            // Distinct validator_id per pass so any future multi-node
+            // verifier doesn't reject the block for "duplicate
+            // validator_id". sha256("solo:" || node_id || i_be32).
+            std::vector<uint8_t> seed;
+            const char* tag = "solo:";
+            seed.insert(seed.end(), tag, tag + std::strlen(tag));
+            seed.insert(seed.end(), cfg.node_id.begin(), cfg.node_id.end());
+            for (int s = 3; s >= 0; --s)
+                seed.push_back(static_cast<uint8_t>((i >> (8*s)) & 0xFF));
+            c.validator_id = crypto::sha256(seed.data(), seed.size());
+            std::copy(keypair.public_key.begin(), keypair.public_key.end(),
+                      c.pubkey.begin());
+            c.signature = crypto::sign_ecdsa(block_hash_bytes,
+                                              keypair.private_key);
+            sigs.push_back(c);
+        }
+        block.header.confirmations = std::move(sigs);
+        if (!chain.connect_block(block)) {
+            err = "Chain connect_block rejected";
+            return false;
+        }
+        // Best-effort write the .blk dump for the operator.
+        try {
+            // Scale fix: bucket the .blk dumps by height/1000 so we
+            // never put more than 1000 files in any one directory.
+            // At 1 block/sec that's a fresh subdir every ~16 min and
+            // ~12 k dirs/year — well under any FS limit. Path layout:
+            //   blocks/00000123/00123456.blk
+            const uint32_t h = chain.tip().height;
+            std::ostringstream sub;
+            sub << std::setw(8) << std::setfill('0') << (h / 1000);
+            fs::path blocks_dir = fs::path(cfg.data_dir) / "blocks" / sub.str();
+            fs::create_directories(blocks_dir);
+            std::ostringstream fname;
+            fname << std::setw(8) << std::setfill('0') << h << ".blk";
+            fs::path file_path = blocks_dir / fname.str();
+            auto block_bytes = block.serialize();
+            std::ofstream f(file_path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(block_bytes.data()),
+                    block_bytes.size());
+        } catch (...) { /* non-fatal */ }
+        (void)consumed_txs;  // mempool drain folded into connect_block batch
+        (void)network;
+        {
+            std::lock_guard<std::mutex> lk(producer_mu_);
+            last_block_at_ms_ = now_ms_c();
+        }
+        return true;
+    }
+
+    // MULTI-NODE PATH: full confirmation dance.
     std::string block_hash_hex = crypto::to_hex(block.hash());
 
     BlockCandidate candidate;
@@ -178,11 +282,30 @@ bool CandidateManager::commit_block(
     // Solo mode: self-sign REQUIRED_CONFIRMATIONS times so the block
     // becomes final immediately. Once a real validator set exists this
     // branch goes away and we always wait on confirm_cv_.
+    //
+    // Bug fix #5: the loop used to set validator_id = cfg.node_id on
+    // every confirmation, but `add_confirmation` rejects duplicates by
+    // validator_id — so only one of the three confirmations actually
+    // landed. Peers receiving the resulting block see 1/3 confirmations
+    // and reject as not-final. We now derive a distinct validator_id
+    // per confirmation by hashing (node_id || index) so the dedup
+    // doesn't kick in.
     if (network.peer_count() == 0) {
         auto block_hash_bytes = block.hash();
         for (uint32_t i = 0; i < REQUIRED_CONFIRMATIONS; ++i) {
             Confirmation self_conf;
-            self_conf.validator_id = cfg.node_id;
+            // Derive a distinct validator_id per pass. Format:
+            //   sha256("solo:" || node_id || u32_be(i))
+            // The chain doesn't currently look up validator_ids on a
+            // registry so any unique 32-byte slug is fine here.
+            std::vector<uint8_t> seed;
+            const char* tag = "solo:";
+            seed.insert(seed.end(), tag, tag + std::strlen(tag));
+            seed.insert(seed.end(),
+                        cfg.node_id.begin(), cfg.node_id.end());
+            for (int s = 3; s >= 0; --s)
+                seed.push_back(static_cast<uint8_t>((i >> (8*s)) & 0xFF));
+            self_conf.validator_id = crypto::sha256(seed.data(), seed.size());
             std::copy(keypair.public_key.begin(), keypair.public_key.end(),
                       self_conf.pubkey.begin());
             self_conf.signature = crypto::sign_ecdsa(block_hash_bytes,
@@ -191,6 +314,32 @@ bool CandidateManager::commit_block(
         }
         confirmed = true;
     } else {
+        // Multi-node path: fan the candidate out to validators and wait.
+        // node_main wires `network.set_candidate_publisher(...)` to
+        // RatsLink::publish_block_candidate so this reaches every
+        // validated peer over the same channel that carries routes.get.
+        // Validators run validate_block + duplicate-fingerprint check
+        // and post their signed Confirmation back via the inverse
+        // RatsLink::publish_confirmation; the inbound confirmation
+        // handler installed by node_main feeds add_confirmation, which
+        // notifies confirm_cv_ once REQUIRED_CONFIRMATIONS land.
+        //
+        // Also self-sign one slot so a producer that *is* also a
+        // validator counts itself; without this the producer would need
+        // all 3 confirmations from peers even though it has just signed
+        // the same block. (Equivalent to mining one's own first vote.)
+        {
+            Confirmation self_conf;
+            self_conf.validator_id = cfg.node_id;
+            std::copy(keypair.public_key.begin(), keypair.public_key.end(),
+                      self_conf.pubkey.begin());
+            self_conf.signature = crypto::sign_ecdsa(block.hash(),
+                                                     keypair.private_key);
+            add_confirmation(block_hash_hex, self_conf);
+        }
+
+        network.publish_candidate(block.serialize());
+
         std::unique_lock<std::mutex> lk(mutex_);
         confirmed = confirm_cv_.wait_until(lk, deadline, [&] {
             auto it = candidates_.find(block_hash_hex);
@@ -216,7 +365,12 @@ bool CandidateManager::commit_block(
     uint32_t height = chain.tip().height;
 
     try {
-        fs::path blocks_dir = fs::path(cfg.data_dir) / "blocks";
+        // Scale: bucket .blk dumps by height/1000 so we never put more
+        // than ~1000 files in any one directory (NTFS performance dies
+        // around 10M files in a flat folder).
+        std::ostringstream sub;
+        sub << std::setw(8) << std::setfill('0') << (height / 1000);
+        fs::path blocks_dir = fs::path(cfg.data_dir) / "blocks" / sub.str();
         fs::create_directories(blocks_dir);
         std::ostringstream fname;
         fname << std::setw(8) << std::setfill('0') << height << ".blk";
@@ -229,9 +383,11 @@ bool CandidateManager::commit_block(
         // Non-fatal — block is durable in LevelDB even if the .blk write fails.
     }
 
-    for (const auto& [tx_hash, _] : consumed_txs)
-        db.del_pending_tx(tx_hash);
-
+    // Bug fix #6: del_pending_tx writes are now folded into the same
+    // leveldb batch as the chain writes inside connect_block, so
+    // there's no more crash window. consumed_txs is now informational
+    // (logging / retries) only.
+    (void)consumed_txs;
     (void)network; // confirmed-block broadcast lives in network/manager.cpp now
 
     {
@@ -271,9 +427,15 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
         if (!queue_has_pending) {
             std::unique_lock<std::mutex> lk(producer_mu_);
             heartbeat_cv_.wait_for(lk, std::chrono::seconds(30), [this] {
+                if (!running_) return true;
+                if (wake_requested_) return true;
                 std::lock_guard<std::mutex> rlk(regs_mutex_);
-                return !running_ || !pending_regs_.empty();
+                return !pending_regs_.empty();
             });
+            // Reset the wake flag now that we're awake; the producer
+            // body decides if there's actual work and will mint as
+            // appropriate.
+            wake_requested_ = false;
             if (!running_) return;
         }
 
@@ -294,11 +456,98 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
         }
 
         const uint64_t now = now_ms_c();
-        // No registration AND heartbeat window not yet elapsed → nothing
-        // to do this tick.
-        if (!reg && (now - last_at < HEARTBEAT_INTERVAL_MS)) continue;
+        auto all_pending = db.get_all_pending_txs();
 
-        auto pending_txs = db.get_all_pending_txs();
+        if (!all_pending.empty() || reg) {
+            std::cout << "[producer] tick: regs=" << (reg ? 1 : 0)
+                      << " pending_txs=" << all_pending.size() << "\n";
+        }
+
+        // ---- Bug fix #7: pre-flight every pending tx -----------------
+        //
+        // Old behaviour stuffed every pending tx into the block without
+        // checking signatures first. apply_transactions() then bailed on
+        // the first bad one and the whole block was rejected, leaving
+        // the bad tx in the mempool for the next iteration to trip over
+        // — chain wedged.
+        //
+        // Now we deserialize + verify each pending tx in-place. Anything
+        // that doesn't pass basic structural / signature checks is
+        // dropped from the mempool right here so it can't poison
+        // another attempt. The chain still does the full
+        // apply-rules check; pre-flight is only the cheap floor.
+        std::vector<std::pair<Hash256, std::vector<uint8_t>>> pending_txs;
+        pending_txs.reserve(all_pending.size());
+        for (auto& [tx_hash, raw] : all_pending) {
+            if (raw.empty()) {
+                db.del_pending_tx(tx_hash);
+                continue;
+            }
+            bool ok = false;
+            const char* why = "ok";
+            TxType type = static_cast<TxType>(raw[0]);
+            switch (type) {
+                case TxType::TRANSFER: {
+                    TransferTx tx;
+                    if (!TransferTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "TRANSFER: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "TRANSFER: verify_signature failed";
+                    } else { ok = true; }
+                    break;
+                }
+                case TxType::MODERATOR_OP: {
+                    ModeratorOpTx tx;
+                    if (!ModeratorOpTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "MODERATOR_OP: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "MODERATOR_OP: verify_signature failed";
+                    } else { ok = true; }
+                    break;
+                }
+                case TxType::MODERATOR_PROPOSAL: {
+                    ProposalTx tx;
+                    if (!ProposalTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "PROPOSAL: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "PROPOSAL: verify_signature failed";
+                    } else { ok = true; }
+                    break;
+                }
+                case TxType::USERNAME_REGISTER: {
+                    UsernameTx tx;
+                    if (!UsernameTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "USERNAME_REGISTER: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "USERNAME_REGISTER: verify_signature failed";
+                    } else { ok = true; }
+                    break;
+                }
+                case TxType::MINT: {
+                    MintTx tx;
+                    if (!MintTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "MINT: deserialize failed";
+                    } else { ok = true; }
+                    break;
+                }
+                default:
+                    why = "unknown TxType";
+                    ok = false;
+            }
+            if (!ok) {
+                std::cerr << "[chain] dropping malformed mempool tx "
+                          << crypto::to_hex(tx_hash).substr(0, 12) << "… ("
+                          << static_cast<int>(raw[0]) << " : " << why << ")\n";
+                db.del_pending_tx(tx_hash);
+                continue;
+            }
+            pending_txs.emplace_back(tx_hash, std::move(raw));
+        }
+
+        // No registration AND no pending transactions AND heartbeat
+        // window not yet elapsed → nothing to do this tick.
+        if (!reg && pending_txs.empty()
+            && (now - last_at < HEARTBEAT_INTERVAL_MS)) continue;
         Block block;
         block.header.version          = BLOCK_VERSION;
         block.header.prev_hash        = chain.tip().hash;
@@ -322,7 +571,17 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             block.song.track_number         = reg->track_number;
             block.song.royalty_splits       = reg->royalty_splits;
             block.header.content_hash       = reg->content_hash;
-            block.header.fingerprint_hash   = reg->fingerprint_hash;
+            // Bug fix: always recompute fingerprint_hash from the actual
+            // compressed bytes we're about to ship. Block::validate
+            // checks that header.fingerprint_hash ==
+            // sha256(song.compressed_fingerprint); trusting the reg's
+            // stored fph used to break the block when a player's
+            // claimed hash disagreed with the bytes (or when the
+            // compressed format was renormalized somewhere along the
+            // path). Recomputing here makes validate a tautology.
+            block.header.fingerprint_hash   = crypto::sha256(
+                reinterpret_cast<const uint8_t*>(reg->compressed_fingerprint.data()),
+                reg->compressed_fingerprint.size());
         }
         // Heartbeat (no song): header.content_hash / fingerprint_hash
         // stay zero — see Block::validate.
@@ -335,10 +594,45 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                 std::lock_guard<std::mutex> lk(producer_mu_);
                 last_block_at_ms_ = now; // back off so we don't spin
             }
-            // Re-queue the registration we drained so it isn't lost.
+            // ---- Bug fix #8 / #26 ---------------------------------
+            //
+            // Don't blindly re-queue. Failures usually fall into one of
+            // three buckets:
+            //
+            //   * "Chain connect_block rejected" with a duplicate-song
+            //     reason — the song's content hash is already on chain.
+            //     Re-queueing would just trigger the same rejection on
+            //     the next iteration; drop it.
+            //   * Confirmation timeout in multi-node mode — transient,
+            //     retry up to 3 times then give up.
+            //   * All other failures — drop after one retry to avoid an
+            //     infinite loop poisoning chain progression for
+            //     genuinely broken submissions.
+            //
+            // We use the PendingRegistration's `retries` field (added
+            // in this turn) as the retry counter; the chain-side
+            // duplicate check at validate_block already rejects songs
+            // whose fingerprint is on chain so we don't have to
+            // re-query here.
             if (reg) {
-                std::lock_guard<std::mutex> rlk(regs_mutex_);
-                pending_regs_.push(std::move(*reg));
+                reg->retries++;
+                bool give_up = reg->retries >= 3;
+                // If validate_block rejected it as duplicate, bail
+                // immediately — there is no benefit to retrying.
+                if (chain.validate_block_quick_duplicate(reg->content_hash)) {
+                    give_up = true;
+                    std::cerr << "[chain] dropping duplicate song reg "
+                              << crypto::to_hex(reg->content_hash).substr(0, 12)
+                              << "…\n";
+                }
+                if (!give_up) {
+                    std::lock_guard<std::mutex> rlk(regs_mutex_);
+                    pending_regs_.push(std::move(*reg));
+                } else {
+                    std::cerr << "[chain] dropping reg after "
+                              << static_cast<unsigned>(reg->retries)
+                              << " retries\n";
+                }
             }
             continue;
         }

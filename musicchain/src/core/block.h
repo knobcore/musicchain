@@ -24,6 +24,14 @@ static constexpr size_t   SEPARATOR_LENGTH   = 8;
 // a full Dejavu constellation (~400 KB) plus thousands of transactions.
 static constexpr uint64_t MAX_BLOCK_SIZE     = 2097152;   // 2 MiB
 
+// Chain identifier mixed into every signed transaction (EIP-155 style).
+// Picked so it can't collide with any existing well-known EVM chain id:
+// 0x4D43 ("MC" in ASCII) → 19779. Bumped by 1 on any consensus-breaking
+// rollback. A musicchain signature is NEVER replayable on Ethereum,
+// BSC, Base, etc. because their chain_id contributes to the sign-hash
+// preimage and ours doesn't match any of theirs.
+static constexpr uint32_t MC_CHAIN_ID        = 19779;
+
 // ---- Basic types -----------------------------------------------------
 
 using Hash256  = std::array<uint8_t, 32>;
@@ -127,12 +135,20 @@ struct Confirmation {
 // ---- Block header ---------------------------------------------------
 
 struct BlockHeader {
-    uint32_t                   version;
-    Hash256                    prev_hash;
-    Hash256                    merkle_root;     // over txs
-    Hash256                    fingerprint_hash; // SHA256(compressed_fingerprint), zero on heartbeat
-    Hash256                    content_hash;     // SHA256(audio), zero on heartbeat
-    uint64_t                   timestamp_ms;
+    // Every Hash256 below is value-initialized so a freshly-default-
+    // constructed BlockHeader carries all-zero hashes. The producer
+    // overwrites the fields it needs (prev_hash, merkle_root, plus
+    // fingerprint_hash + content_hash for song-bearing blocks) and
+    // leaves the rest at zero — which is exactly what Block::validate
+    // expects for heartbeat blocks. Without the {} initializers these
+    // arrays would hold indeterminate values and validate() rejected
+    // every block by accident.
+    uint32_t                   version          = 0;
+    Hash256                    prev_hash{};
+    Hash256                    merkle_root{};
+    Hash256                    fingerprint_hash{}; // zero on heartbeat
+    Hash256                    content_hash{};     // zero on heartbeat
+    uint64_t                   timestamp_ms     = 0;
     std::vector<Confirmation>  confirmations;
 
     // Serialise header to bytes (used for hash calculation)

@@ -53,17 +53,31 @@ MUSICCHAIN_API const char* mc_last_error(void);
 
 typedef void* mc_wallet_t;
 
-/** Create a new wallet with the given password.
- *  Returns a wallet handle, or NULL on failure. */
-MUSICCHAIN_API mc_wallet_t mc_wallet_create(const char* password);
-
 /** Load an existing wallet from path.
  *  Returns a wallet handle, or NULL on failure. */
 MUSICCHAIN_API mc_wallet_t mc_wallet_load(const char* path, const char* password);
 
-/** Import a private key (64-char hex) into a new wallet.
- *  Returns a wallet handle, or NULL on failure. */
-MUSICCHAIN_API mc_wallet_t mc_wallet_import(const char* priv_key_hex, const char* password);
+/** Generate a fresh 12-word BIP39 English mnemonic. Caller owns the
+ *  returned string and must free it with mc_free. Returns NULL on
+ *  entropy-source failure (see mc_last_error). */
+MUSICCHAIN_API char*        mc_bip39_generate_12(void);
+
+/** Validate a BIP39 mnemonic against the English wordlist + checksum.
+ *  Accepts 12/15/18/21/24-word phrases. Returns 1 if valid, 0 if not. */
+MUSICCHAIN_API int          mc_bip39_validate(const char* mnemonic);
+
+/** Derive a wallet from a BIP39 mnemonic + optional passphrase
+ *  (passphrase may be NULL for empty). Returns NULL on failure (see
+ *  mc_last_error). */
+MUSICCHAIN_API mc_wallet_t  mc_wallet_from_mnemonic(const char* mnemonic,
+                                                    const char* passphrase);
+
+/** Compute the Ethereum-style Base address (0x-prefixed 40-hex,
+ *  lowercase) for the wallet's secp256k1 key. Same key, different
+ *  derivation — used by the Base bridge so musicchain and Base
+ *  addresses are unified under one mnemonic. Caller frees with
+ *  mc_free. */
+MUSICCHAIN_API char*        mc_wallet_get_eth_address(mc_wallet_t wallet);
 
 /** Save wallet to path. Returns 0 on success. */
 MUSICCHAIN_API int mc_wallet_save(mc_wallet_t wallet, const char* path);

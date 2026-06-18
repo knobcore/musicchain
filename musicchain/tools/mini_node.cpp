@@ -14,6 +14,10 @@
 // librats (deps/librats) compiled with a QUIC backend, so consume its C
 // bindings header instead.
 #include "librats_c.h"
+#include "../src/net/load_monitor.h"
+#include <fstream>
+#include <memory>
+
 // librats vendors nlohmann::json at src/json.hpp; reuse it here so we can
 // parse incoming RPC envelopes properly (the previous ad-hoc string-search
 // parser ran into trouble once librats's own serializer started sorting
@@ -105,6 +109,14 @@ struct RouteEntry {
     uint64_t     received_at_ms = 0;
     Reachability reachability   = Reachability::Unknown;
     uint64_t     reachability_tested_at_ms = 0;
+    // Load fields parsed from the route message. Players use these to
+    // pick the lightest peer when multiple full nodes are reachable.
+    // Default to zero (= unknown / idle) so a peer that never reports
+    // doesn't get artificially boosted.
+    float        load_score = 0.0f;
+    float        cpu_load   = 0.0f;
+    uint64_t     net_bps    = 0;
+    bool         is_busy    = false;
 };
 
 std::atomic<bool>  g_running{true};
@@ -139,6 +151,58 @@ struct PlayerEntry {
 };
 std::mutex                                       g_players_mu;
 std::unordered_map<std::string, PlayerEntry>     g_players;
+
+// ---- Chat module: IRC-like channels over librats gossipsub ----------
+//
+// Two topic conventions used here:
+//
+//   "chat:rooms"          — global directory. Anyone publishes a JSON
+//                           room announcement when they create a room;
+//                           every mini-node that hears it auto-
+//                           subscribes to that room's per-room topic.
+//
+//   "chat:room:<name>"    — per-room message stream. Players publish
+//                           signed JSON messages; mini-nodes persist
+//                           the last `kChatRingPerRoom` in memory so a
+//                           player joining mid-conversation can fetch
+//                           recent history via the chat.history verb.
+//
+// Multi-mini-node sync + load balancing fall straight out of
+// gossipsub's mesh protocol — we don't write any explicit replication
+// code. A new mini-node joining the mesh starts receiving messages on
+// every topic it subscribes to within a few seconds, and the bounded-
+// degree mesh distributes load automatically.
+
+constexpr const char* kChatRoomsTopic  = "chat:rooms";
+constexpr const char* kChatRoomPrefix  = "chat:room:";
+constexpr size_t      kChatRingPerRoom = 1000;
+
+struct ChatRoom {
+    std::string name;
+    std::string topic_str;   // human-readable description
+    std::string creator;     // 0x-prefixed address that announced it
+    uint64_t    created_ms = 0;
+    bool        is_private = false;
+};
+
+struct ChatMessage {
+    std::string from;        // 0x-prefixed address
+    std::string from_pubkey; // 33-byte compressed pubkey hex, for sig recovery
+    uint64_t    ts_ms = 0;
+    std::string body;        // plaintext for public rooms, ECIES hex for private
+    std::string sig;         // ECDSA over canonical JSON of (from,ts_ms,body,room)
+};
+
+std::mutex                                              g_chat_rooms_mu;
+std::unordered_map<std::string, ChatRoom>               g_chat_rooms;
+
+std::mutex                                              g_chat_msgs_mu;
+std::unordered_map<std::string, std::deque<ChatMessage>> g_chat_msgs;
+
+// Forward declarations; bodies appear below the rats_client_t globals.
+void chat_subscribe_room(rats_client_t client, const std::string& name);
+void on_chat_room_announce(void*, const char*, const char*, const char*);
+void on_chat_message(void*, const char*, const char*, const char*);
 
 // ---- Event log (TUI monitor) ----------------------------------------
 //
@@ -267,9 +331,22 @@ uint64_t json_get_uint(const std::string& src, const std::string& key) {
     return v;
 }
 
+// Mini-node's own LoadMonitor — same metric stack as the full node so
+// players see one consistent score across both peer types. Heap-
+// allocated because LoadMonitor owns a std::mutex + std::thread, which
+// rule out reassignment. main() builds it once with the resolved cfg.
+std::unique_ptr<mc::net::LoadMonitor> g_load_mon;
+
 std::string routes_json() {
     std::ostringstream ss;
-    ss << "{\"peers\":[";
+    mc::net::LoadMonitor::Snapshot self_load{};
+    if (g_load_mon) self_load = g_load_mon->current();
+    ss << "{\"self_load\":{"
+       << "\"load_score\":"  << self_load.load_score          << ","
+       << "\"cpu_load\":"    << self_load.cpu_load            << ","
+       << "\"net_bps\":"     << self_load.net_bytes_per_sec   << ","
+       << "\"is_busy\":"     << (self_load.is_busy ? "true" : "false")
+       << "},\"peers\":[";
     bool first = true;
     std::lock_guard<std::mutex> lk(g_routes_mu);
     for (const auto& kv : g_routes) {
@@ -296,6 +373,10 @@ std::string routes_json() {
            << "\"api_url\":\""        << api_url          << "\","
            << "\"public_address\":\"" << r.public_address << "\","
            << "\"reachability\":\""   << reachability_str(r.reachability) << "\","
+           << "\"load_score\":"       << r.load_score    << ","
+           << "\"cpu_load\":"         << r.cpu_load      << ","
+           << "\"net_bps\":"          << r.net_bps       << ","
+           << "\"is_busy\":"          << (r.is_busy ? "true" : "false") << ","
            << "\"last_seen_ms\":"     << r.received_at_ms
            << "}";
     }
@@ -393,6 +474,20 @@ void ingest_route(const std::string& body, const char* peer_id) {
     e.api_port       = static_cast<int>(json_get_uint(body, "api_port"));
     e.ts             = json_get_uint(body, "ts");
     e.received_at_ms = now_ms();
+    // Load fields — present in routes from the new full-node build.
+    // Parse via nlohmann::json so floats and bools work, the
+    // hand-rolled json_get_string used above is string-only.
+    try {
+        auto j = nlohmann::json::parse(body);
+        if (j.contains("load_score") && j["load_score"].is_number())
+            e.load_score = j["load_score"].get<float>();
+        if (j.contains("cpu_load")   && j["cpu_load"].is_number())
+            e.cpu_load = j["cpu_load"].get<float>();
+        if (j.contains("net_bps")    && j["net_bps"].is_number())
+            e.net_bps = j["net_bps"].get<uint64_t>();
+        if (j.contains("is_busy")    && j["is_busy"].is_boolean())
+            e.is_busy = j["is_busy"].get<bool>();
+    } catch (...) { /* older format — leave defaults */ }
     // If the route message didn't carry an explicit rats_peer_id, the
     // sender's transport peer id is the next best thing.
     if (e.rats_peer_id.empty() && peer_id) e.rats_peer_id = peer_id;
@@ -723,6 +818,73 @@ std::string peer_address(const char* peer_id) {
     return addr;
 }
 
+// ---- Chat callbacks (bodies) ---------------------------------------
+
+void chat_subscribe_room(rats_client_t client, const std::string& name) {
+    const std::string topic = std::string(kChatRoomPrefix) + name;
+    if (rats_is_subscribed_to_topic(client, topic.c_str())) return;
+    rats_subscribe_to_topic(client, topic.c_str());
+    rats_set_topic_message_callback(client, topic.c_str(),
+                                    on_chat_message, nullptr);
+}
+
+void on_chat_room_announce(void* /*ud*/, const char* /*peer_id*/,
+                            const char* /*topic*/, const char* msg) {
+    if (!msg) return;
+    try {
+        auto j = nlohmann::json::parse(msg);
+        ChatRoom room;
+        room.name       = j.value("name",       std::string());
+        if (room.name.empty()) return;
+        room.topic_str  = j.value("topic",      std::string());
+        room.creator    = j.value("creator",    std::string());
+        room.created_ms = j.value("created_ms", static_cast<uint64_t>(0));
+        room.is_private = j.value("private",    false);
+        bool added = false;
+        {
+            std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
+            added = g_chat_rooms.emplace(room.name, room).second;
+        }
+        if (added) {
+            chat_subscribe_room(g_client, room.name);
+            if (!g_quiet) {
+                std::cerr << "[mini-node] chat-room registered: "
+                          << room.name
+                          << (room.is_private ? " (private)" : "")
+                          << "\n";
+            }
+        }
+    } catch (const nlohmann::json::exception&) {
+        // Malformed announcement — drop.
+    }
+}
+
+void on_chat_message(void* /*ud*/, const char* /*peer_id*/,
+                     const char* topic, const char* msg) {
+    if (!msg || !topic) return;
+    std::string topic_str = topic;
+    if (topic_str.compare(0, std::strlen(kChatRoomPrefix), kChatRoomPrefix) != 0) {
+        return;
+    }
+    std::string room_name = topic_str.substr(std::strlen(kChatRoomPrefix));
+    try {
+        auto j = nlohmann::json::parse(msg);
+        ChatMessage m;
+        m.from        = j.value("from",        std::string());
+        m.from_pubkey = j.value("from_pubkey", std::string());
+        m.ts_ms       = j.value("ts_ms",       static_cast<uint64_t>(0));
+        m.body        = j.value("body",        std::string());
+        m.sig         = j.value("sig",         std::string());
+        if (m.from.empty() || m.ts_ms == 0) return;
+        std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
+        auto& dq = g_chat_msgs[room_name];
+        dq.push_back(std::move(m));
+        while (dq.size() > kChatRingPerRoom) dq.pop_front();
+    } catch (const nlohmann::json::exception&) {
+        // Malformed message — drop.
+    }
+}
+
 void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data) {
     // librats_c.cpp strdup's both args; free at every return path.
     if (!peer_id || !message_data) {
@@ -817,6 +979,59 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
                                            : it->second},
                     {"self", false},
                 });
+            }
+        }
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":"
+          << arr.dump() << "}";
+    } else if (type == "chat.list_rooms") {
+        // Returns every room this mini-node has heard about via the
+        // chat:rooms gossipsub topic. Players call it on launch and
+        // every time the "Social" tab is opened.
+        nlohmann::json arr = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
+            for (const auto& [_, room] : g_chat_rooms) {
+                arr.push_back({
+                    {"name",       room.name},
+                    {"topic",      room.topic_str},
+                    {"creator",    room.creator},
+                    {"created_ms", room.created_ms},
+                    {"private",    room.is_private},
+                });
+            }
+        }
+        r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":"
+          << arr.dump() << "}";
+    } else if (type == "chat.history") {
+        // Returns up to `limit` recent messages for `room`, optionally
+        // before `before_ts_ms` (for paged scroll-back). Body shape:
+        //   {"room":"#general","limit":50,"before_ts_ms":1718596800000}
+        auto body = env.value("body", nlohmann::json::object());
+        const std::string room = body.value("room", std::string());
+        const uint64_t before  = body.value("before_ts_ms",
+                                            static_cast<uint64_t>(0));
+        int limit              = body.value("limit", 50);
+        if (limit < 1)   limit = 1;
+        if (limit > 200) limit = 200;
+        nlohmann::json arr = nlohmann::json::array();
+        if (!room.empty()) {
+            std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
+            auto it = g_chat_msgs.find(room);
+            if (it != g_chat_msgs.end()) {
+                int taken = 0;
+                for (auto rit = it->second.rbegin();
+                     rit != it->second.rend() && taken < limit;
+                     ++rit) {
+                    if (before > 0 && rit->ts_ms >= before) continue;
+                    arr.push_back({
+                        {"from",        rit->from},
+                        {"from_pubkey", rit->from_pubkey},
+                        {"ts_ms",       rit->ts_ms},
+                        {"body",        rit->body},
+                        {"sig",         rit->sig},
+                    });
+                    ++taken;
+                }
             }
         }
         r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":"
@@ -1181,11 +1396,21 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
 
 int main(int argc, char** argv) {
     uint16_t rats_port = kDefaultRatsPort;
+    std::string config_path;
+    mc::net::LoadConfig load_cfg;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--rats-port" && i + 1 < argc) {
             rats_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (a == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+        } else if (a == "--max-bps" && i + 1 < argc) {
+            load_cfg.max_bandwidth_bps =
+                static_cast<uint64_t>(std::atoll(argv[++i]));
+        } else if (a == "--busy-threshold" && i + 1 < argc) {
+            load_cfg.busy_score_threshold =
+                static_cast<float>(std::atof(argv[++i]));
         } else if (a == "--quiet") {
             g_quiet = true;
         } else if (a == "--peer-vps" && i + 1 < argc) {
@@ -1219,6 +1444,65 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Load persisted config so a re-run of mini-node with no flags
+    // reuses the same load-monitor settings + rats port. Config path
+    // defaults to ./mini-node.json next to the binary; --config wins.
+    {
+        if (config_path.empty()) {
+            const std::string probe = "./mini-node.json";
+            std::ifstream tf(probe);
+            if (tf) config_path = probe;
+        }
+        if (!config_path.empty()) {
+            std::ifstream f(config_path);
+            if (f) {
+                try {
+                    nlohmann::json j; f >> j;
+                    if (j.contains("rats_port") &&
+                        rats_port == kDefaultRatsPort)
+                        rats_port = j["rats_port"].get<uint16_t>();
+                    if (j.contains("load_monitor")) {
+                        const auto& lm = j["load_monitor"];
+                        if (lm.contains("max_bandwidth_bps"))
+                            load_cfg.max_bandwidth_bps = lm["max_bandwidth_bps"];
+                        if (lm.contains("cpu_weight"))
+                            load_cfg.cpu_weight = lm["cpu_weight"];
+                        if (lm.contains("net_weight"))
+                            load_cfg.net_weight = lm["net_weight"];
+                        if (lm.contains("sample_interval_ms"))
+                            load_cfg.sample_interval_ms = lm["sample_interval_ms"];
+                        if (lm.contains("busy_score_threshold"))
+                            load_cfg.busy_score_threshold = lm["busy_score_threshold"];
+                        if (lm.contains("disable_net_metric"))
+                            load_cfg.disable_net_metric = lm["disable_net_metric"];
+                        if (lm.contains("disable_cpu_metric"))
+                            load_cfg.disable_cpu_metric = lm["disable_cpu_metric"];
+                    }
+                } catch (...) { /* keep CLI / default values */ }
+            }
+        }
+        // Save back so any CLI overrides land on disk too.
+        std::string save_path = config_path.empty()
+            ? std::string("./mini-node.json") : config_path;
+        try {
+            nlohmann::json j;
+            j["rats_port"] = rats_port;
+            nlohmann::json lm;
+            lm["max_bandwidth_bps"]    = load_cfg.max_bandwidth_bps;
+            lm["cpu_weight"]           = load_cfg.cpu_weight;
+            lm["net_weight"]           = load_cfg.net_weight;
+            lm["sample_interval_ms"]   = load_cfg.sample_interval_ms;
+            lm["busy_score_threshold"] = load_cfg.busy_score_threshold;
+            lm["disable_net_metric"]   = load_cfg.disable_net_metric;
+            lm["disable_cpu_metric"]   = load_cfg.disable_cpu_metric;
+            j["load_monitor"] = lm;
+            std::ofstream of(save_path);
+            of << j.dump(2);
+        } catch (...) {}
+    }
+    g_load_mon = std::make_unique<mc::net::LoadMonitor>(load_cfg);
+    g_load_mon->start();
+
     // In TUI mode librats' own console logger would scribble over our redraws,
     // so disable it. In --quiet mode (systemd) we let librats log to stdout.
     rats_set_console_logging_enabled(g_quiet ? 1 : 0);
@@ -1243,6 +1527,15 @@ int main(int argc, char** argv) {
 
     rats_subscribe_to_topic(client, kRoutesTopic);
     rats_set_topic_message_callback(client, kRoutesTopic, on_route_message, nullptr);
+
+    // Chat: subscribe to the global room-announcement topic. When a
+    // player publishes a room creation here, on_chat_room_announce
+    // adds the room to our directory AND auto-subscribes to the
+    // per-room messages topic. Multi-mini-node sync comes for free
+    // via the gossipsub mesh.
+    rats_subscribe_to_topic(client, kChatRoomsTopic);
+    rats_set_topic_message_callback(client, kChatRoomsTopic,
+                                    on_chat_room_announce, nullptr);
 
     // Direct typed-message receiver for route broadcasts from full nodes (the
     // path the full node uses today, since gossipsub mesh form-up is too slow

@@ -112,15 +112,46 @@ class LibratsDiscovery extends ChangeNotifier {
       if (routes.isEmpty) {
         vpsStatus = 'No full nodes registered with VPS yet';
       } else {
-        // Pick the most recently-seen full node with a non-empty
-        // rats_peer_id. last_seen_ms is set server-side per route_publish.
-        final sorted = routes.values.toList()
-          ..sort((a, b) => ((b['last_seen_ms'] as int? ?? 0))
-              .compareTo(a['last_seen_ms'] as int? ?? 0));
-        final pick = sorted.firstWhere(
-          (m) => (m['rats_peer_id'] as String? ?? '').isNotEmpty,
-          orElse: () => sorted.first,
-        );
+        // Pick the lightest reachable full node.
+        //
+        // Score: lower is better.
+        //   score = 1 + 2 * load_score   (clamp to 1..3)
+        //         * (is_busy ? 4 : 1)    (busy peers heavily penalised)
+        //         * staleness_penalty    (1 if seen <120s ago, climbing
+        //                                 linearly toward 10 by 30 min)
+        //
+        // Ties (e.g. two fresh idle nodes) break on freshness.
+        //
+        // Until per-peer ping plumbing lands in RatsClient we treat
+        // every peer as 50 ms away. When that arrives, multiply the
+        // score by (ping_ms / 50). The structure is in place.
+        const fallbackPingMs = 50;
+        final candidates = routes.values
+            .where((m) => (m['rats_peer_id'] as String? ?? '').isNotEmpty)
+            .toList();
+        if (candidates.isEmpty) candidates.addAll(routes.values);
+
+        double scoreOf(Map m) {
+          final loadScore = (m['load_score'] as num?)?.toDouble() ?? 0.0;
+          final isBusy    = m['is_busy'] as bool? ?? false;
+          final seenMs    = (m['last_seen_ms'] as int? ?? 0);
+          final ageMs     = DateTime.now().millisecondsSinceEpoch - seenMs;
+          final staleness = ageMs <= 120000
+              ? 1.0
+              : (1.0 + (ageMs - 120000) / 200000.0).clamp(1.0, 10.0);
+          final loadPart  = 1.0 + 2.0 * loadScore.clamp(0.0, 1.0);
+          final busyPart  = isBusy ? 4.0 : 1.0;
+          return fallbackPingMs.toDouble() * loadPart * busyPart * staleness;
+        }
+
+        candidates.sort((a, b) {
+          final cmp = scoreOf(a).compareTo(scoreOf(b));
+          if (cmp != 0) return cmp;
+          // Tiebreak on freshness.
+          return ((b['last_seen_ms'] as int? ?? 0))
+              .compareTo(a['last_seen_ms'] as int? ?? 0);
+        });
+        final pick = candidates.first;
         autoSelectedRatsPeerId   = pick['rats_peer_id'] as String? ?? '';
         autoSelectedUrl          = pick['api_url']      as String? ?? '';
         // Surface the chosen node's reachability so UI can show "via tunnel"

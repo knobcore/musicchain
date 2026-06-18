@@ -90,37 +90,27 @@ class _ConnectionBanner extends StatelessWidget {
     final progress  = disc.vpsStatus;
 
     final rats        = RatsClient.instance;
-    final ownPid      = rats.ownPeerId;
-    final pubAddr     = rats.publicAddress;
     final peerCount   = rats.peerCount;
+    final nodeCount   = disc.routes.length;
 
     final Color  dotColor;
     final String primaryLine;
+    // Two-state banner per operator request: "offline" when we're not
+    // attached to a full node, otherwise "N nodes · M peers connected".
+    // No peer IDs or IPs — those moved to a debug screen.
     String? secondaryLine;
 
     if (searching) {
       dotColor    = Colors.orange;
-      primaryLine = progress.isNotEmpty ? progress : 'Discovering nodes…';
+      primaryLine = progress.isNotEmpty ? progress : 'Connecting…';
     } else if (hasNode) {
-      dotColor = Colors.green;
-      final nodePid = disc.autoSelectedRatsPeerId;
-      primaryLine   = 'node: $nodePid';
-      // Second line surfaces our own rats id + STUN-observed public
-      // address so the user can verify the peer-to-peer identity and
-      // see what the rest of the swarm sees us as. Short / empty fields
-      // gracefully collapse.
-      final parts = <String>[];
-      if (ownPid.isNotEmpty)  parts.add('us: $ownPid');
-      if (pubAddr.isNotEmpty) parts.add('pub: $pubAddr');
-      parts.add('$peerCount peer${peerCount == 1 ? '' : 's'}');
-      secondaryLine = parts.join('  ·  ');
+      dotColor    = Colors.green;
+      primaryLine = 'online · '
+                    '$nodeCount node${nodeCount == 1 ? '' : 's'} · '
+                    '$peerCount peer${peerCount == 1 ? '' : 's'} connected';
     } else {
       dotColor    = Colors.red;
-      primaryLine = 'No nodes — tap Connect to search';
-      if (ownPid.isNotEmpty) {
-        secondaryLine = 'us: $ownPid'
-            '${pubAddr.isNotEmpty ? '  ·  pub: $pubAddr' : ''}';
-      }
+      primaryLine = 'offline';
     }
 
     // Tap → reconnect (or search if not connected).

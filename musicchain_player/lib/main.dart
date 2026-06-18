@@ -24,6 +24,7 @@ import 'src/services/offline_play_log/network_transition_watcher.dart';
 import 'src/services/offline_play_log/sensor_capture.dart';
 import 'src/services/offline_play_log/offline_submit_service.dart';
 import 'src/screens/home_screen.dart';
+import 'src/screens/wallet_gate.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -153,7 +154,10 @@ class MusicChainApp extends StatelessWidget {
           ),
           useMaterial3: true,
         ),
-        home: const HomeScreen(),
+        // WalletGate runs the first-launch / login decision tree
+        // before handing off to HomeScreen; once the wallet is
+        // unlocked it just renders the child.
+        home: const WalletGate(child: HomeScreen()),
         debugShowCheckedModeBanner: false,
       ),
     );

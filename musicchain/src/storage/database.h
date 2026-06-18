@@ -159,6 +159,82 @@ public:
     /// undefined. Quorum math uses size() of this list against votes.
     std::vector<Address> list_active_moderators() const;
 
+    // ---- Record labels (label:, art_label:) -------------------------
+    //
+    // A "record label" groups one or more artist addresses under a
+    // single payout policy. When the chain releases escrow for an
+    // artist who has been assigned to a label, the funds flow through
+    // the label's splits[] instead of going to the artist's own
+    // address. Splits sum to 10 000 basis points (= 100 %).
+    //
+    // Labels are pure founder-side metadata: moderators can edit
+    // them, the chain enforces split correctness, and the record is
+    // public.
+    struct LabelSplit {
+        Address  wallet{};
+        uint16_t basis_points = 0; // 0..10000, sum must be 10000
+    };
+    struct LabelDef {
+        std::string             display_name;  // case-preserving
+        std::vector<LabelSplit> splits;
+    };
+    // Label key is the name lowercased.
+    void                    set_label(leveldb::WriteBatch& b,
+                                      const std::string& name,
+                                      const LabelDef& def);
+    std::optional<LabelDef> get_label(const std::string& name) const;
+    std::vector<std::string> list_labels() const;
+
+    // Per-artist assignment. Empty string clears the assignment.
+    void                       assign_artist_label(leveldb::WriteBatch& b,
+                                                   const Address& artist,
+                                                   const std::string& label_name);
+    std::optional<std::string> get_artist_label(const Address& artist) const;
+
+    // ---- Username registry (un:, addrun:) ---------------------------
+    //
+    // First-come-first-served on-chain alias from a username string to
+    // a 20-byte address. Wallets register one to make their address
+    // memorable (think ENS but on musicchain). Lookup is in both
+    // directions: name → address for "send to lain", and address → name
+    // for "shown on a profile".
+    bool                        username_taken(const std::string& name) const;
+    void                        set_username(leveldb::WriteBatch& b,
+                                             const std::string& name,
+                                             const Address& addr);
+    std::optional<Address>      lookup_username(const std::string& name) const;
+    std::optional<std::string>  get_addr_username(const Address& addr) const;
+
+    // ---- Multi-mod proposals (prop:, propvote:, propstatus:) -----
+    //
+    // Backing storage for the Phase 3 proposal + vote workflow. A
+    // proposal is committed once via `put_proposal()` keyed on its
+    // tx-hash; each YES vote (including the proposer's implicit one)
+    // lands as a `propvote:<prop>:<voter>` marker so we can recount
+    // without scanning the chain. `propstatus:` is 0 while the
+    // proposal is open and 1 once quorum landed and the action was
+    // executed — re-execution is blocked by this flag.
+
+    static constexpr uint8_t PROP_PENDING  = 0;
+    static constexpr uint8_t PROP_EXECUTED = 1;
+
+    bool                       has_proposal(const Hash256& h) const;
+    void                       put_proposal(leveldb::WriteBatch& b,
+                                            const Hash256& h,
+                                            const std::vector<uint8_t>& raw);
+    std::optional<std::vector<uint8_t>> get_proposal(const Hash256& h) const;
+
+    uint8_t                    get_proposal_status(const Hash256& h) const;
+    void                       set_proposal_status(leveldb::WriteBatch& b,
+                                                   const Hash256& h, uint8_t status);
+
+    bool   has_proposal_vote(const Hash256& prop_hash, const Address& voter) const;
+    void   add_proposal_vote(leveldb::WriteBatch& b,
+                             const Hash256& prop_hash, const Address& voter);
+    size_t count_proposal_votes(const Hash256& prop_hash) const;
+
+    std::vector<Hash256> list_pending_proposals() const;
+
     // ---- Category hide lists (ha:, hb:, ht:) -------------------------
     //
     // Moderator-driven soft censorship by metadata. The chain still

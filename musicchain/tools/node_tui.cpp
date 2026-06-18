@@ -2,10 +2,13 @@
 
 #include "../src/api/rats_api.h"
 #include "../src/api/server.h"
+#include "../src/consensus/candidate.h"
 #include "../src/core/chain.h"
 #include "../src/crypto/hash.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/signature.h"
+#include "../src/crypto/ecies.h"
+#include "../src/crypto/bip39.h"
 #include "../src/network/manager.h"
 #include "../src/store/swarm.h"
 #include "../src/storage/database.h"
@@ -23,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <streambuf>
 #include <string>
 #include <thread>
@@ -228,7 +232,18 @@ std::string read_moderator_key_file(const std::string& data_dir) {
 void action_login(mc::Database& db, const std::string& data_dir,
                   ModeratorState& mod, struct ModView& mv);
 void action_logout(ModeratorState& mod, struct ModView& mv);
-void action_bootstrap_founder(mc::Database& db, struct ModView& mv);
+void action_bootstrap_founder(mc::Database& db, const std::string& data_dir,
+                              struct ModView& mv);
+void action_view_proposals(mc::Database& db, const ModeratorState& mod,
+                           struct ModView& mv);
+void action_manage_labels(mc::Database& db, const ModeratorState& mod,
+                          struct ModView& mv);
+
+// Returns the path of the founder seed file (plaintext BIP39 mnemonic)
+// living next to the chain data dir. Forward-declared here so
+// action_login can probe for it before action_bootstrap_founder's
+// definition appears.
+std::string founder_seed_path(const std::string& data_dir);
 
 // Domain-separated salt for the founder's PBKDF2-HMAC-SHA512 derivation.
 // Versioned so that if we ever migrate to a different KDF / parameter
@@ -414,7 +429,7 @@ void draw_main_page(mc::Chain& chain,
     draw_box(top, 0, h, left_w);
     draw_panel_header(top, 0, left_w, "Wallet / Chain");
 
-    const std::string node_addr = mc::crypto::to_hex(node_kp.address.data(), 20);
+    const std::string node_addr = mc::crypto::to_checksum_hex(node_kp.address);
     const uint64_t    node_bal  = db.get_balance(node_kp.address);
     const Address     node_esc  = mc::crypto::escrow_address_for(node_kp.address);
     const uint64_t    esc_bal   = db.get_balance(node_esc);
@@ -1168,6 +1183,50 @@ void open_in_os(const std::filesystem::path& p) {
 #endif
 }
 
+// Decrypt-on-open helper used by the inbox review screens. If the file
+// at `src` is plaintext (no ECIES magic) we return its path unchanged.
+// Otherwise we attempt to decrypt with the logged-in moderator's key
+// and stash the plaintext in a fresh temp file so the OS viewer can
+// open it. Returns an empty path on failure (not encrypted to me, GCM
+// auth failure, etc.). The temp file is intentionally leaked — the
+// user closes the viewer when done; future passes can sweep
+// %TEMP%/musicchain_decrypt_* on TUI shutdown.
+std::filesystem::path decrypt_to_temp(const std::filesystem::path& src,
+                                       const ModeratorState& mod) {
+    std::ifstream f(src, std::ios::binary);
+    if (!f) return {};
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+    f.close();
+
+    if (!mc::crypto::ecies_looks_encrypted(bytes.data(), bytes.size())) {
+        return src;
+    }
+    if (!mod.logged_in) return {};
+
+    auto pt = mc::crypto::ecies_decrypt(bytes, mod.kp.address, mod.kp.private_key);
+    if (!pt) return {};
+
+    auto base = src.filename().string();
+    // Strip the .enc suffix so the OS picks the right viewer by extension.
+    if (base.size() > 4 &&
+        base.substr(base.size() - 4) == ".enc") {
+        base.resize(base.size() - 4);
+    }
+    std::error_code ec;
+    auto tmp_dir = std::filesystem::temp_directory_path(ec) /
+                   ("musicchain_decrypt_" + std::to_string(
+                       std::chrono::system_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(tmp_dir, ec);
+    auto out_path = tmp_dir / base;
+    std::ofstream o(out_path, std::ios::binary | std::ios::trunc);
+    if (!o) return {};
+    o.write(reinterpret_cast<const char*>(pt->data()),
+            static_cast<std::streamsize>(pt->size()));
+    o.close();
+    return out_path;
+}
+
 void action_review_kyc(mc::Database& db, const ModeratorState& mod,
                         ModView& mv, const std::string& data_dir) {
     auto rows = load_kyc_rows(data_dir);
@@ -1265,7 +1324,7 @@ void action_review_kyc(mc::Database& db, const ModeratorState& mod,
                     const Address esc =
                         mc::crypto::escrow_address_for(artist_addr);
                     const uint64_t bal = db.get_balance(esc);
-                    kv("Escrow",  mc::crypto::to_hex(esc.data(), 20));
+                    kv("Escrow",  mc::crypto::to_checksum_hex(esc));
                     kv("Balance", mc::Ledger::format_balance(bal) + " mc");
                 }
             }
@@ -1318,8 +1377,20 @@ void action_review_kyc(mc::Database& db, const ModeratorState& mod,
         const KycRow& r = rows[sel];
 
         if (key == 'O' || key == 'o') {
-            open_in_os(r.path);
-            note = "opened " + r.filename;
+            // The file on disk is ECIES-encrypted to the active mods if
+            // any were on chain at submit time. decrypt_to_temp inlines
+            // the no-op for plaintext files and writes a temp PDF when
+            // it has to decrypt.
+            auto open_path = decrypt_to_temp(r.path, mod);
+            if (open_path.empty()) {
+                note = "open: file is encrypted to other moderators (or auth failed)";
+                note_color = CP_WARN;
+                continue;
+            }
+            open_in_os(open_path);
+            note = open_path == r.path
+                ? ("opened " + r.filename)
+                : ("decrypted + opened " + open_path.filename().string());
             note_color = CP_OK;
             continue;
         }
@@ -1383,6 +1454,40 @@ void action_review_kyc(mc::Database& db, const ModeratorState& mod,
     }
 }
 
+// Helper shared by the proposal-building actions: sign + enqueue. Sets
+// `mv.last_action` and returns true on success.
+bool submit_proposal_tx(mc::Database& db, const ModeratorState& mod,
+                         mc::ProposalTx& tx, ModView& mv,
+                         const std::string& action_label) {
+    if (db.get_mod_level(mod.kp.address)
+            < static_cast<uint8_t>(mc::ModLevel::OP)) {
+        mv.last_action = action_label + ": need OP level to propose";
+        mv.last_action_color = CP_WARN;
+        return false;
+    }
+
+    tx.proposer        = mod.kp.address;
+    tx.proposer_pubkey = mod.kp.public_key;
+    tx.nonce           = db.get_nonce(mod.kp.address);
+
+    auto msg_bytes = tx.sign_message();
+    auto msg_hash  = mc::crypto::sha256(msg_bytes.data(), msg_bytes.size());
+    tx.signature   = mc::crypto::sign_ecdsa(msg_hash, mod.kp.private_key);
+    if (!tx.verify_signature()) {
+        mv.last_action = action_label + ": internal sign/verify mismatch";
+        mv.last_action_color = CP_WARN;
+        return false;
+    }
+
+    auto h = tx.tx_hash();
+    if (!db.put_pending_tx(h, tx.serialize())) {
+        mv.last_action = action_label + ": failed to enqueue tx";
+        mv.last_action_color = CP_WARN;
+        return false;
+    }
+    return true;
+}
+
 void action_release_escrow(mc::Database& db, const ModeratorState& mod,
                             ModView& mv) {
     if (!mod.logged_in) {
@@ -1391,12 +1496,12 @@ void action_release_escrow(mc::Database& db, const ModeratorState& mod,
         return;
     }
 
-    // CRITICAL: the old flow accepted arbitrary from/to addresses,
-    // letting a malicious or careless moderator drain any wallet on
-    // the chain. The fix is to derive the source (escrow account)
-    // from the artist's address — moderators can ONLY shift tokens
-    // from `escrow_address_for(artist)` to that artist, never from an
-    // arbitrary source to an arbitrary destination.
+    // The escrow source is derived from the artist's address so a
+    // moderator can ONLY shift tokens from `escrow_address_for(artist)`
+    // to that artist, never from an arbitrary source to an arbitrary
+    // destination. Proposal-driven means a single moderator can't even
+    // do that one transfer — quorum of the active mods has to vote YES
+    // before the chain executes the move.
     std::string artist_hex;
     if (!prompt_string("Artist wallet address (40 hex)", artist_hex, 40))
         return;
@@ -1412,10 +1517,6 @@ void action_release_escrow(mc::Database& db, const ModeratorState& mod,
         mv.last_action_color = CP_WARN; return;
     }
 
-    // Amount input — blank / "all" releases the full escrow balance.
-    // Anything else parsed as a decimal, capped at the escrow's actual
-    // balance so a typo of "9999" can't accidentally try to drain an
-    // unfunded source.
     std::string amt_str;
     if (!prompt_string(
             "Amount (blank=all, e.g. 12.5)", amt_str, 32))
@@ -1436,21 +1537,188 @@ void action_release_escrow(mc::Database& db, const ModeratorState& mod,
         }
     }
 
-    leveldb::WriteBatch batch;
-    mc::Ledger ledger(db);
-    if (!ledger.transfer(batch, esc_addr, artist_addr, amount)) {
-        mv.last_action = "release: ledger refused transfer";
-        mv.last_action_color = CP_WARN; return;
-    }
-    db.write(batch);
-    mv.last_action = "release: " + mc::Ledger::format_balance(amount)
-                   + " mc → " + artist_hex.substr(0, 12) + "…";
+    mc::ProposalTx tx{};
+    tx.kind         = static_cast<uint8_t>(mc::ProposalKind::RELEASE_ESCROW);
+    tx.target_addr  = artist_addr;
+    tx.amount       = amount;
+    if (!submit_proposal_tx(db, mod, tx, mv, "release")) return;
+
+    const size_t active_n = db.list_active_moderators().size();
+    const size_t needed   = (active_n / 2) + 1;
+    mv.last_action = "release: proposal queued, "
+                   + mc::Ledger::format_balance(amount) + " mc → "
+                   + artist_hex.substr(0, 12) + "…  ("
+                   + std::to_string(needed) + "/" + std::to_string(active_n)
+                   + " YES needed)";
     mv.last_action_color = CP_OK;
+}
+
+// ---- Proposal browser (V key) ---------------------------------------
+//
+// Lists every PENDING chain-level proposal so an OP can see what
+// needs their attention and cast a YES vote with a single keypress.
+// Uses arrow keys for selection, Enter to vote, q/ESC to leave.
+
+struct ProposalRow {
+    mc::Hash256    prop_hash;
+    mc::ProposalTx tx;
+    size_t         votes;
+    bool           already_voted;
+};
+
+std::vector<ProposalRow> load_proposal_rows(mc::Database& db,
+                                            const Address& self) {
+    std::vector<ProposalRow> out;
+    auto hashes = db.list_pending_proposals();
+    out.reserve(hashes.size());
+    for (const auto& h : hashes) {
+        auto raw = db.get_proposal(h);
+        if (!raw) continue;
+        mc::ProposalTx tx;
+        if (!mc::ProposalTx::deserialize(raw->data(), raw->size(), tx)) continue;
+        ProposalRow r;
+        r.prop_hash      = h;
+        r.tx             = tx;
+        r.votes          = db.count_proposal_votes(h);
+        r.already_voted  = db.has_proposal_vote(h, self);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::string format_proposal_summary(const ProposalRow& r,
+                                    size_t needed, size_t active_n) {
+    const auto kind = static_cast<mc::ProposalKind>(r.tx.kind);
+    std::string body;
+    switch (kind) {
+        case mc::ProposalKind::HIDE_CONTENT: {
+            body = "HIDE  " + mc::crypto::to_hex(r.tx.target_hash).substr(0, 16) + "…";
+            break;
+        }
+        case mc::ProposalKind::RELEASE_ESCROW: {
+            body = "RELEASE  "
+                 + mc::Ledger::format_balance(r.tx.amount) + " mc → "
+                 + mc::crypto::to_checksum_hex(r.tx.target_addr).substr(0, 14) + "…";
+            break;
+        }
+        case mc::ProposalKind::VOTE_YES:
+            body = "VOTE? (orphaned)"; break;
+    }
+    char votes_buf[64];
+    std::snprintf(votes_buf, sizeof(votes_buf), "  [%zu/%zu of %zu YES]",
+                  r.votes, needed, active_n);
+    body += votes_buf;
+    if (r.already_voted) body += "  ✓ you voted";
+    return body;
+}
+
+void action_view_proposals(mc::Database& db, const ModeratorState& mod,
+                           ModView& mv) {
+    if (!mod.logged_in) {
+        mv.last_action = "vote: not logged in";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    if (db.get_mod_level(mod.kp.address)
+            < static_cast<uint8_t>(mc::ModLevel::OP)) {
+        mv.last_action = "vote: need OP level to cast votes";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+
+    int sel = 0;
+    while (true) {
+        auto rows = load_proposal_rows(db, mod.kp.address);
+        const size_t active_n = db.list_active_moderators().size();
+        const size_t needed   = (active_n / 2) + 1;
+
+        int max_y = getmaxy(stdscr);
+        int max_x = getmaxx(stdscr);
+        if (rows.empty()) sel = 0;
+        else if (sel >= (int)rows.size()) sel = (int)rows.size() - 1;
+        if (sel < 0) sel = 0;
+
+        erase();
+        attron(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+        mvhline(0, 0, ' ', max_x);
+        mvprintw(0, 2, " Pending proposals · %zu open · quorum needs %zu/%zu YES ",
+                 rows.size(), needed, active_n);
+        attroff(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+
+        const int list_top = 2;
+        const int list_h   = max_y - list_top - 2;
+
+        if (rows.empty()) {
+            attron(A_DIM);
+            mvprintw(list_top + 1, 4,
+                     "No open proposals. Press E to propose an escrow");
+            mvprintw(list_top + 2, 4,
+                     "release; HIDE proposals are built via H on the");
+            mvprintw(list_top + 3, 4,
+                     "library page (per-song).");
+            attroff(A_DIM);
+        } else {
+            for (size_t i = 0; i < rows.size() && (int)i < list_h; ++i) {
+                bool is_sel = (int)i == sel;
+                if (is_sel) attron(A_REVERSE);
+                mvprintw(list_top + (int)i, 2, " %s",
+                         format_proposal_summary(rows[i], needed, active_n).c_str());
+                if (is_sel) attroff(A_REVERSE);
+            }
+        }
+
+        // Footer hint
+        attron(COLOR_PAIR(CP_FOOTER_LBL));
+        mvhline(max_y - 1, 0, ' ', max_x);
+        attroff(COLOR_PAIR(CP_FOOTER_LBL));
+        attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        mvprintw(max_y - 1, 1, " ↑↓ ");
+        attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        attron(COLOR_PAIR(CP_FOOTER_LBL));
+        mvprintw(max_y - 1, 6, " select ");
+        attroff(COLOR_PAIR(CP_FOOTER_LBL));
+        attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        mvprintw(max_y - 1, 15, " Enter ");
+        attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        attron(COLOR_PAIR(CP_FOOTER_LBL));
+        mvprintw(max_y - 1, 22, " cast YES ");
+        attroff(COLOR_PAIR(CP_FOOTER_LBL));
+        attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        mvprintw(max_y - 1, 33, " Q ");
+        attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+        attron(COLOR_PAIR(CP_FOOTER_LBL));
+        mvprintw(max_y - 1, 36, " back ");
+        attroff(COLOR_PAIR(CP_FOOTER_LBL));
+
+        refresh();
+
+        int key = getch();
+        if (key == 'q' || key == 'Q' || key == 27 /*ESC*/) break;
+        if (key == KEY_UP)   { if (sel > 0) --sel; continue; }
+        if (key == KEY_DOWN) { if (sel + 1 < (int)rows.size()) ++sel; continue; }
+        if ((key == '\n' || key == '\r' || key == KEY_ENTER) && !rows.empty()) {
+            const auto& r = rows[sel];
+            if (r.already_voted) {
+                mv.last_action = "vote: already cast on that proposal";
+                mv.last_action_color = CP_WARN;
+                continue;
+            }
+            // Build a VOTE_YES tx referencing the proposal hash.
+            mc::ProposalTx vote{};
+            vote.kind        = static_cast<uint8_t>(mc::ProposalKind::VOTE_YES);
+            vote.target_hash = r.prop_hash;
+            if (!submit_proposal_tx(db, mod, vote, mv, "vote")) continue;
+            mv.last_action = "vote: YES queued ("
+                           + std::to_string(r.votes + 1) + "/"
+                           + std::to_string(needed) + ")";
+            mv.last_action_color = CP_OK;
+        }
+    }
 }
 
 // ---- Login / logout (Phase 1 of the IRC-style moderator system) ----
 
-void action_login(mc::Database& db, const std::string& /*data_dir*/,
+void action_login(mc::Database& db, const std::string& data_dir,
                   ModeratorState& mod, ModView& mv) {
     if (mod.logged_in) {
         mv.last_action = "login: already authenticated as "
@@ -1459,17 +1727,65 @@ void action_login(mc::Database& db, const std::string& /*data_dir*/,
         return;
     }
 
+    auto try_kp_for_login = [&](const mc::crypto::KeyPair& kp) -> bool {
+        uint8_t lvl = db.get_mod_level(kp.address);
+        if (lvl == 0) return false;
+        mod.kp        = kp;
+        mod.addr_hex  = mc::crypto::to_checksum_hex(kp.address);
+        mod.level     = lvl;
+        mod.logged_in = true;
+        return true;
+    };
+
+    // Path 0: on-disk founder.seed (BIP39 mnemonic written by
+    // action_bootstrap_founder). Loaded automatically — no prompt at
+    // all, just a tap on L. The seed file lives next to the chain
+    // data dir; deleting it forces a fresh bootstrap.
+    {
+        const auto seed_path = founder_seed_path(data_dir);
+        std::ifstream sf(seed_path);
+        if (sf.is_open()) {
+            std::string mnemonic;
+            std::getline(sf, mnemonic);
+            sf.close();
+            // Strip trailing CR/whitespace defensively.
+            while (!mnemonic.empty()
+                   && (mnemonic.back() == '\r' || mnemonic.back() == '\n'
+                       || mnemonic.back() == ' ')) {
+                mnemonic.pop_back();
+            }
+            if (!mnemonic.empty() && mc::crypto::bip39_validate(mnemonic)) {
+                auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+                std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+                if (kp_opt) {
+                    if (try_kp_for_login(*kp_opt)) {
+                        mv.last_action = "login: founder seed (level "
+                                       + std::to_string(mod.level) + ")";
+                        mv.last_action_color = CP_OK;
+                        return;
+                    }
+                    // Disk seed is well-formed but the bound GRANT has
+                    // not yet applied on chain. Common right after the
+                    // first B-press: producer mints within ~30 s of a
+                    // pending tx. Tell the operator instead of falling
+                    // through to the prompt (which would also fail).
+                    mv.last_action = "login: GRANT not yet on chain — "
+                                     "wait ~30s then press L again";
+                    mv.last_action_color = CP_WARN;
+                    return;
+                }
+            }
+        }
+    }
+
     // The login prompt accepts either:
-    //   1. A passphrase (any length, not pure 64-hex), which gets
-    //      PBKDF2'd with the founder salt to yield a 32-byte seed.
-    //   2. A raw 64-hex private key, used as-is.
-    // We always try the passphrase derivation first; if the input is
-    // 64 hex chars and the passphrase-derived key isn't a moderator,
-    // we fall back to interpreting it as a raw key. This means a
-    // founder who types their passphrase always gets their founder
-    // key, never a colliding "raw key with those characters."
+    //   1. A 12-word BIP39 mnemonic typed in (for restoring on a new
+    //      machine without copying founder.seed).
+    //   2. A legacy passphrase (any length, not pure 64-hex), which
+    //      gets PBKDF2'd with the founder salt to yield a 32-byte seed.
+    //   3. A raw 64-hex private key, used as-is.
     std::string entered;
-    if (!prompt_secret("Moderator passphrase or 64-hex private key",
+    if (!prompt_secret("BIP39 mnemonic, passphrase, or 64-hex private key",
                        entered, 256)) {
         mv.last_action = "login: cancelled";
         mv.last_action_color = CP_WARN;
@@ -1481,17 +1797,59 @@ void action_login(mc::Database& db, const std::string& /*data_dir*/,
         return;
     }
 
-    auto try_kp_for_login = [&](const mc::crypto::KeyPair& kp) -> bool {
-        uint8_t lvl = db.get_mod_level(kp.address);
-        if (lvl == 0) return false;
-        mod.kp        = kp;
-        mod.addr_hex  = mc::crypto::to_hex(kp.address.data(), 20);
-        mod.level     = lvl;
-        mod.logged_in = true;
-        return true;
-    };
+    // Path 1a: input is a valid BIP39 mnemonic.
+    if (mc::crypto::bip39_validate(entered)) {
+        auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(entered, "");
+        if (kp_opt && try_kp_for_login(*kp_opt)) {
+            mv.last_action = "login: mnemonic ok (level "
+                           + std::to_string(mod.level) + ")";
+            mv.last_action_color = CP_OK;
+            return;
+        }
+    }
 
-    // Path 1: treat input as passphrase.
+    // Path 1b: input looks like a username — look up on chain, then
+    // prompt for the mnemonic to prove ownership.
+    {
+        std::string lower = entered;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        bool looks_like_username =
+            lower.size() >= 3 && lower.size() <= 30 &&
+            (lower[0] >= 'a' && lower[0] <= 'z');
+        if (looks_like_username) {
+            for (char c : lower) {
+                if (!((c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') ||
+                      c == '_')) {
+                    looks_like_username = false;
+                    break;
+                }
+            }
+        }
+        if (looks_like_username) {
+            auto addr = db.lookup_username(lower);
+            if (addr) {
+                std::string mn;
+                if (prompt_secret(("Mnemonic for username '" + lower + "'").c_str(),
+                                  mn, 256)
+                    && mc::crypto::bip39_validate(mn)) {
+                    auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mn, "");
+                    std::fill(mn.begin(), mn.end(), '\0');
+                    if (kp_opt
+                        && std::memcmp(kp_opt->address.data(),
+                                       addr->data(), 20) == 0
+                        && try_kp_for_login(*kp_opt)) {
+                        mv.last_action = "login: '" + lower + "' (level "
+                                       + std::to_string(mod.level) + ")";
+                        mv.last_action_color = CP_OK;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Path 1b: legacy passphrase via PBKDF2.
     {
         auto seed = mc::crypto::derive_seed_pbkdf2_sha512(
             entered, kFounderSalt, kFounderIters);
@@ -1537,7 +1895,18 @@ void action_logout(ModeratorState& mod, ModView& mv) {
     mv.last_action_color = CP_OK;
 }
 
-void action_bootstrap_founder(mc::Database& db, ModView& mv) {
+// Path of the on-disk founder seed file. Plaintext BIP39 mnemonic.
+// Living next to the chain data is intentional: an attacker with disk
+// access already has the chain's full ledger, so the seed's marginal
+// secrecy is bounded by FS permissions and full-disk encryption. A
+// future iteration can wrap it under a password.
+std::string founder_seed_path(const std::string& data_dir) {
+    return data_dir + "/founder.seed";
+}
+
+void action_bootstrap_founder(mc::Database& db,
+                              const std::string& data_dir,
+                              ModView& mv) {
     // Bootstrap is one-shot: once a founder is recorded on chain there
     // is no second bootstrap window. The chain rejects future
     // self-grants regardless of what the TUI does, but check here too
@@ -1547,47 +1916,91 @@ void action_bootstrap_founder(mc::Database& db, ModView& mv) {
         mv.last_action_color = CP_WARN;
         return;
     }
-
-    std::string pass1;
-    if (!prompt_secret("Founder passphrase (memorise — never written to disk)",
-                       pass1, 256)) {
-        mv.last_action = "bootstrap: cancelled";
-        mv.last_action_color = CP_WARN;
-        return;
-    }
-    if (pass1.size() < 12) {
-        // Soft minimum. PBKDF2 stretches but the founder key is the
-        // single highest-value secret on the chain, so a too-short
-        // passphrase is a footgun we'd rather reject early.
-        mv.last_action = "bootstrap: passphrase too short (min 12 chars)";
+    const auto seed_path = founder_seed_path(data_dir);
+    if (fs::exists(seed_path)) {
+        mv.last_action = "bootstrap: seed already saved — press L to log in"
+                       " (GRANT applies in the next block)";
         mv.last_action_color = CP_WARN;
         return;
     }
 
-    std::string pass2;
-    if (!prompt_secret("Confirm founder passphrase", pass2, 256)) {
-        mv.last_action = "bootstrap: cancelled";
+    // Generate a fresh BIP39 mnemonic and derive the keypair. Like a
+    // standard wallet first-launch: we generate, you write it down, you
+    // decide whether to also save to disk for convenience.
+    std::string mnemonic = mc::crypto::bip39_generate_12();
+    if (mnemonic.empty()) {
+        mv.last_action = "bootstrap: entropy source failed";
         mv.last_action_color = CP_WARN;
-        // Best-effort scrub before returning.
-        std::fill(pass1.begin(), pass1.end(), '\0');
         return;
     }
-    if (pass1 != pass2) {
-        mv.last_action = "bootstrap: confirmation did not match";
+    auto seed = mc::crypto::bip39_mnemonic_to_seed(mnemonic, "");
+    if (seed.size() != 64) {
+        mv.last_action = "bootstrap: BIP39 seed derivation failed";
         mv.last_action_color = CP_WARN;
-        std::fill(pass1.begin(), pass1.end(), '\0');
-        std::fill(pass2.begin(), pass2.end(), '\0');
+        std::fill(mnemonic.begin(), mnemonic.end(), '\0');
         return;
     }
-    std::fill(pass2.begin(), pass2.end(), '\0');
-
-    // PBKDF2 stretch → 32-byte seed → secp256k1 keypair.
-    auto seed = mc::crypto::derive_seed_pbkdf2_sha512(
-        pass1, kFounderSalt, kFounderIters);
-    std::fill(pass1.begin(), pass1.end(), '\0');
-
-    auto kp = mc::crypto::keypair_from_seed(seed.data(), seed.size());
+    auto kp = mc::crypto::keypair_from_seed(seed.data(), 32);
     std::fill(seed.begin(), seed.end(), 0);
+
+    // Render the seed on screen until the operator acknowledges. This
+    // is the only chance to write the words down off-disk; if the
+    // operator skips the save-to-disk step below they MUST have copied
+    // it now or the founder key is lost.
+    {
+        erase();
+        int max_y = getmaxy(stdscr);
+        int max_x = getmaxx(stdscr);
+        attron(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+        mvhline(0, 0, ' ', max_x);
+        mvprintw(0, 2, " Founder seed phrase ");
+        attroff(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+        attron(A_BOLD);
+        mvprintw(3, 4, "Write these 12 words down on paper. This is the only");
+        mvprintw(4, 4, "off-disk copy. Anyone with these words owns the founder");
+        mvprintw(5, 4, "wallet — keep them somewhere safe.");
+        attroff(A_BOLD);
+        attron(COLOR_PAIR(CP_OK) | A_BOLD);
+        mvprintw(8, 4, "%s", mnemonic.c_str());
+        attroff(COLOR_PAIR(CP_OK) | A_BOLD);
+        mvprintw(10, 4, "Press any key once you've written it down.");
+        refresh();
+        nodelay(stdscr, FALSE);
+        getch();
+        nodelay(stdscr, TRUE);
+        erase();
+        refresh();
+    }
+
+    // Ask whether to also persist to disk (default: yes, for ease).
+    std::string save_choice;
+    bool save_to_disk = true;
+    if (prompt_string("Save seed to founder.seed on disk? (y/n)",
+                      save_choice, 4)) {
+        save_to_disk = !(save_choice == "n" || save_choice == "N" ||
+                          save_choice == "no" || save_choice == "No");
+    }
+
+    // Optional username. The chain runs the well-formedness rules
+    // (3..30 chars, [a-z0-9_]+, first char must be a letter). Empty
+    // skips the username registration entirely.
+    std::string username;
+    prompt_string("Founder username (optional, blank to skip)",
+                  username, 32);
+    for (auto& c : username) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (save_to_disk) {
+        std::ofstream sf(seed_path, std::ios::trunc);
+        if (!sf.is_open()) {
+            mv.last_action = "bootstrap: could not open " + seed_path + " for write";
+            mv.last_action_color = CP_WARN;
+            std::fill(mnemonic.begin(), mnemonic.end(), '\0');
+            return;
+        }
+        sf << mnemonic << "\n";
+        sf.close();
+    }
+    std::fill(mnemonic.begin(), mnemonic.end(), '\0');
 
     // Build the GRANT FOUNDER tx, self-signed.
     mc::ModeratorOpTx tx{};
@@ -1611,10 +2024,27 @@ void action_bootstrap_founder(mc::Database& db, ModView& mv) {
         return;
     }
 
-    // Wipe the private key from kp now that the signature is built.
-    // The TUI itself doesn't need to remember the founder key — the
-    // operator can re-derive it any time by typing the passphrase at
-    // the login prompt.
+    // If the operator picked a username, build + sign a UsernameTx
+    // alongside the GRANT. Both end up in the same block. The
+    // UsernameTx uses nonce 1 because the GRANT consumes nonce 0.
+    mc::UsernameTx un_tx{};
+    bool want_username = !username.empty();
+    if (want_username) {
+        un_tx.name         = username;
+        un_tx.owner        = kp.address;
+        un_tx.owner_pubkey = kp.public_key;
+        un_tx.nonce        = 1; // after the GRANT
+        auto un_msg  = un_tx.sign_message();
+        auto un_hash = mc::crypto::sha256(un_msg.data(), un_msg.size());
+        un_tx.signature = mc::crypto::sign_ecdsa(un_hash, kp.private_key);
+        if (!un_tx.verify_signature()) {
+            mv.last_action = "bootstrap: username sign/verify mismatch";
+            mv.last_action_color = CP_WARN;
+            return;
+        }
+    }
+
+    // Wipe the private key from kp now that all signatures are built.
     {
         volatile uint8_t* p = kp.private_key.data();
         for (size_t i = 0; i < kp.private_key.size(); ++i) p[i] = 0;
@@ -1622,17 +2052,187 @@ void action_bootstrap_founder(mc::Database& db, ModView& mv) {
     }
 
     // Drop into the mempool so the next block this node mines includes
-    // the GRANT.
+    // the GRANT (and optionally the username).
     auto h = tx.tx_hash();
     if (!db.put_pending_tx(h, tx.serialize())) {
         mv.last_action = "bootstrap: failed to enqueue tx";
         mv.last_action_color = CP_WARN;
         return;
     }
+    if (want_username) {
+        auto un_h = un_tx.tx_hash();
+        db.put_pending_tx(un_h, un_tx.serialize());
+    }
 
-    const std::string addr_hex = mc::crypto::to_hex(kp.address.data(), 20);
+    const std::string addr_hex = mc::crypto::to_checksum_hex(kp.address);
+    std::string suffix;
+    if (want_username) suffix = " + username '" + username + "'";
     mv.last_action = "bootstrap: GRANT queued for "
-                   + addr_hex.substr(0, 12) + "…  (next block applies)";
+                   + addr_hex.substr(0, 14) + "…" + suffix
+                   + "  (next block applies)";
+    mv.last_action_color = CP_OK;
+}
+
+// ---- Founder-only: record-label management (M key) ------------------
+
+void action_manage_labels(mc::Database& db, const ModeratorState& mod,
+                          ModView& mv) {
+    if (!mod.logged_in) {
+        mv.last_action = "labels: not logged in";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+    if (db.get_mod_level(mod.kp.address)
+            != static_cast<uint8_t>(mc::ModLevel::FOUNDER)) {
+        mv.last_action = "labels: founder only";
+        mv.last_action_color = CP_WARN;
+        return;
+    }
+
+    // Submenu: D = define label, A = assign artist, ESC = back.
+    erase();
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+    attron(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+    mvhline(0, 0, ' ', max_x);
+    mvprintw(0, 2, " Record-label management (founder) ");
+    attroff(COLOR_PAIR(CP_PANEL_HDR) | A_BOLD);
+
+    auto labels = db.list_labels();
+    int r = 2;
+    attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
+    mvprintw(r++, 2, "Existing labels (%zu)", labels.size());
+    attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
+    for (size_t i = 0; i < labels.size() && r < max_y - 6; ++i) {
+        auto def = db.get_label(labels[i]);
+        if (!def) continue;
+        std::string line = " " + def->display_name + "  [";
+        for (size_t s = 0; s < def->splits.size(); ++s) {
+            if (s) line += ", ";
+            line += mc::crypto::to_checksum_hex(def->splits[s].wallet)
+                        .substr(0, 10) + "…:"
+                  + std::to_string(def->splits[s].basis_points / 100) + "%";
+        }
+        line += "]";
+        if ((int)line.size() > max_x - 4) line = line.substr(0, max_x - 5) + "…";
+        attron(COLOR_PAIR(CP_VALUE));
+        mvprintw(r++, 2, "%s", line.c_str());
+        attroff(COLOR_PAIR(CP_VALUE));
+    }
+
+    attron(COLOR_PAIR(CP_FOOTER_LBL));
+    mvhline(max_y - 1, 0, ' ', max_x);
+    attroff(COLOR_PAIR(CP_FOOTER_LBL));
+    attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 1, " D ");
+    attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 4, "Define label   ");
+    attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 20, " A ");
+    attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 23, "Assign artist   ");
+    attron(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 40, " Q ");
+    attroff(COLOR_PAIR(CP_FOOTER_KEY) | A_BOLD);
+    mvprintw(max_y - 1, 43, "Back");
+    refresh();
+
+    nodelay(stdscr, FALSE);
+    int key = getch();
+    nodelay(stdscr, TRUE);
+
+    if (key == 'q' || key == 'Q' || key == 27) return;
+
+    std::string meta_json;
+
+    if (key == 'd' || key == 'D') {
+        std::string name;
+        if (!prompt_string("Label name (1..64 chars)", name, 64)) return;
+        // Collect splits interactively.
+        std::ostringstream splits_js;
+        splits_js << "[";
+        int total_bp = 0;
+        int count = 0;
+        while (count < 16 && total_bp < 10000) {
+            std::string addr_hex, bp_str;
+            const std::string p =
+                "Split " + std::to_string(count + 1) +
+                " wallet (0x… or blank to finish)";
+            if (!prompt_string(p.c_str(), addr_hex, 64)) break;
+            if (addr_hex.empty()) break;
+            Address w{};
+            if (!mc::crypto::parse_address(addr_hex, w)) {
+                mv.last_action = "labels: bad wallet address";
+                mv.last_action_color = CP_WARN; return;
+            }
+            int remaining = 10000 - total_bp;
+            const std::string p2 =
+                "Basis points 1.." + std::to_string(remaining)
+                                   + " (100 = 1%)";
+            if (!prompt_string(p2.c_str(), bp_str, 5)) break;
+            int bp = std::atoi(bp_str.c_str());
+            if (bp <= 0 || bp > remaining) {
+                mv.last_action = "labels: bad basis points";
+                mv.last_action_color = CP_WARN; return;
+            }
+            if (count) splits_js << ",";
+            splits_js << "{\"addr\":\""
+                      << mc::crypto::to_checksum_hex(w)
+                      << "\",\"bp\":" << bp << "}";
+            total_bp += bp;
+            ++count;
+        }
+        splits_js << "]";
+        if (total_bp != 10000 || count == 0) {
+            mv.last_action = "labels: splits must total 10000 bp (100%)";
+            mv.last_action_color = CP_WARN; return;
+        }
+        std::ostringstream js;
+        js << "{\"action\":\"label_define\",\"name\":\"" << name
+           << "\",\"splits\":" << splits_js.str() << "}";
+        meta_json = js.str();
+    } else if (key == 'a' || key == 'A') {
+        std::string artist_hex, label_name;
+        if (!prompt_string("Artist address (0x…)", artist_hex, 64)) return;
+        Address artist{};
+        if (!mc::crypto::parse_address(artist_hex, artist)) {
+            mv.last_action = "labels: bad artist address";
+            mv.last_action_color = CP_WARN; return;
+        }
+        if (!prompt_string("Label name (blank to unassign)",
+                           label_name, 64)) return;
+        std::ostringstream js;
+        js << "{\"action\":\"label_assign\",\"artist\":\""
+           << mc::crypto::to_checksum_hex(artist)
+           << "\",\"label\":\"" << label_name << "\"}";
+        meta_json = js.str();
+    } else {
+        return;
+    }
+
+    // Build the founder-signed ModeratorOpTx.
+    mc::ModeratorOpTx tx{};
+    tx.op_code        = static_cast<uint8_t>(mc::ModOpCode::TAG_LABEL_EDIT);
+    tx.proposer       = mod.kp.address;
+    tx.proposer_pubkey = mod.kp.public_key;
+    tx.nonce          = db.get_nonce(mod.kp.address);
+    tx.meta_json      = meta_json;
+
+    auto msg_bytes = tx.sign_message();
+    auto msg_hash  = mc::crypto::sha256(msg_bytes.data(), msg_bytes.size());
+    tx.signature   = mc::crypto::sign_ecdsa(msg_hash, mod.kp.private_key);
+    if (!tx.verify_signature()) {
+        mv.last_action = "labels: sign/verify mismatch";
+        mv.last_action_color = CP_WARN; return;
+    }
+    auto h = tx.tx_hash();
+    if (!db.put_pending_tx(h, tx.serialize())) {
+        mv.last_action = "labels: failed to enqueue";
+        mv.last_action_color = CP_WARN; return;
+    }
+    mv.last_action = "labels: " +
+        std::string(key == 'd' || key == 'D' ? "define" : "assign")
+        + " queued (next block applies)";
     mv.last_action_color = CP_OK;
 }
 
@@ -1661,6 +2261,7 @@ void run_tui(mc::api::HttpServer& /*http*/,
              mc::Database& db,
              mc::store::SwarmIndex& swarm,
              mc::net::NetworkManager& net,
+             mc::CandidateManager& candidates,
              const mc::crypto::KeyPair& node_keypair,
              const std::string& data_dir,
              std::atomic<bool>& keep_running) {
@@ -1747,6 +2348,8 @@ void run_tui(mc::api::HttpServer& /*http*/,
                         {"K",  "KYC"},
                         {"H",  "Library"},
                         {"E",  "Release"},
+                        {"V",  "Vote"},
+                        {"M",  "Labels"},
                         {"R",  "Refresh"},
                         {"O",  "Logout"},
                         {"Q",  "Quit"},
@@ -1760,12 +2363,17 @@ void run_tui(mc::api::HttpServer& /*http*/,
                             {"Q",  "Quit"},
                         });
                     } else {
-                        // Pre-founder: the only meaningful moderator
-                        // action is the one-shot bootstrap.
+                        // Pre-founder: B bootstraps. L is also shown
+                        // because the operator may have just pressed B
+                        // and now wants to log in once the GRANT mines
+                        // — or they may have a founder.seed file from a
+                        // previous bootstrap whose GRANT hasn't applied
+                        // yet.
                         draw_footer_bar({
                             {"F1", "Main"},
                             {"F2", "Logs"},
                             {"B",  "Bootstrap"},
+                            {"L",  "Login"},
                             {"Q",  "Quit"},
                         });
                     }
@@ -1799,7 +2407,11 @@ void run_tui(mc::api::HttpServer& /*http*/,
                 action_logout(mod, mv);
             } else if ((key == 'b' || key == 'B') && !mod.logged_in
                        && !db.get_founder().has_value()) {
-                action_bootstrap_founder(db, mv);
+                action_bootstrap_founder(db, data_dir, mv);
+                // The GRANT just landed in the mempool — wake the
+                // producer thread so the first block mines immediately,
+                // not 2 s later when the heartbeat poll re-checks.
+                candidates.wake();
             } else if (mod.logged_in) {
                 if (key == 'i' || key == 'I') {
                     mv.dmca_files = scan_dmca_inbox(data_dir);
@@ -1813,8 +2425,16 @@ void run_tui(mc::api::HttpServer& /*http*/,
                     action_browse_library(api, db, mod, mv);
                 } else if (key == 'k' || key == 'K') {
                     action_review_kyc(db, mod, mv, data_dir);
+                    candidates.wake();
                 } else if (key == 'e' || key == 'E') {
                     action_release_escrow(db, mod, mv);
+                    candidates.wake();
+                } else if (key == 'v' || key == 'V') {
+                    action_view_proposals(db, mod, mv);
+                    candidates.wake();
+                } else if (key == 'm' || key == 'M') {
+                    action_manage_labels(db, mod, mv);
+                    candidates.wake();
                 } else if (key == 'r' || key == 'R') {
                     mv.dmca_files = scan_dmca_inbox(data_dir);
                     mv.kyc_files  = scan_kyc_inbox(data_dir);

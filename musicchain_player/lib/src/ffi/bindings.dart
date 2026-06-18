@@ -76,22 +76,6 @@ class MusicChainBindings {
   late final _mc_last_error =
       _mc_last_errorPtr.asFunction<ffi.Pointer<ffi.Char> Function()>();
 
-  /// Create a new wallet with the given password.
-  /// Returns a wallet handle, or NULL on failure.
-  mc_wallet_t mc_wallet_create(
-    ffi.Pointer<ffi.Char> password,
-  ) {
-    return _mc_wallet_create(
-      password,
-    );
-  }
-
-  late final _mc_wallet_createPtr =
-      _lookup<ffi.NativeFunction<mc_wallet_t Function(ffi.Pointer<ffi.Char>)>>(
-          'mc_wallet_create');
-  late final _mc_wallet_create = _mc_wallet_createPtr
-      .asFunction<mc_wallet_t Function(ffi.Pointer<ffi.Char>)>();
-
   /// Load an existing wallet from path.
   /// Returns a wallet handle, or NULL on failure.
   mc_wallet_t mc_wallet_load(
@@ -109,25 +93,6 @@ class MusicChainBindings {
           mc_wallet_t Function(
               ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>)>>('mc_wallet_load');
   late final _mc_wallet_load = _mc_wallet_loadPtr.asFunction<
-      mc_wallet_t Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>)>();
-
-  /// Import a private key (64-char hex) into a new wallet.
-  /// Returns a wallet handle, or NULL on failure.
-  mc_wallet_t mc_wallet_import(
-    ffi.Pointer<ffi.Char> priv_key_hex,
-    ffi.Pointer<ffi.Char> password,
-  ) {
-    return _mc_wallet_import(
-      priv_key_hex,
-      password,
-    );
-  }
-
-  late final _mc_wallet_importPtr = _lookup<
-      ffi.NativeFunction<
-          mc_wallet_t Function(ffi.Pointer<ffi.Char>,
-              ffi.Pointer<ffi.Char>)>>('mc_wallet_import');
-  late final _mc_wallet_import = _mc_wallet_importPtr.asFunction<
       mc_wallet_t Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>)>();
 
   /// Save wallet to path. Returns 0 on success.

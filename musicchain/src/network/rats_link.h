@@ -1,6 +1,10 @@
 #pragma once
 
+#include "../core/block.h"
+#include "../net/load_monitor.h"
+
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -25,6 +29,26 @@ constexpr uint16_t    MC_VPS_RATS_PORT = 8080;
 /// through endpoint to this topic every 15 minutes; the VPS mini-node
 /// subscribes and aggregates the routing table.
 constexpr const char* MC_ROUTES_TOPIC = "musicchain.routes";
+
+// Typed librats message kinds for consensus. We use rats_broadcast_message /
+// rats_on_message rather than GossipSub topics because the GossipSub layer
+// has a several-second mesh form-up window we can't tolerate for block
+// production — every full node accepts inbound consensus messages from any
+// validated peer on the same direct channel routes.get uses.
+//
+// MC_MSG_BLOCK_CANDIDATE — producer → validators. Body: JSON
+//   { "block_b64": "<base64 Block::serialize()>" }
+// Receivers re-deserialize, run validate_block + duplicate-fingerprint
+// check, and if both pass reply with a confirmation via the next msg type.
+//
+// MC_MSG_BLOCK_CONFIRMATION — validator → producer. Body: JSON
+//   { "block_hash": "<hex>",
+//     "validator_id": "<hex>",
+//     "pubkey": "<hex compressed pubkey>",
+//     "signature": "<hex 64-byte ECDSA>" }
+// Producer routes into CandidateManager::add_confirmation.
+constexpr const char* MC_MSG_BLOCK_CANDIDATE    = "mc:block_candidate";
+constexpr const char* MC_MSG_BLOCK_CONFIRMATION = "mc:block_confirmation";
 
 /// Wraps the librats C client so every musicchain-node can:
 ///   1. Punch through NAT via STUN at the VPS
@@ -63,9 +87,39 @@ public:
     // Broadcast raw bytes to every connected rats peer.
     void broadcast(const void* data, size_t size);
 
+    // ---- Consensus broadcast / receive ------------------------------
+    //
+    // Producer side: fan out a fresh candidate to every validated peer.
+    // `block_bytes` is Block::serialize(); we base64-encode and wrap in
+    // a tiny JSON envelope before handing to rats_broadcast_message.
+    void publish_block_candidate(const std::vector<uint8_t>& block_bytes);
+
+    // Validator side: respond to a candidate with this signed confirmation.
+    void publish_confirmation(const std::string& block_hash_hex,
+                              const ::mc::Confirmation& c);
+
+    // Wire up the validator-side handler that runs whenever a peer
+    // broadcasts a block candidate. Receives the raw serialized bytes;
+    // caller deserializes + validates + sends back a confirmation.
+    using BlockCandidateHandler =
+        std::function<void(std::vector<uint8_t> /*block_bytes*/)>;
+    void set_block_candidate_handler(BlockCandidateHandler h);
+
+    // Wire up the producer-side handler that runs when a validator
+    // sends back a confirmation. Routes into CandidateManager.
+    using ConfirmationHandler =
+        std::function<void(std::string /*block_hash_hex*/,
+                            ::mc::Confirmation)>;
+    void set_confirmation_handler(ConfirmationHandler h);
+
     // Publish our routing record to MC_ROUTES_TOPIC right now (also done
     // automatically every 15 minutes by the background thread).
     void publish_route_now();
+
+    // Wire a LoadMonitor whose current snapshot is added to every
+    // outgoing routes record. Players use the published load_score +
+    // is_busy + net_bps to pick the lightest full node.
+    void set_load_monitor(LoadMonitor* lm) { load_monitor_ = lm; }
 
 private:
     uint16_t       listen_port_;
@@ -76,6 +130,7 @@ private:
     mutable std::mutex pub_mu_;
     std::string    public_addr_;
     std::string    rats_peer_id_;
+    LoadMonitor*   load_monitor_ = nullptr;
 
     // List of bootstrap mini-nodes (VPSes) we dial at startup and re-dial
     // from the watchdog whenever validated_peer_count() == 0. Populated
@@ -91,9 +146,24 @@ private:
     std::atomic<bool> route_thread_running_{false};
     void route_loop();
     void observe_public_address_via_vps();
-    int  validated_peer_count() const;
     void redial_vps();
     std::string build_route_json() const;
+
+    // Consensus handlers (default-empty until node_main wires them).
+    mutable std::mutex      handlers_mu_;
+    BlockCandidateHandler   on_block_candidate_;
+    ConfirmationHandler     on_confirmation_;
+    static void on_candidate_msg_trampoline(void* user_data,
+                                            const char* peer_id,
+                                            const char* message_data);
+    static void on_confirmation_msg_trampoline(void* user_data,
+                                               const char* peer_id,
+                                               const char* message_data);
+
+public:
+    // Validated peer count — useful for consensus (knowing when the
+    // multi-node confirmation path should run vs. the solo fast-path).
+    int  validated_peer_count() const;
 };
 
 } // namespace mc::net

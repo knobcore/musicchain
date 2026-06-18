@@ -6,6 +6,7 @@
 #include "../crypto/hash.h"
 #include "../crypto/keys.h"
 #include "../crypto/signature.h"
+#include "../crypto/bip39.h"
 #include "../audio/ogg_validator.h"
 #include "../audio/ogg_decoder.h"
 #include "../audio/fingerprint.h"
@@ -48,19 +49,6 @@ struct WalletHandle {
     mc::crypto::KeyPair kp;
 };
 
-mc_wallet_t mc_wallet_create(const char* password) {
-    try {
-        auto kp = mc::crypto::generate_keypair();
-        auto* w = new WalletHandle{kp};
-        // Optionally save with password - caller calls mc_wallet_save
-        (void)password;
-        return w;
-    } catch (const std::exception& e) {
-        set_error(e.what());
-        return nullptr;
-    }
-}
-
 mc_wallet_t mc_wallet_load(const char* path, const char* password) {
     try {
         mc::crypto::EncryptedKey ek;
@@ -75,16 +63,58 @@ mc_wallet_t mc_wallet_load(const char* path, const char* password) {
     }
 }
 
-mc_wallet_t mc_wallet_import(const char* priv_key_hex, const char* password) {
+// ---- BIP39 mnemonic wallet flow -------------------------------------
+//
+// NB: the function definitions here drop the `extern "C" MUSICCHAIN_API`
+// decoration. The header (`include/musicchain.h`) carries it via the
+// `MUSICCHAIN_API` macro which expands to dllexport when MUSICCHAIN_BUILD
+// is defined and dllimport otherwise. Re-decorating the definition
+// triggers C2491 ("definition of dllimport function not allowed") in
+// MSVC because we're building the static library here, not the export
+// side.
+
+char* mc_bip39_generate_12(void) {
+    auto s = mc::crypto::bip39_generate_12();
+    if (s.empty()) {
+        set_error("bip39_generate failed");
+        return nullptr;
+    }
+    return make_cstring(s);
+}
+
+int mc_bip39_validate(const char* mnemonic) {
+    if (!mnemonic) return 0;
+    return mc::crypto::bip39_validate(mnemonic) ? 1 : 0;
+}
+
+mc_wallet_t mc_wallet_from_mnemonic(
+    const char* mnemonic, const char* passphrase) {
+    if (!mnemonic) { set_error("mnemonic is null"); return nullptr; }
     try {
-        mc::crypto::KeyPair kp;
-        if (!mc::crypto::keypair_from_hex(priv_key_hex, kp)) { set_error("invalid key"); return nullptr; }
-        (void)password;
-        return new WalletHandle{kp};
+        auto kp = mc::crypto::bip39_mnemonic_to_keypair(
+            mnemonic, passphrase ? passphrase : "");
+        if (!kp) { set_error("mnemonic failed validation"); return nullptr; }
+        return new WalletHandle{*kp};
     } catch (const std::exception& e) {
         set_error(e.what());
         return nullptr;
     }
+}
+
+char* mc_wallet_get_eth_address(mc_wallet_t wallet) {
+    auto* w = static_cast<WalletHandle*>(wallet);
+    if (!w) { set_error("null wallet"); return nullptr; }
+    auto a = mc::crypto::eth_address_from_pubkey(w->kp.public_key);
+    // Format as 0x-prefixed lowercase 40-hex per Ethereum convention.
+    static const char hex_lut[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(42);
+    out.append("0x");
+    for (uint8_t b : a) {
+        out.push_back(hex_lut[b >> 4]);
+        out.push_back(hex_lut[b & 0x0f]);
+    }
+    return make_cstring(out);
 }
 
 int mc_wallet_save(mc_wallet_t wallet, const char* path) {

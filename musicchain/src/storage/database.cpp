@@ -196,11 +196,16 @@ void Database::put_fingerprint(leveldb::WriteBatch& b, const SongSection& song) 
     // Reverse index: SHA256(compressed_fingerprint) -> content_hash.
     // Players that fingerprint local audio submit only the digest to ask
     // whether the chain knows that song; this index makes the answer O(1).
+    //
+    // Bug fix #20: this used to share the "h:" prefix with the block
+    // height-by-hash table (chain.cpp:47). Same prefix + same-length
+    // hex keys = two schemas living in the same keyspace. Moved to
+    // "fph:" so they're physically distinct.
     const Hash256 fp_hash = crypto::sha256(
         reinterpret_cast<const uint8_t*>(comp.data()), comp.size());
     std::vector<uint8_t> fp_to_ch(song.content_hash.begin(),
                                   song.content_hash.end());
-    put_batch(b, "h:" + hex(fp_hash), fp_to_ch);
+    put_batch(b, "fph:" + hex(fp_hash), fp_to_ch);
 
     // Update bucket inverted index
     for (auto bucket : fp->bucket_ids()) {
@@ -223,12 +228,12 @@ void Database::del_fingerprint(leveldb::WriteBatch& b, const Hash256& content_ha
     const Hash256 fp_hash = crypto::sha256(
         reinterpret_cast<const uint8_t*>(entry->compressed_fingerprint.data()),
         entry->compressed_fingerprint.size());
-    del_batch(b, "h:" + hex(fp_hash));
+    del_batch(b, "fph:" + hex(fp_hash));
 }
 
 std::optional<Hash256> Database::get_content_hash_for_fingerprint(
     const Hash256& fingerprint_hash) const {
-    auto v = get("h:" + hex(fingerprint_hash));
+    auto v = get("fph:" + hex(fingerprint_hash));
     if (!v || v->size() != 32) return std::nullopt;
     Hash256 ch;
     std::memcpy(ch.data(), v->data(), 32);
@@ -540,6 +545,206 @@ std::vector<Address> Database::list_active_moderators() const {
             a[i] = static_cast<uint8_t>((H << 4) | L);
         }
         out.push_back(a);
+        return true;
+    });
+    return out;
+}
+
+// ---- Record labels --------------------------------------------------
+
+namespace {
+std::string label_key_lower(const std::string& name) {
+    std::string out = name;
+    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+} // namespace
+
+void Database::set_label(leveldb::WriteBatch& b,
+                         const std::string& name,
+                         const LabelDef& def) {
+    // Wire format:
+    //   name_len (1) | display_name (name_len) |
+    //   splits_count (1) | for each: wallet(20) + basis_points(2 LE)
+    std::vector<uint8_t> buf;
+    const uint8_t nl = static_cast<uint8_t>(std::min<size_t>(def.display_name.size(), 64));
+    buf.push_back(nl);
+    buf.insert(buf.end(), def.display_name.begin(), def.display_name.begin() + nl);
+    const uint8_t sc = static_cast<uint8_t>(std::min<size_t>(def.splits.size(), 16));
+    buf.push_back(sc);
+    for (uint8_t i = 0; i < sc; ++i) {
+        buf.insert(buf.end(),
+                   def.splits[i].wallet.begin(),
+                   def.splits[i].wallet.end());
+        buf.push_back(static_cast<uint8_t>(def.splits[i].basis_points & 0xFF));
+        buf.push_back(static_cast<uint8_t>((def.splits[i].basis_points >> 8) & 0xFF));
+    }
+    put_batch(b, "label:" + label_key_lower(name), buf);
+}
+
+std::optional<Database::LabelDef> Database::get_label(const std::string& name) const {
+    auto raw = get("label:" + label_key_lower(name));
+    if (!raw || raw->empty()) return std::nullopt;
+    const uint8_t* p   = raw->data();
+    const uint8_t* end = raw->data() + raw->size();
+    if (p >= end) return std::nullopt;
+    uint8_t nl = *p++;
+    if (static_cast<size_t>(end - p) < nl) return std::nullopt;
+    LabelDef out;
+    out.display_name.assign(reinterpret_cast<const char*>(p), nl);
+    p += nl;
+    if (p >= end) return std::nullopt;
+    uint8_t sc = *p++;
+    out.splits.resize(sc);
+    for (uint8_t i = 0; i < sc; ++i) {
+        if (static_cast<size_t>(end - p) < 22) return std::nullopt;
+        std::memcpy(out.splits[i].wallet.data(), p, 20);
+        p += 20;
+        out.splits[i].basis_points = static_cast<uint16_t>(p[0]) |
+                                     (static_cast<uint16_t>(p[1]) << 8);
+        p += 2;
+    }
+    return out;
+}
+
+std::vector<std::string> Database::list_labels() const {
+    std::vector<std::string> out;
+    for_each_with_prefix("label:", [&](const std::string& k, const std::string&){
+        // Skip art_label: which doesn't actually start with "label:"
+        // but does share the prefix in alphabetical proximity. The
+        // strict prefix match above already screens it out.
+        if (k.size() > 6) out.push_back(k.substr(6));
+        return true;
+    });
+    return out;
+}
+
+void Database::assign_artist_label(leveldb::WriteBatch& b,
+                                   const Address& artist,
+                                   const std::string& label_name) {
+    if (label_name.empty()) {
+        b.Delete("art_label:" + hex(artist));
+        return;
+    }
+    auto canonical = label_key_lower(label_name);
+    put_batch(b, "art_label:" + hex(artist),
+              std::vector<uint8_t>(canonical.begin(), canonical.end()));
+}
+
+std::optional<std::string> Database::get_artist_label(const Address& artist) const {
+    auto v = get("art_label:" + hex(artist));
+    if (!v) return std::nullopt;
+    return std::string(v->begin(), v->end());
+}
+
+// ---- Username registry ----------------------------------------------
+
+namespace {
+std::string un_key_lower(const std::string& name) {
+    std::string out = name;
+    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+} // namespace
+
+bool Database::username_taken(const std::string& name) const {
+    return get("un:" + un_key_lower(name)).has_value();
+}
+
+void Database::set_username(leveldb::WriteBatch& b,
+                            const std::string& name,
+                            const Address& addr) {
+    auto canonical = un_key_lower(name);
+    put_batch(b, "un:" + canonical,
+              std::vector<uint8_t>(addr.begin(), addr.end()));
+    put_batch(b, "addrun:" + hex(addr),
+              std::vector<uint8_t>(canonical.begin(), canonical.end()));
+}
+
+std::optional<Address> Database::lookup_username(const std::string& name) const {
+    auto v = get("un:" + un_key_lower(name));
+    if (!v || v->size() != 20) return std::nullopt;
+    Address a;
+    std::memcpy(a.data(), v->data(), 20);
+    return a;
+}
+
+std::optional<std::string> Database::get_addr_username(const Address& addr) const {
+    auto v = get("addrun:" + hex(addr));
+    if (!v) return std::nullopt;
+    return std::string(v->begin(), v->end());
+}
+
+// ---- Multi-mod proposals (Phase 3) ----------------------------------
+
+bool Database::has_proposal(const Hash256& h) const {
+    return get("prop:" + hex(h)).has_value();
+}
+
+void Database::put_proposal(leveldb::WriteBatch& b,
+                            const Hash256& h,
+                            const std::vector<uint8_t>& raw) {
+    put_batch(b, "prop:" + hex(h), raw);
+}
+
+std::optional<std::vector<uint8_t>> Database::get_proposal(const Hash256& h) const {
+    return get("prop:" + hex(h));
+}
+
+uint8_t Database::get_proposal_status(const Hash256& h) const {
+    auto v = get("propstatus:" + hex(h));
+    if (!v || v->empty()) return PROP_PENDING;
+    return (*v)[0];
+}
+
+void Database::set_proposal_status(leveldb::WriteBatch& b,
+                                   const Hash256& h, uint8_t status) {
+    put_batch(b, "propstatus:" + hex(h), std::vector<uint8_t>{status});
+}
+
+bool Database::has_proposal_vote(const Hash256& prop_hash,
+                                 const Address& voter) const {
+    return get("propvote:" + hex(prop_hash) + ":" + hex(voter)).has_value();
+}
+
+void Database::add_proposal_vote(leveldb::WriteBatch& b,
+                                 const Hash256& prop_hash,
+                                 const Address& voter) {
+    put_batch(b, "propvote:" + hex(prop_hash) + ":" + hex(voter), {});
+}
+
+size_t Database::count_proposal_votes(const Hash256& prop_hash) const {
+    size_t n = 0;
+    for_each_with_prefix("propvote:" + hex(prop_hash) + ":",
+        [&](const std::string&, const std::string&){
+            ++n; return true;
+        });
+    return n;
+}
+
+std::vector<Hash256> Database::list_pending_proposals() const {
+    // We treat absence of the status key as PENDING; iterate over the
+    // `prop:` table and filter out any that have flipped to EXECUTED.
+    std::vector<Hash256> out;
+    for_each_with_prefix("prop:", [&](const std::string& k, const std::string&){
+        // Skip the propstatus + propvote tables which also start with
+        // "prop". Filter strictly on the "prop:" prefix length + the
+        // 64-hex tail.
+        if (k.size() != 5 + 64) return true;
+        Hash256 h{};
+        for (size_t i = 0; i < 32; ++i) {
+            auto h2 = [](char c)->int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                return -1;
+            };
+            int H = h2(k[5 + 2*i]);
+            int L = h2(k[5 + 2*i + 1]);
+            if (H < 0 || L < 0) return true;
+            h[i] = static_cast<uint8_t>((H << 4) | L);
+        }
+        if (get_proposal_status(h) == PROP_PENDING) out.push_back(h);
         return true;
     });
     return out;

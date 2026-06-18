@@ -50,6 +50,10 @@ struct PendingRegistration {
     uint16_t                  track_number = 0;
     std::vector<RoyaltySplit> royalty_splits;
     std::string               announcing_peer_id; // who fingerprinted it
+    // How many block-mint attempts this reg has burned. The producer
+    // gives up after 3 so a single bad submission can't wedge the
+    // chain forever (bug-fix #8).
+    uint8_t                   retries          = 0;
 };
 
 struct BlockCandidate {
@@ -89,6 +93,13 @@ public:
     /// Number of pending registrations waiting to land in the next block.
     size_t pending_registration_count() const;
 
+    /// External nudge: callers that have just dropped something into
+    /// the mempool (e.g. action_bootstrap_founder after enqueueing the
+    /// GRANT FOUNDER tx) call this so the heartbeat loop wakes
+    /// immediately instead of waiting out the poll interval. No effect
+    /// on the producer's internal state — pure notify.
+    void wake();
+
 private:
     mutable std::mutex                               mutex_;
     std::unordered_map<std::string, BlockCandidate>  candidates_;
@@ -100,6 +111,11 @@ private:
     std::thread                                      heartbeat_thread_;
     bool                                             running_ = false;
     uint64_t                                         last_block_at_ms_ = 0;
+    // wake() sets this to true under producer_mu_ + notify_all(); the
+    // wait_for predicate checks it so a notify accompanying a mempool
+    // tx (rather than a pending_regs_ push) actually breaks out of the
+    // sleep. Producer body resets it once the work is consumed.
+    bool                                             wake_requested_ = false;
 
     // Pending player-submitted registrations. The heartbeat loop drains
     // these into freshly-minted blocks — one song record per block,

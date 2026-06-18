@@ -279,6 +279,30 @@ if(NOT MSVC)
   list(APPEND MC_LINK_LIBS Threads::Threads)
 endif()
 
+# cpp-httplib (single-header) for the JSON-RPC HTTP shim. Quiet because
+# vcpkg ships the CONFIG target on Windows but pkg-config on Linux.
+find_package(httplib CONFIG QUIET)
+if(TARGET httplib::httplib)
+  list(APPEND MC_LINK_LIBS httplib::httplib)
+endif()
+
+# libwally-core: Bitcoin/Liquid wallet primitives. Vendored under
+# deps/libwally-core (git clone + secp256k1-zkp submodule). We force a
+# static build so the wallycore archive gets folded into
+# musicchain_static — no separate runtime .dll / .so to ship.
+set(BUILD_SHARED_LIBS                OFF CACHE BOOL "" FORCE)
+set(WALLYCORE_ENABLE_TESTS           OFF CACHE BOOL "" FORCE)
+set(WALLYCORE_INSTALL                OFF CACHE BOOL "" FORCE)
+set(WALLYCORE_BUILD_ELEMENTS         OFF CACHE BOOL "" FORCE)
+set(SECP256K1_BUILD_TESTS            OFF CACHE BOOL "" FORCE)
+set(SECP256K1_BUILD_BENCHMARK        OFF CACHE BOOL "" FORCE)
+set(SECP256K1_BUILD_EXAMPLES         OFF CACHE BOOL "" FORCE)
+set(SECP256K1_INSTALL                OFF CACHE BOOL "" FORCE)
+add_subdirectory(deps/libwally-core EXCLUDE_FROM_ALL)
+list(APPEND MC_LINK_LIBS wallycore)
+list(APPEND MC_INCLUDE_DIRS
+  ${CMAKE_SOURCE_DIR}/deps/libwally-core/include)
+
 if(TARGET nlohmann_json::nlohmann_json)
   list(APPEND MC_LINK_LIBS nlohmann_json::nlohmann_json)
 endif()
@@ -319,11 +343,24 @@ set(MC_SOURCES
   src/crypto/hash.cpp
   src/crypto/keys.cpp
   src/crypto/signature.cpp
+  src/crypto/ecies.cpp
+  # Hand-rolled BIP39 stays in the tree as a reference but is no longer
+  # linked. wally_bip39.cpp implements the same public API on top of
+  # the vendored libwally-core archive under deps/libwally-core.
+  # src/crypto/bip39.cpp
+  # src/crypto/bip39_wordlist_en.cpp
+  src/crypto/wally_bip39.cpp
+  src/crypto/keccak256.cpp
   src/audio/ogg_validator.cpp
   src/audio/ogg_decoder.cpp
   src/audio/fingerprint.cpp
+  src/audio/multi_decoder.cpp
   src/consensus/validator.cpp
   src/consensus/candidate.cpp
+  src/consensus/slashing.cpp
+  src/sync/sync_manager.cpp
+  src/sync/deep_audit.cpp
+  src/net/load_monitor.cpp
   src/tokens/ledger.cpp
   src/tokens/mint.cpp
   src/network/manager.cpp       # thin shim now — no TCP mesh
@@ -331,6 +368,7 @@ set(MC_SOURCES
   src/storage/database.cpp
   src/store/swarm.cpp
   src/api/server.cpp
+  src/api/jsonrpc_server.cpp
   src/api/routes.cpp
   src/api/rats_api.cpp
   src/capi/capi.cpp
@@ -412,7 +450,9 @@ endif()
 endif() # NOT MC_MINI_NODE_ONLY
 
 # Mini-node — VPS rendezvous binary, vanilla librats TCP transport.
-add_executable(musicchain-mini-node tools/mini_node.cpp)
+add_executable(musicchain-mini-node
+  tools/mini_node.cpp
+  src/net/load_monitor.cpp)
 target_link_libraries(musicchain-mini-node PRIVATE mc_rats_quic)
 if(WIN32)
   target_link_libraries(musicchain-mini-node PRIVATE ws2_32 iphlpapi bcrypt)

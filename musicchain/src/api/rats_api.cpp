@@ -10,6 +10,7 @@
 #include "librats_c.h"
 #include "../crypto/hash.h"
 #include "../crypto/signature.h"
+#include "../crypto/ecies.h"
 // h3_server include removed: the h3.request verb that wrapped HTTP/3-
 // shaped tunneled calls is gone now that the player drives every verb
 // through the native rats RPC. Restore behind MC_WITH_H3 when bringing
@@ -255,6 +256,64 @@ void RatsApi::handle_request(const std::string& peer_id,
                      {"body", { {"observed_address", addr} }}};
         } else if (type == "dht.peers") {
             reply = wrap_handler_result(req_id, http_.verb_dht_peers());
+        }
+        // ---- chain sync ---------------------------------------------
+        //
+        // chain.tip               → { height, hash, timestamp_ms }
+        // chain.list_block_hashes → { from_height, max=128 } →
+        //                            { hashes: [hex,hex,...] }
+        // chain.get_block         → { hash } | { height } →
+        //                            { block_b64: "..." }
+        //
+        // SyncManager on a fresh node calls chain.tip on every peer it
+        // can reach, picks the best peer per fork-choice, then walks
+        // chain.list_block_hashes paginated forward from its current
+        // tip+1 and pulls each block via chain.get_block. Each pulled
+        // block runs the same five-step validation rebuild_derived_state
+        // runs before connect_block.
+        else if (type == "chain.tip") {
+            const auto t = chain_.tip();
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"height",       t.height},
+                                {"hash",         crypto::to_hex(t.hash)},
+                                {"timestamp_ms", t.timestamp_ms}}}};
+        } else if (type == "chain.list_block_hashes") {
+            const uint32_t from = static_cast<uint32_t>(
+                in.value("from_height", 0));
+            uint32_t max  = static_cast<uint32_t>(in.value("max", 128));
+            if (max == 0 || max > 512) max = 128; // cap per-call cost
+            const auto t = chain_.tip();
+            std::vector<std::string> out;
+            for (uint32_t h = from; h <= t.height && out.size() < max; ++h) {
+                if (auto bh = chain_.get_block_hash(h))
+                    out.push_back(crypto::to_hex(*bh));
+                else break;
+            }
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"from_height", from},
+                                {"hashes",      out}}}};
+        } else if (type == "chain.get_block") {
+            std::optional<Block> block;
+            if (in.contains("hash")) {
+                Hash256 h{};
+                if (crypto::parse_hash256(in.value("hash", ""), h))
+                    block = chain_.get_block(h);
+            } else if (in.contains("height")) {
+                const uint32_t height =
+                    static_cast<uint32_t>(in.value("height", 0));
+                if (auto bh = chain_.get_block_hash(height))
+                    block = chain_.get_block(*bh);
+            }
+            if (!block) {
+                reply = {{"req_id", req_id}, {"status", "not_found"},
+                         {"body", nullptr}};
+            } else {
+                const auto bytes = block->serialize();
+                reply = {{"req_id", req_id}, {"status", "ok"},
+                         {"body", {{"block_b64",
+                                    audio::base64_encode(bytes.data(),
+                                                          bytes.size())}}}};
+            }
         } else if (type == "songs.list") {
             // Inject the live swarm size next to each chain entry so the
             // client can hide songs nobody is currently serving. The
@@ -397,7 +456,19 @@ void RatsApi::handle_request(const std::string& peer_id,
 
             Hash256 fph{};
             bool have_hash = false;
-            if (!fp_hex.empty()) {
+            // Bug fix: ALWAYS recompute fingerprint_hash from the
+            // actual compressed_fingerprint bytes when we have them.
+            // If the player only sent the hash, we trust it but it
+            // can't be used for new-song registration — only for
+            // existence lookups. This stops a class of bug where the
+            // player's claimed fph disagreed with sha256(compressed)
+            // and Block::validate later rejected the block (because
+            // Block::validate also recomputes), wedging the producer.
+            if (!fp.empty()) {
+                fph = crypto::sha256(
+                    reinterpret_cast<const uint8_t*>(fp.data()), fp.size());
+                have_hash = true;
+            } else if (!fp_hex.empty()) {
                 if (!crypto::parse_hash256(fp_hex, fph)) {
                     reply = {{"req_id", req_id},
                              {"status", "invalid"},
@@ -405,10 +476,6 @@ void RatsApi::handle_request(const std::string& peer_id,
                 } else {
                     have_hash = true;
                 }
-            } else if (!fp.empty()) {
-                fph = crypto::sha256(
-                    reinterpret_cast<const uint8_t*>(fp.data()), fp.size());
-                have_hash = true;
             } else {
                 reply = {{"req_id", req_id},
                          {"status", "invalid"},
@@ -920,17 +987,52 @@ void RatsApi::handle_request(const std::string& peer_id,
                 std::filesystem::create_directories(inbox, ec);
                 const auto path = inbox / (prefix + safe);
 
-                std::ofstream f(path, std::ios::binary | std::ios::trunc);
+                // Phase 4: encrypt the inbox file to every currently
+                // active moderator on chain. Any moderator can later
+                // decrypt with their own private key; the node
+                // operator cannot read the contents without being a
+                // moderator. If no moderator pubkeys are known (no
+                // founder yet, or DB corruption) we fall back to
+                // storing the plaintext so the operator can still see
+                // submissions during bootstrap — early-chain operators
+                // are expected to be the founder anyway.
+                std::vector<std::pair<Address, PubKey33>> recipients;
+                for (const auto& a : db_.list_active_moderators()) {
+                    auto pk = db_.get_mod_pubkey(a);
+                    if (pk.has_value()) recipients.emplace_back(a, *pk);
+                }
+
+                std::vector<uint8_t> blob_to_write = bytes;
+                std::string suffix_marker;
+                if (!recipients.empty()) {
+                    auto encrypted = mc::crypto::ecies_encrypt(bytes, recipients);
+                    if (!encrypted.empty()) {
+                        blob_to_write = std::move(encrypted);
+                        suffix_marker = ".enc";
+                    } else {
+                        std::cerr << "[rats-api] ecies_encrypt failed for "
+                                  << recipients.size()
+                                  << " recipients; storing plaintext\n";
+                    }
+                }
+
+                auto final_path = path;
+                if (!suffix_marker.empty()) {
+                    final_path += suffix_marker;
+                }
+
+                std::ofstream f(final_path, std::ios::binary | std::ios::trunc);
                 if (!f) {
                     reply = {{"req_id", req_id}, {"status", "error"},
                              {"error",  "could not open inbox file"}};
                 } else {
-                    f.write(reinterpret_cast<const char*>(bytes.data()),
-                            (std::streamsize)bytes.size());
+                    f.write(reinterpret_cast<const char*>(blob_to_write.data()),
+                            (std::streamsize)blob_to_write.size());
                     f.close();
                     std::cout << "[rats-api] " << type << ": stored "
-                              << bytes.size() << " bytes as "
-                              << path.filename().string() << "\n";
+                              << blob_to_write.size() << " bytes as "
+                              << final_path.filename().string()
+                              << " (recipients=" << recipients.size() << ")\n";
                     reply = {{"req_id", req_id}, {"status", "ok"},
                              {"body", {
                                  {"stored_as", path.filename().string()},

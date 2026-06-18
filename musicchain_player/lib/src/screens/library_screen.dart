@@ -292,10 +292,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Widget _splitBody(LibraryProvider lib) {
+    // Use filteredSongs so the rendered library hides entries whose
+    // serving peer is currently offline (LibraryProvider.filteredSongs
+    // drops swarmSize == 0). Without this, a song that was uploaded
+    // by a phone that later disconnected stays visible but unstreamable
+    // — the original "songs stay in list when user disconnects" bug.
+    final live = lib.filteredSongs;
     final wantedAlbum = _selectedAlbum?.toLowerCase();
     final selectedTracks = wantedAlbum == null
         ? const <Song>[]
-        : _drillFilter(lib.songs)
+        : _drillFilter(live)
             .where((s) => _albumKeyNorm(s) == wantedAlbum)
             .toList();
 
@@ -385,7 +391,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   List<Widget> _pillsFor(_DrillLevel level, LibraryProvider lib) {
-    final scoped = _drillFilter(lib.songs).toList();
+    // Same rule as _splitBody — pills are derived from songs whose
+    // serving peer is currently online so we don't pop up genre/artist
+    // chips that resolve to zero playable tracks.
+    final scoped = _drillFilter(lib.filteredSongs).toList();
     switch (level) {
       case _DrillLevel.genre:
         final buckets = _bucketByNorm(scoped, _genreKey, _genreKeyNorm);

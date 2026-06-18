@@ -68,7 +68,14 @@ bool parse_hash256(const std::string& hex, Hash256& out) {
 }
 
 bool parse_address(const std::string& hex, Address& out) {
-    auto b = from_hex(hex);
+    std::string h = hex;
+    // Accept 0x-prefixed input transparently (post-CEX-migration the
+    // user-facing format is EIP-55 0x-checksummed, but lots of
+    // internal call sites still pass bare hex).
+    if (h.size() == 42 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) {
+        h = h.substr(2);
+    }
+    auto b = from_hex(h);
     if (b.size() != 20) return false;
     std::copy(b.begin(), b.end(), out.begin());
     return true;

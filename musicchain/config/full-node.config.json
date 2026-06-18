@@ -1,0 +1,22 @@
+{
+  "data_dir":          "./data",
+  "p2p_port":          9333,
+  "api_port":          9334,
+  "rats_port":         8080,
+  "max_peers":         125,
+  "max_sessions":      10000,
+  "validator_enabled": true,
+  "log_level":         "info",
+  "tui_mode":          true,
+  "seed_nodes":        [],
+  "registry_url":      "",
+  "load_monitor": {
+    "max_bandwidth_bps":    10485760,
+    "cpu_weight":           0.6,
+    "net_weight":           0.4,
+    "sample_interval_ms":   5000,
+    "busy_score_threshold": 0.85,
+    "disable_net_metric":   false,
+    "disable_cpu_metric":   false
+  }
+}

@@ -65,33 +65,6 @@ class WalletProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> createWallet(String password) async {
-    _loading = true;
-    notifyListeners();
-    try {
-      _info  = await _service.createWallet(password);
-      _error = null;
-    } catch (e) {
-      _error = e.toString();
-    }
-    _loading = false;
-    notifyListeners();
-  }
-
-  Future<void> importWallet(String privateKeyHex, String password) async {
-    _loading = true;
-    notifyListeners();
-    try {
-      _info  = await _service.importWallet(privateKeyHex, password);
-      _error = null;
-      await refreshBalance();
-    } catch (e) {
-      _error = e.toString();
-    }
-    _loading = false;
-    notifyListeners();
-  }
-
   Future<void> refreshBalance() async {
     if (_info == null) return;
     try {
@@ -121,7 +94,14 @@ class WalletProvider extends ChangeNotifier {
           .substring(0, 8);
       final amount = whole * 100000000 + int.parse(frac);
 
-      // Build 56-byte sign message: from(20) | to(20) | amount(8 LE) | nonce(8 LE)
+      // Build 60-byte sign message:
+      //   chain_id(4 LE) | from(20) | to(20) | amount(8 LE) | nonce(8 LE)
+      //
+      // Must match TransferTx::sign_message() in
+      // musicchain/src/core/transaction.cpp — EIP-155-style chain_id is
+      // mixed in first so a signature can't replay on Ethereum /
+      // BSC / Base / any other chain. MC_CHAIN_ID = 19779 (0x4D43, "MC").
+      const int mcChainId = 19779;
       Uint8List hexToBytes(String hex) {
         final h = hex.replaceAll('0x', '');
         return Uint8List.fromList(List.generate(
@@ -129,18 +109,23 @@ class WalletProvider extends ChangeNotifier {
           (i) => int.parse(h.substring(i * 2, i * 2 + 2), radix: 16),
         ));
       }
-
+      void writeU32LE(Uint8List buf, int offset, int value) {
+        for (int i = 0; i < 4; i++) {
+          buf[offset + i] = (value >> (i * 8)) & 0xFF;
+        }
+      }
       void writeU64LE(Uint8List buf, int offset, int value) {
         for (int i = 0; i < 8; i++) {
           buf[offset + i] = (value >> (i * 8)) & 0xFF;
         }
       }
 
-      final msg = Uint8List(56);
-      msg.setRange(0, 20, hexToBytes(_info!.address));
-      msg.setRange(20, 40, hexToBytes(toAddress));
-      writeU64LE(msg, 40, amount);
-      writeU64LE(msg, 48, nonce);
+      final msg = Uint8List(60);
+      writeU32LE(msg, 0, mcChainId);
+      msg.setRange(4,  24, hexToBytes(_info!.address));
+      msg.setRange(24, 44, hexToBytes(toAddress));
+      writeU64LE(msg, 44, amount);
+      writeU64LE(msg, 52, nonce);
 
       // Sign via FFI (mc_wallet_sign hashes internally then ECDSA signs)
       final sig = _service.sign(msg);

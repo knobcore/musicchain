@@ -17,13 +17,20 @@
 #include "../src/network/rats_link.h"
 #include "../src/api/server.h"
 #include "../src/api/rats_api.h"
+#include "../src/api/jsonrpc_server.h"
 // h3_server include removed: the standalone HTTP/3 listener was retired
 // when verbs moved to librats RPC. Restore behind MC_WITH_H3 when bringing
 // it back.
 #include "../src/consensus/candidate.h"
 #include "../src/consensus/validator.h"
+#include "../src/sync/sync_manager.h"
+#include "../src/sync/deep_audit.h"
+#include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/hash.h"
+#include "../src/crypto/signature.h"
+#include "../src/audio/fingerprint.h"
+#include <unordered_set>
 #include "node_tui.h"
 
 #include "../deps/librats/src/librats_c.h"
@@ -43,7 +50,20 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+// Load-monitor settings parsed from the JSON config — used to construct
+// the LoadMonitor below. File-scope so load_config can populate it
+// without changing the function signature.
+static mc::net::LoadConfig g_load_cfg{};
+
 // ---- Configuration --------------------------------------------------
+
+// Mirrors NodeConfig + the bits node_main keeps in file-scope state so
+// running the binary a second time replays the same setup. Anything an
+// operator sets via the TUI or CLI lands here, gets serialized to
+// `config.json`, and is honoured on next boot. Defaults are conservative
+// (loopback-free 9333/9334/8080 + small caches) so a fresh install with
+// no config still produces a useful node.
+static bool g_tui_mode_persisted = true;
 
 static mc::net::NodeConfig load_config(const std::string& path) {
     mc::net::NodeConfig cfg;
@@ -51,17 +71,76 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     std::ifstream f(path);
     json j;
     f >> j;
-    if (j.contains("data_dir"))        cfg.data_dir = j["data_dir"];
-    if (j.contains("p2p_port"))        cfg.p2p_port = j["p2p_port"];
-    if (j.contains("api_port"))        cfg.api_port = j["api_port"];
-    if (j.contains("max_peers"))       cfg.max_peers = j["max_peers"];
-    if (j.contains("validator_enabled")) cfg.validator_enabled = j["validator_enabled"];
-    if (j.contains("log_level"))       cfg.log_level = j["log_level"];
+    if (j.contains("data_dir"))           cfg.data_dir = j["data_dir"];
+    if (j.contains("p2p_port"))           cfg.p2p_port = j["p2p_port"];
+    if (j.contains("api_port"))           cfg.api_port = j["api_port"];
+    if (j.contains("rats_port"))          cfg.rats_port = j["rats_port"];
+    if (j.contains("max_peers"))          cfg.max_peers = j["max_peers"];
+    if (j.contains("max_sessions"))       cfg.max_sessions = j["max_sessions"];
+    if (j.contains("validator_enabled"))  cfg.validator_enabled = j["validator_enabled"];
+    if (j.contains("log_level"))          cfg.log_level = j["log_level"];
+    if (j.contains("tui_mode"))           g_tui_mode_persisted = j["tui_mode"];
     if (j.contains("seed_nodes")) {
         for (auto& s : j["seed_nodes"]) cfg.seed_nodes.push_back(s);
     }
     if (j.contains("registry_url"))  cfg.registry_url  = j["registry_url"];
+    if (j.contains("load_monitor")) {
+        const auto& lm = j["load_monitor"];
+        if (lm.contains("max_bandwidth_bps"))
+            g_load_cfg.max_bandwidth_bps = lm["max_bandwidth_bps"];
+        if (lm.contains("cpu_weight"))
+            g_load_cfg.cpu_weight = lm["cpu_weight"];
+        if (lm.contains("net_weight"))
+            g_load_cfg.net_weight = lm["net_weight"];
+        if (lm.contains("sample_interval_ms"))
+            g_load_cfg.sample_interval_ms = lm["sample_interval_ms"];
+        if (lm.contains("busy_score_threshold"))
+            g_load_cfg.busy_score_threshold = lm["busy_score_threshold"];
+        if (lm.contains("disable_net_metric"))
+            g_load_cfg.disable_net_metric = lm["disable_net_metric"];
+        if (lm.contains("disable_cpu_metric"))
+            g_load_cfg.disable_cpu_metric = lm["disable_cpu_metric"];
+    }
     return cfg;
+}
+
+// Write the current config (whatever load_config + CLI overrides produced)
+// back to disk so the next launch picks up the same settings without the
+// operator having to remember which flags they used. Called from cmd_start
+// once the full settings are resolved; safe to overwrite — we keep the
+// existing file's unknown keys by reading-then-mutating-then-writing.
+static void save_config(const std::string& path,
+                        const mc::net::NodeConfig& cfg,
+                        bool tui_mode) {
+    json j = json::object();
+    if (fs::exists(path)) {
+        try { std::ifstream f(path); f >> j; } catch (...) { j = json::object(); }
+    }
+    j["data_dir"]          = cfg.data_dir;
+    j["p2p_port"]          = cfg.p2p_port;
+    j["api_port"]          = cfg.api_port;
+    j["rats_port"]         = cfg.rats_port;
+    j["max_peers"]         = cfg.max_peers;
+    j["max_sessions"]      = cfg.max_sessions;
+    j["validator_enabled"] = cfg.validator_enabled;
+    j["log_level"]         = cfg.log_level;
+    j["tui_mode"]          = tui_mode;
+    j["seed_nodes"]        = cfg.seed_nodes;
+    j["registry_url"]      = cfg.registry_url;
+    json lm = json::object();
+    lm["max_bandwidth_bps"]    = g_load_cfg.max_bandwidth_bps;
+    lm["cpu_weight"]           = g_load_cfg.cpu_weight;
+    lm["net_weight"]           = g_load_cfg.net_weight;
+    lm["sample_interval_ms"]   = g_load_cfg.sample_interval_ms;
+    lm["busy_score_threshold"] = g_load_cfg.busy_score_threshold;
+    lm["disable_net_metric"]   = g_load_cfg.disable_net_metric;
+    lm["disable_cpu_metric"]   = g_load_cfg.disable_cpu_metric;
+    j["load_monitor"]      = lm;
+    try {
+        fs::create_directories(fs::path(path).parent_path());
+        std::ofstream f(path);
+        f << j.dump(2);
+    } catch (...) { /* non-fatal */ }
 }
 
 // ---- Signal handling ------------------------------------------------
@@ -109,18 +188,63 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         mc::ui::start_log_capture();
     }
 
-    // Load from file if provided (args override)
-    if (!config_path.empty()) {
+    // Locate config file. Probe order (first hit wins):
+    //   1. --config explicit path
+    //   2. ${data_dir}/config.json (set in previous run via save_config)
+    //   3. ./data/config.json (default data-dir convention)
+    //   4. ./full-node.config.json (shipped alongside the binary by the
+    //      build script — the operator's first-run starting point)
+    //   5. <exe_dir>/full-node.config.json (operator launched from elsewhere)
+    // Without this fallback ladder the operator either has to remember
+    // --config every time or carry the file in cwd. The build now ships
+    // a default file next to the .exe so step 4/5 always fires on a
+    // clean install.
+    if (config_path.empty()) {
+        auto try_path = [&](const std::string& p) {
+            if (!config_path.empty()) return;
+            if (fs::exists(p)) config_path = p;
+        };
+        if (!cfg.data_dir.empty()) try_path(cfg.data_dir + "/config.json");
+        try_path("./data/config.json");
+        try_path("./full-node.config.json");
+        if (exe_path) {
+            const fs::path exe_dir = fs::path(exe_path).parent_path();
+            if (!exe_dir.empty())
+                try_path((exe_dir / "full-node.config.json").string());
+        }
+    }
+    // Load from file if a config exists (explicit args still override).
+    if (!config_path.empty() && fs::exists(config_path)) {
         auto file_cfg = load_config(config_path);
         if (cfg.data_dir.empty())  cfg.data_dir  = file_cfg.data_dir;
         if (cfg.p2p_port == 9333 && file_cfg.p2p_port != 9333) cfg.p2p_port = file_cfg.p2p_port;
         if (cfg.api_port == 9334 && file_cfg.api_port != 9334) cfg.api_port = file_cfg.api_port;
+        if (cfg.rats_port == 8080 && file_cfg.rats_port != 8080) cfg.rats_port = file_cfg.rats_port;
+        if (cfg.max_peers == 125 && file_cfg.max_peers != 125) cfg.max_peers = file_cfg.max_peers;
         if (cfg.seed_nodes.empty())    cfg.seed_nodes    = file_cfg.seed_nodes;
         if (cfg.registry_url.empty())  cfg.registry_url  = file_cfg.registry_url;
-        if (!file_cfg.data_dir.empty() && cfg.data_dir.empty()) cfg.data_dir = file_cfg.data_dir;
+        // tui_mode: file value wins unless CLI explicitly passed --no-tui /
+        // --tui (handled before this block flipped tui_mode away from the
+        // default). We re-apply the persisted value here only when the CLI
+        // didn't touch it. Simplest signal: if CLI didn't set it, tui_mode
+        // is still the default true.
+        if (tui_mode == true) tui_mode = g_tui_mode_persisted;
     }
 
     if (cfg.data_dir.empty()) cfg.data_dir = "./data";
+
+    // Persist the resolved (file + CLI) settings back so a re-run with
+    // no flags reuses everything the operator picked here — including
+    // data_dir, ports, tui mode, and the load_monitor block. The path
+    // is config_path when --config was passed, else ${data_dir}/config.json
+    // so a node-with-no-arguments run still leaves a self-describing
+    // record next to its data.
+    {
+        std::string save_path = config_path.empty()
+            ? cfg.data_dir + "/config.json"
+            : config_path;
+        save_config(save_path, cfg, tui_mode);
+    }
 
     // Create directories
     std::cerr << "[dbg] creating dirs\n";
@@ -144,7 +268,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cerr << "[dbg] keypair loaded\n";
     cfg.node_id = mc::crypto::sha256(keypair.public_key.data(), 33);
     std::cout << "[node] node_id: " << mc::crypto::to_hex(cfg.node_id) << "\n";
-    std::cout << "[node] address: " << mc::crypto::to_hex(keypair.address.data(), 20) << "\n";
+    std::cout << "[node] address: " << mc::crypto::to_checksum_hex(keypair.address) << "\n";
 
     // Bootstrap first moderator wallet (runs once, guarded by sentinel key)
     std::cerr << "[dbg] moderator bootstrap\n";
@@ -156,14 +280,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
             std::ofstream mod_f(cfg.data_dir + "/moderator.txt");
             mod_f << "Private Key: " << mc::crypto::to_hex(mod_kp.private_key.data(),
                                                             mod_kp.private_key.size()) << "\n";
-            mod_f << "Address:     " << mc::crypto::to_hex(mod_kp.address.data(), 20) << "\n";
+            mod_f << "Address:     " << mc::crypto::to_checksum_hex(mod_kp.address) << "\n";
             mod_f.close();
             db.add_moderator(mod_batch, mod_kp.address);
             db.put_batch(mod_batch, "moderator_initialized", {1});
             db.write(mod_batch);
             std::cout << "[node] moderator wallet created — " << cfg.data_dir << "/moderator.txt\n";
             std::cout << "[node] moderator address: "
-                      << mc::crypto::to_hex(mod_kp.address.data(), 20) << "\n";
+                      << mc::crypto::to_checksum_hex(mod_kp.address) << "\n";
         }
     }
 
@@ -184,10 +308,13 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // Network manager
     std::cerr << "[dbg] creating network manager\n";
     mc::net::NetworkManager network(chain, candidates, cfg, keypair);
+    // Legacy direct-connect path — fires when a peer pushes a finalized
+    // block over the (gutted) TCP mesh. Still safe to leave installed: if
+    // the mesh ever comes back it just calls connect_block.
     network.set_block_handler([&chain](mc::Block block) {
-        std::string err;
         if (chain.connect_block(block)) {
-            std::cout << "[chain] connected block at height " << chain.tip().height << "\n";
+            std::cout << "[chain] connected block at height "
+                      << chain.tip().height << "\n";
         } else {
             std::cerr << "[chain] failed to connect block\n";
         }
@@ -216,6 +343,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // create it first and hand a reference to RatsApi.
     mc::api::HttpServer api(chain, candidates, network, db, cfg, keypair);
 
+    // JSON-RPC HTTP shim for exchange / explorer integration. Ethereum-
+    // flavoured `eth_*` methods on port 8545 (the EVM convention), bound
+    // to 127.0.0.1 by default so an operator opening the firewall is an
+    // explicit decision. Cheap to keep alive — about 1 MiB of resident
+    // memory at idle and no traffic until somebody scrapes us.
+    mc::api::JsonRpcServer rpc(chain, db, 8545);
+    rpc.start();
+
     // The standalone HTTP/3 server on cfg.api_port is gone — every verb in
     // HttpServer is now reachable over the same librats QUIC RPC channel
     // (see RatsApi below) on UDP/443. Players, full nodes and the mini-node
@@ -226,9 +361,17 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // from behind a NAT, without any UPnP support. Also publishes our
     // routing record (node_id + STUN-discovered public address + api_port)
     // to the VPS mini-node every 15 minutes via the MC_ROUTES_TOPIC topic.
+    // LoadMonitor must outlive RatsLink (RatsLink reads its current()
+    // snapshot when building each routes record).
+    static mc::net::LoadMonitor load_mon(g_load_cfg);
+    load_mon.start();
+    std::cout << "[load] monitor started: max_bw="
+              << g_load_cfg.max_bandwidth_bps << " bps, busy@"
+              << g_load_cfg.busy_score_threshold << "\n";
     mc::net::RatsLink rats(cfg.rats_port,
                             mc::crypto::to_hex(cfg.node_id),
                             cfg.api_port);
+    rats.set_load_monitor(&load_mon);
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
     if (rats.start()) {
         std::cout << "[node] rats link active on port " << cfg.rats_port
@@ -255,8 +398,188 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         }
 
         rats_api.start(rats.client());
+
+        // ---- Consensus mesh wiring -------------------------------------
+        //
+        // Hand RatsLink to the consensus layer so the producer (in
+        // CandidateManager::commit_block) can fan out fresh candidates
+        // and so we can count actual peers when deciding solo vs.
+        // multi-node. Without these two lines block production runs
+        // forever in the solo-self-sign path even when peers are present.
+        network.set_peer_count_provider([&rats] {
+            int n = rats.validated_peer_count();
+            return n < 0 ? size_t{0} : static_cast<size_t>(n);
+        });
+        network.set_candidate_publisher([&rats](const std::vector<uint8_t>& b) {
+            rats.publish_block_candidate(b);
+        });
+
+        // ---- Validator-side: vote on incoming candidates --------------
+        //
+        // Other nodes' producers broadcast their freshly-minted block
+        // here. We re-deserialize, run the same checks chain.connect_block
+        // would later run, plus the uniqueness gate ("has anyone already
+        // registered this fingerprint?"). If everything passes we sign
+        // (block_hash, keypair.private_key) and publish a Confirmation
+        // back over the same channel, where the producer's confirmation
+        // handler picks it up and calls candidates.add_confirmation.
+        //
+        // We deliberately do NOT call chain.connect_block here — the block
+        // isn't final until REQUIRED_CONFIRMATIONS arrive at the producer.
+        // The producer then re-broadcasts the finalized block on a future
+        // turn (via routes / catch-up sync) and connect happens there.
+        rats.set_block_candidate_handler(
+            [&chain, &db, &cfg, &keypair, &rats](std::vector<uint8_t> bytes) {
+                mc::Block block;
+                if (!mc::Block::deserialize(bytes.data(), bytes.size(), block)) {
+                    std::cerr << "[consensus] dropped candidate: malformed\n";
+                    return;
+                }
+                std::string err;
+                if (!chain.validate_block(block, err)) {
+                    // Note: Block::validate (called from chain.validate_block)
+                    // already enforces sha256(compressed_fingerprint bytes)
+                    // == header.fingerprint_hash, so we don't repeat that
+                    // check here. A producer can't lie about which
+                    // fingerprint a header claims.
+                    std::cerr << "[consensus] dropped candidate: validate failed — "
+                              << err << "\n";
+                    return;
+                }
+                if (block.has_song) {
+                    // Uniqueness gate #1 — same audio file already on-chain.
+                    // Indexed by content_hash via the "f:" prefix. Cheapest
+                    // check; one DB get.
+                    if (db.get_fingerprint(block.song.content_hash)) {
+                        std::cerr << "[consensus] dropped candidate: content_hash "
+                                     "already registered\n";
+                        return;
+                    }
+                    // Uniqueness gate #2 — SAME song re-encoded as a
+                    // different file. chromaprint is content-similarity,
+                    // not bit-equality: re-encoding an MP3 to OGG keeps
+                    // the song audibly identical but produces a *similar*
+                    // (not equal) fingerprint, which means a different
+                    // header.fingerprint_hash and a different
+                    // song.content_hash. So we have to decode the
+                    // candidate's chromaprint blob into raw 32-bit
+                    // per-frame codes and compute bin-level hamming-
+                    // distance similarity against everything in the
+                    // bucket index. Threshold matches rats_api's existing
+                    // fingerprint.submit fuzzy probe (kSimThreshold=0.55)
+                    // — anything above that is treated as the same song.
+                    auto submitted = mc::audio::Fingerprint::from_compressed(
+                        block.song.compressed_fingerprint);
+                    if (submitted) {
+                        constexpr float kSimThreshold = 0.55f;
+                        std::unordered_set<std::string> seen;
+                        float best_sim = 0.0f;
+                        mc::Hash256 best_match{};
+                        int n_candidates = 0;
+                        for (auto bucket : submitted->bucket_ids()) {
+                            for (const auto& cand_ch : db.get_bucket(bucket)) {
+                                if (cand_ch == block.song.content_hash) continue;
+                                const std::string key = mc::crypto::to_hex(cand_ch);
+                                if (!seen.insert(key).second) continue;
+                                ++n_candidates;
+                                auto entry = db.get_fingerprint(cand_ch);
+                                if (!entry) continue;
+                                auto cand_fp = mc::audio::Fingerprint::from_compressed(
+                                    entry->compressed_fingerprint);
+                                if (!cand_fp) continue;
+                                const float sim = submitted->similarity(*cand_fp);
+                                if (sim > best_sim) {
+                                    best_sim   = sim;
+                                    best_match = cand_ch;
+                                }
+                                if (sim >= kSimThreshold) goto reject_dup;
+                            }
+                        }
+                        std::cout << "[consensus] fuzzy probe: "
+                                  << n_candidates << " candidates, best="
+                                  << best_sim << "\n";
+                        goto fuzzy_ok;
+reject_dup:
+                        std::cerr << "[consensus] dropped candidate: chromaprint "
+                                     "similar to already-registered song "
+                                  << mc::crypto::to_hex(best_match).substr(0, 16)
+                                  << "… (sim=" << best_sim << " >= "
+                                  << kSimThreshold << ")\n";
+                        return;
+fuzzy_ok: ;
+                    }
+                }
+                // Validation passed. Sign and broadcast a confirmation.
+                mc::Confirmation conf{};
+                conf.validator_id = cfg.node_id;
+                std::copy(keypair.public_key.begin(), keypair.public_key.end(),
+                          conf.pubkey.begin());
+                conf.signature = mc::crypto::sign_ecdsa(block.hash(),
+                                                        keypair.private_key);
+                const std::string block_hash_hex =
+                    mc::crypto::to_hex(block.hash());
+                rats.publish_confirmation(block_hash_hex, conf);
+                std::cout << "[consensus] confirmed candidate "
+                          << block_hash_hex.substr(0, 16) << "…\n";
+            });
+
+        // ---- Producer-side: collect votes from validators -------------
+        rats.set_confirmation_handler(
+            [&candidates, &chain](std::string block_hash_hex,
+                                   mc::Confirmation c) {
+                // Slashed validators' confirmations don't count. We
+                // derive the validator's address from their public key
+                // and check the slashed: index. This protects against
+                // a slashed party still emitting confirmation messages
+                // from their old key — those go in the bin.
+                const auto addr =
+                    mc::crypto::address_from_pubkey(c.pubkey);
+                if (chain.is_slashed(addr)) {
+                    std::cerr << "[consensus] dropped confirmation from "
+                                 "slashed validator "
+                              << mc::crypto::to_hex(addr.data(), 20)
+                                    .substr(0, 16) << "…\n";
+                    return;
+                }
+                bool now_final =
+                    candidates.add_confirmation(block_hash_hex, c);
+                if (now_final) {
+                    std::cout << "[consensus] candidate "
+                              << block_hash_hex.substr(0, 16)
+                              << "… reached quorum\n";
+                }
+            });
     } else {
         std::cerr << "[node] rats link failed to start — continuing without NAT punch\n";
+    }
+    if (rats.client()) {
+        // SyncManager fetches missing history from peers on startup. Wires
+        // a librats inbound-reply handler so RPC replies from peers reach
+        // the correlator and unblock the matching pending request.
+        static mc::SyncManager sync(chain, rats, /*min_peers=*/2);
+        rats_on_message(rats.client(), "musicchain.reply",
+            [](void* /*user*/, const char* peer_id,
+                const char* message_data) {
+                if (!peer_id || !message_data) {
+                    if (peer_id)       rats_string_free(peer_id);
+                    if (message_data)  rats_string_free(message_data);
+                    return;
+                }
+                sync.on_rpc_reply(peer_id, message_data);
+                rats_string_free(peer_id);
+                rats_string_free(message_data);
+            }, nullptr);
+        sync.start();
+
+        // DeepAuditor runs the chromaprint↔audio re-check on a random
+        // recent block every kAuditIntervalMs. Catches producers that
+        // declared one fingerprint but uploaded different audio. Full
+        // nodes don't hold audio under the post-pivot architecture, so
+        // most cycles will no-op (graceful — the audit just skips). On
+        // the player + on nodes that opt into a content cache, this is
+        // the gate against fingerprint-vs-audio forgery.
+        static mc::DeepAuditor audit(chain, db, cfg.data_dir + "/audio");
+        audit.start();
     }
 
     // UPnP removed. NAT traversal is now mc_rats_quic's job (QUIC peers all
@@ -285,7 +608,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
             }
         });
         mc::ui::run_tui(api, rats_api, chain, db, rats_api.swarm_index(),
-                        network, keypair, cfg.data_dir, g_running);
+                        network, candidates, keypair, cfg.data_dir, g_running);
         if (janitor.joinable()) janitor.join();
     } else {
         std::cout << "[node] running. Press Ctrl+C to stop.\n";

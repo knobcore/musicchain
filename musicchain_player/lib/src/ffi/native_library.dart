@@ -6,6 +6,7 @@ import 'bindings.dart';
 
 class NativeLibrary {
   static late MusicChainBindings _bindings;
+  static late DynamicLibrary _lib;
   static bool _initialized = false;
 
   static MusicChainBindings get bindings {
@@ -13,11 +14,21 @@ class NativeLibrary {
     return _bindings;
   }
 
+  /// Raw DynamicLibrary handle — exposed for hand-written FFI bindings
+  /// in companion files (wallet_mnemonic_bindings.dart, etc.) that
+  /// need to resolve symbols added to musicchain.h after the generated
+  /// MusicChainBindings was last regenerated. Prefer `bindings` over
+  /// this for anything ffigen knows about.
+  static DynamicLibrary get lib {
+    assert(_initialized, 'Call NativeLibrary.initialize() first');
+    return _lib;
+  }
+
   static Future<void> initialize() async {
     if (_initialized) return;
 
-    final lib = _loadLibrary();
-    _bindings = MusicChainBindings(lib);
+    _lib = _loadLibrary();
+    _bindings = MusicChainBindings(_lib);
 
     final result = _bindings.mc_init();
     if (result != 0) {

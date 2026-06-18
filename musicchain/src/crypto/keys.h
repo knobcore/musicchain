@@ -31,8 +31,29 @@ std::vector<uint8_t> derive_seed_pbkdf2_sha512(const std::string& passphrase,
 // Derive keypair from hex private key string
 bool keypair_from_hex(const std::string& priv_hex, KeyPair& out);
 
-// Derive Address from compressed public key
+// Derive Address from compressed public key.
+//
+// As of the CEX-friendly migration, this uses Ethereum-style derivation:
+// keccak256(uncompressed_pubkey[1..65])[-20..]. The result is the
+// same 20-byte address that MetaMask, Coinbase Wallet, ethers.js, and
+// every other EVM tool will produce from the same secp256k1 key.
 Address address_from_pubkey(const PubKey33& pubkey);
+
+// Kept as an alias for code that imported it during the earlier bridge
+// design phase. Now identical to `address_from_pubkey`.
+using EthAddress = std::array<uint8_t, 20>;
+EthAddress eth_address_from_pubkey(const PubKey33& pubkey);
+
+// EIP-55 mixed-case checksummed representation of an address.
+// Returns "0x" + 40 hex chars with the case carrying the checksum.
+// Use this everywhere addresses are displayed to users so they catch
+// typos (and so we look like a standard EVM-style chain).
+std::string to_checksum_hex(const Address& addr);
+
+// Parse a 0x-prefixed or unprefixed hex address. If the input is
+// mixed-case, the EIP-55 checksum is verified and a mismatch returns
+// false. All-lowercase or all-uppercase is accepted as legacy.
+bool parse_address_checksummed(const std::string& s, Address& out);
 
 // ---- Encrypted key file (Argon2id + AES-256-GCM) -------------------
 

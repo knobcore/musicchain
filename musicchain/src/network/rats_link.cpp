@@ -1,4 +1,6 @@
 #include "rats_link.h"
+#include "../audio/fingerprint.h"  // base64_encode / base64_decode
+#include "../crypto/hash.h"        // to_hex / from_hex helpers
 
 // `mc_rats_quic.h` was the old transparent shim that exported the librats C
 // API directly. We now link the real librats (deps/librats) compiled with a
@@ -87,6 +89,15 @@ bool RatsLink::start() {
     // (mostly informational here — the VPS mini-node is the real aggregator).
     rats_subscribe_to_topic(client_, MC_ROUTES_TOPIC);
 
+    // Consensus message dispatchers. rats_on_message keys on the typed
+    // message name so other librats traffic (file transfers, routes, etc.)
+    // doesn't reach these. We pass `this` as user_data so the trampoline
+    // can find the active handler.
+    rats_on_message(client_, MC_MSG_BLOCK_CANDIDATE,
+                    &RatsLink::on_candidate_msg_trampoline, this);
+    rats_on_message(client_, MC_MSG_BLOCK_CONFIRMATION,
+                    &RatsLink::on_confirmation_msg_trampoline, this);
+
     running_ = true;
 
     // Kick off the 15-minute route-broadcast thread.
@@ -145,11 +156,17 @@ std::string RatsLink::build_route_json() const {
         pub = public_addr_;
         rid = rats_peer_id_;
     }
+    LoadMonitor::Snapshot load{};
+    if (load_monitor_) load = load_monitor_->current();
     std::ostringstream ss;
     ss << "{\"node_id\":\""        << node_id_hex_  << "\","
        << "\"rats_peer_id\":\""    << rid           << "\","
        << "\"public_address\":\""  << pub           << "\","
        << "\"api_port\":"          << own_api_port_ << ","
+       << "\"load_score\":"        << load.load_score << ","
+       << "\"cpu_load\":"          << load.cpu_load   << ","
+       << "\"net_bps\":"           << load.net_bytes_per_sec << ","
+       << "\"is_busy\":"           << (load.is_busy ? "true" : "false") << ","
        << "\"ts\":"                << ts            << "}";
     return ss.str();
 }
@@ -344,6 +361,108 @@ void RatsLink::route_loop() {
         for (int i = 0; i < kTickSeconds && route_thread_running_; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Consensus broadcast / receive — block candidates + confirmations.
+// Built on rats_broadcast_message / rats_on_message (typed key/value
+// channel) rather than GossipSub, because the mesh form-up delay would
+// stall block production. Every validated peer is in the connection
+// pool already, so broadcast_message reaches them directly.
+// ---------------------------------------------------------------------
+
+void RatsLink::publish_block_candidate(const std::vector<uint8_t>& block_bytes) {
+    if (!client_ || block_bytes.empty()) return;
+    const std::string b64 =
+        ::mc::audio::base64_encode(block_bytes.data(), block_bytes.size());
+    nlohmann::json env;
+    env["block_b64"] = b64;
+    const std::string body = env.dump();
+    rats_broadcast_message(client_, MC_MSG_BLOCK_CANDIDATE, body.c_str());
+}
+
+void RatsLink::publish_confirmation(const std::string& block_hash_hex,
+                                     const ::mc::Confirmation& c) {
+    if (!client_ || block_hash_hex.empty()) return;
+    nlohmann::json env;
+    env["block_hash"]   = block_hash_hex;
+    env["validator_id"] = ::mc::crypto::to_hex(c.validator_id.data(),
+                                                c.validator_id.size());
+    env["pubkey"]       = ::mc::crypto::to_hex(c.pubkey.data(),
+                                                c.pubkey.size());
+    env["signature"]    = ::mc::crypto::to_hex(c.signature.data(),
+                                                c.signature.size());
+    const std::string body = env.dump();
+    rats_broadcast_message(client_, MC_MSG_BLOCK_CONFIRMATION, body.c_str());
+}
+
+void RatsLink::set_block_candidate_handler(BlockCandidateHandler h) {
+    std::lock_guard<std::mutex> lk(handlers_mu_);
+    on_block_candidate_ = std::move(h);
+}
+
+void RatsLink::set_confirmation_handler(ConfirmationHandler h) {
+    std::lock_guard<std::mutex> lk(handlers_mu_);
+    on_confirmation_ = std::move(h);
+}
+
+void RatsLink::on_candidate_msg_trampoline(void* user_data,
+                                            const char* /*peer_id*/,
+                                            const char* message_data) {
+    auto* self = static_cast<RatsLink*>(user_data);
+    if (!self || !message_data) return;
+    BlockCandidateHandler h;
+    {
+        std::lock_guard<std::mutex> lk(self->handlers_mu_);
+        h = self->on_block_candidate_;
+    }
+    if (!h) return;
+    try {
+        auto env = nlohmann::json::parse(message_data);
+        const auto b64 = env.value("block_b64", std::string{});
+        if (b64.empty()) return;
+        auto bytes = ::mc::audio::base64_decode(b64);
+        if (bytes.empty()) return;
+        h(std::move(bytes));
+    } catch (...) {
+        // Malformed — silently drop. Peer can't crash us with bad input.
+    }
+}
+
+void RatsLink::on_confirmation_msg_trampoline(void* user_data,
+                                               const char* /*peer_id*/,
+                                               const char* message_data) {
+    auto* self = static_cast<RatsLink*>(user_data);
+    if (!self || !message_data) return;
+    ConfirmationHandler h;
+    {
+        std::lock_guard<std::mutex> lk(self->handlers_mu_);
+        h = self->on_confirmation_;
+    }
+    if (!h) return;
+    try {
+        auto env = nlohmann::json::parse(message_data);
+        const auto block_hash = env.value("block_hash", std::string{});
+        const auto vid_hex    = env.value("validator_id", std::string{});
+        const auto pk_hex     = env.value("pubkey", std::string{});
+        const auto sig_hex    = env.value("signature", std::string{});
+        if (block_hash.empty() || vid_hex.empty() ||
+            pk_hex.empty()     || sig_hex.empty()) return;
+
+        auto vid_bytes = ::mc::crypto::from_hex(vid_hex);
+        auto pk_bytes  = ::mc::crypto::from_hex(pk_hex);
+        auto sig_bytes = ::mc::crypto::from_hex(sig_hex);
+        if (vid_bytes.size() != 32 || pk_bytes.size() != 33 ||
+            sig_bytes.size() != 64) return;
+
+        ::mc::Confirmation c{};
+        std::copy(vid_bytes.begin(), vid_bytes.end(), c.validator_id.begin());
+        std::copy(pk_bytes.begin(),  pk_bytes.end(),  c.pubkey.begin());
+        std::copy(sig_bytes.begin(), sig_bytes.end(), c.signature.begin());
+        h(block_hash, c);
+    } catch (...) {
+        // Malformed — drop.
     }
 }
 

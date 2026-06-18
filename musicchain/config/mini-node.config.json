@@ -1,0 +1,12 @@
+{
+  "rats_port": 8080,
+  "load_monitor": {
+    "max_bandwidth_bps":    52428800,
+    "cpu_weight":           0.6,
+    "net_weight":           0.4,
+    "sample_interval_ms":   5000,
+    "busy_score_threshold": 0.85,
+    "disable_net_metric":   false,
+    "disable_cpu_metric":   false
+  }
+}

@@ -15,6 +15,7 @@
     "leveldb",
     "libuv",
     "nlohmann-json",
+    "cpp-httplib",
     {
       "name": "curl",
       "features": ["ssl"]

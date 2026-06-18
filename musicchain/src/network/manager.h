@@ -68,10 +68,32 @@ public:
     // rewritten in this phase.
     template <typename T> void broadcast(const T&) {}
 
-    // Diagnostic helpers — all return empty / zero since the TCP mesh is
-    // gone. Callers should migrate to `rats_get_peer_count()` etc.
+    // ---- peer_count plumbing ----------------------------------------
+    //
+    // CandidateManager::commit_block branches on peer_count(): == 0 picks
+    // the solo self-sign fast path, > 0 broadcasts the candidate and
+    // waits for confirmations. Until node_main hands us a real provider
+    // we return 0 (correct for boot, before RatsLink is up).
+    using PeerCountProvider = std::function<size_t()>;
+    void   set_peer_count_provider(PeerCountProvider p) { peers_ = std::move(p); }
+    size_t peer_count() const { return peers_ ? peers_() : 0; }
+
+    // ---- candidate publisher ----------------------------------------
+    //
+    // Hook so CandidateManager can fan out a freshly-minted candidate
+    // block to the validator peer set. node_main wires this to
+    // RatsLink::publish_block_candidate. Until then it's a no-op — the
+    // self-sign path doesn't need it.
+    using CandidatePublisher =
+        std::function<void(const std::vector<uint8_t>& /*block_bytes*/)>;
+    void set_candidate_publisher(CandidatePublisher p) { publish_ = std::move(p); }
+    void publish_candidate(const std::vector<uint8_t>& bytes) const {
+        if (publish_) publish_(bytes);
+    }
+
+    // Diagnostic helpers — all return empty since the TCP mesh is gone.
+    // Callers should migrate to `rats_get_peer_count()` etc.
     std::vector<std::string> connected_peers() const { return {}; }
-    size_t                   peer_count()       const { return 0; }
     std::vector<DhtEntry>    get_dht_peers()    const { return {}; }
     std::string              own_ipv6_str()     const { return {}; }
     uint32_t                 chain_height()     const;
@@ -80,11 +102,13 @@ public:
     void inject_peer(const std::string&, uint16_t, const Hash256&) {}
 
 private:
-    Chain&            chain_;
-    CandidateManager& candidates_;
-    NodeConfig        config_;
-    crypto::KeyPair   keypair_;
-    BlockHandler      on_block_;
+    Chain&             chain_;
+    CandidateManager&  candidates_;
+    NodeConfig         config_;
+    crypto::KeyPair    keypair_;
+    BlockHandler       on_block_;
+    PeerCountProvider  peers_;
+    CandidatePublisher publish_;
 };
 
 } // namespace mc::net

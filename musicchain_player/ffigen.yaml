@@ -23,9 +23,7 @@ functions:
     - mc_cleanup
     - mc_free
     - mc_last_error
-    - mc_wallet_create
     - mc_wallet_load
-    - mc_wallet_import
     - mc_wallet_save
     - mc_wallet_free
     - mc_wallet_get_address

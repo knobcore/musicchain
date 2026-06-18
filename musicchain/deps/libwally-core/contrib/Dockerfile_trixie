@@ -1,0 +1,16 @@
+#
+# Dockerfile for wally builds on Debian trixie (stable).
+# build from this directory with e.g:
+#     DOCKER_BUILDKIT=1 docker build . -t blockstream/wallycore -f Dockerfile_trixie
+# and for linux/arm64:
+#     DOCKER_BUILDKIT=1 docker build . -t blockstream/wallycore -f Dockerfile_trixie --platform linux/arm64 --build-arg TARGETARCH=arm64
+#
+FROM debian:trixie@sha256:4ae67669760b807c19f23902a3fd7c121a6a70cf2ae709035674b23e712e4d62
+WORKDIR /root
+COPY trixie_deps.sh ./deps.sh
+COPY requirements.txt ./contrib/requirements.txt
+ARG TARGETARCH=amd64
+ENV TARGETARCH=${TARGETARCH}
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-${TARGETARCH}
+RUN ./deps.sh && rm ./deps.sh
+ENV ANDROID_NDK=/opt/android-ndk-r26b

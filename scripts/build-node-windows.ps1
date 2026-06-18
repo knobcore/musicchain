@@ -60,6 +60,16 @@ $releaseDir = Join-Path $buildDir 'Release'
 $exe        = Join-Path $releaseDir 'musicchain-node.exe'
 if (-not (Test-Path $exe)) { Fail 'musicchain-node.exe not produced' }
 
+# librats's CMakeLists.txt writes the shared library to its own
+# bin\Release subdir instead of the parent project's Release dir.
+# Pull it (and any other rats-side DLLs) next to musicchain-node.exe
+# so the runtime loader finds it.
+$librrelease = Join-Path $buildDir 'deps\librats\bin\Release'
+if (Test-Path $librrelease) {
+    Get-ChildItem $librrelease -Filter *.dll -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item $_.FullName $releaseDir -Force }
+}
+
 Write-Step 'Build artifacts'
 Write-Host ('  ' + $exe) -ForegroundColor Green
 Get-ChildItem $releaseDir -Filter *.dll -ErrorAction SilentlyContinue |

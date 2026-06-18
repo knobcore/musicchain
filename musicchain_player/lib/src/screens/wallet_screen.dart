@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/wallet_provider.dart';
+import '../services/wallet_service.dart';
 import '../widgets/balance_display.dart';
 
 class WalletScreen extends StatelessWidget {
@@ -14,61 +15,14 @@ class WalletScreen extends StatelessWidget {
       appBar: AppBar(title: const Text('Wallet')),
       body: Consumer<WalletProvider>(
         builder: (context, wallet, _) {
+          // WalletGate enforces wallet existence before this screen is
+          // reachable, so we always have an info to display. Defensive
+          // fallback shouldn't normally fire.
           if (!wallet.hasWallet) {
-            return _NoWalletView(wallet: wallet);
+            return const Center(child: CircularProgressIndicator());
           }
           return _WalletView(wallet: wallet);
         },
-      ),
-    );
-  }
-}
-
-class _NoWalletView extends StatefulWidget {
-  final WalletProvider wallet;
-  const _NoWalletView({required this.wallet});
-
-  @override
-  State<_NoWalletView> createState() => _NoWalletViewState();
-}
-
-class _NoWalletViewState extends State<_NoWalletView> {
-  final _passCtrl = TextEditingController();
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.account_balance_wallet_outlined, size: 80),
-          const SizedBox(height: 16),
-          const Text('No wallet found'),
-          const SizedBox(height: 24),
-          TextField(
-            controller: _passCtrl,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'Password',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => widget.wallet.createWallet(_passCtrl.text),
-            child: const Text('Create New Wallet'),
-          ),
-          const SizedBox(height: 8),
-          OutlinedButton(
-            onPressed: () => widget.wallet.tryLoadWallet(_passCtrl.text),
-            child: const Text('Load Existing Wallet'),
-          ),
-          if (widget.wallet.error != null) ...[
-            const SizedBox(height: 8),
-            Text(widget.wallet.error!, style: const TextStyle(color: Colors.red)),
-          ],
-        ],
       ),
     );
   }
@@ -90,17 +44,20 @@ class _WalletView extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Address', style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text('Address',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 4),
                 Row(
                   children: [
                     Expanded(
                       child: Text(info.address,
-                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                          style: const TextStyle(
+                              fontFamily: 'monospace', fontSize: 12)),
                     ),
                     IconButton(
                       icon: const Icon(Icons.copy, size: 18),
-                      onPressed: () => Clipboard.setData(ClipboardData(text: info.address)),
+                      onPressed: () => Clipboard.setData(
+                          ClipboardData(text: info.address)),
                     ),
                   ],
                 ),
@@ -109,7 +66,8 @@ class _WalletView extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        BalanceDisplay(balance: info.balance, onRefresh: wallet.refreshBalance),
+        BalanceDisplay(
+            balance: info.balance, onRefresh: wallet.refreshBalance),
         const SizedBox(height: 16),
         const Divider(),
         ListTile(
@@ -118,11 +76,20 @@ class _WalletView extends StatelessWidget {
           onTap: () => _showSendDialog(context),
         ),
         ListTile(
-          leading: const Icon(Icons.delete_forever),
-          title: const Text('Remove Wallet'),
-          onTap: () {
-            wallet.freeWallet();
-          },
+          leading: const Icon(Icons.vpn_key),
+          title: const Text('Show recovery phrase'),
+          subtitle: const Text(
+              'Your 12-word BIP39 mnemonic — never share it'),
+          onTap: () => _showMnemonicDialog(context),
+        ),
+        ListTile(
+          leading: const Icon(Icons.logout, color: Colors.redAccent),
+          title: const Text('Sign out / use a different wallet',
+              style: TextStyle(color: Colors.redAccent)),
+          subtitle: const Text(
+              'Wipes the wallet from this device. The chain still '
+              'knows your address. Have your recovery phrase first.'),
+          onTap: () => _confirmSignOut(context),
         ),
       ],
     );
@@ -145,7 +112,8 @@ class _WalletView extends StatelessWidget {
             TextField(
               controller: amountCtrl,
               decoration: const InputDecoration(labelText: 'Amount'),
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              keyboardType:
+                  const TextInputType.numberWithOptions(decimal: true),
             ),
           ],
         ),
@@ -158,9 +126,9 @@ class _WalletView extends StatelessWidget {
             onPressed: () async {
               Navigator.pop(dialogCtx);
               final err = await context.read<WalletProvider>().sendTokens(
-                toCtrl.text.trim(),
-                amountCtrl.text.trim(),
-              );
+                    toCtrl.text.trim(),
+                    amountCtrl.text.trim(),
+                  );
               if (!context.mounted) return;
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                 content: Text(
@@ -173,5 +141,68 @@ class _WalletView extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _showMnemonicDialog(BuildContext context) async {
+    final mnemonic = await WalletService().readSavedMnemonic();
+    if (!context.mounted) return;
+    if (mnemonic == null || mnemonic.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('No recovery phrase saved on this device.'),
+      ));
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Recovery phrase'),
+        content: SelectableText(mnemonic,
+            style:
+                const TextStyle(fontFamily: 'monospace', fontSize: 14)),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: mnemonic));
+              Navigator.pop(ctx);
+            },
+            child: const Text('Copy'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _confirmSignOut(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Wipe wallet from this device?'),
+        content: const Text(
+            'If you don\'t have your recovery phrase, you will lose '
+            'access to this wallet forever.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Wipe wallet'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+    await WalletService().clearLocalWallet();
+    if (!context.mounted) return;
+    context.read<WalletProvider>().freeWallet();
+    // WalletGate observes the wallet state and will route us back to
+    // first-launch as soon as the next frame paints.
   }
 }

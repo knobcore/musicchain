@@ -1,5 +1,6 @@
 #include "fingerprint.h"
 #include "ogg_decoder.h"
+#include "multi_decoder.h"
 #include <chromaprint.h>
 #include <cstring>
 #include <stdexcept>
@@ -46,6 +47,32 @@ std::vector<uint8_t> base64_decode(const std::string& s) {
 }
 
 // ---- Fingerprint implementation ------------------------------------
+
+std::unique_ptr<Fingerprint> Fingerprint::from_any(const uint8_t* data,
+                                                    size_t len) {
+    auto pcm = decode_any(data, len);
+    if (pcm.samples.empty() || pcm.sample_rate <= 0 || pcm.channels <= 0)
+        return nullptr;
+
+    ChromaprintContext* ctx = chromaprint_new(CHROMAPRINT_ALGORITHM_DEFAULT);
+    if (!ctx) return nullptr;
+    chromaprint_start(ctx, pcm.sample_rate, pcm.channels);
+    // chromaprint_feed takes int16 samples = nb_samples * channels.
+    chromaprint_feed(ctx, pcm.samples.data(),
+                     static_cast<int>(pcm.samples.size()));
+    chromaprint_finish(ctx);
+
+    uint32_t* fp_data = nullptr;
+    int       fp_size = 0;
+    chromaprint_get_raw_fingerprint(ctx, &fp_data, &fp_size);
+    auto result = std::make_unique<Fingerprint>();
+    if (fp_size > 0) {
+        result->raw_.assign(fp_data, fp_data + fp_size);
+        chromaprint_dealloc(fp_data);
+    }
+    chromaprint_free(ctx);
+    return result;
+}
 
 std::unique_ptr<Fingerprint> Fingerprint::from_ogg(const uint8_t* data, size_t len) {
     auto decoder = OggDecoder::open(data, len);

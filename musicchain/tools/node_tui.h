@@ -14,6 +14,7 @@
 namespace mc::api { class HttpServer; class RatsApi; }
 namespace mc { class Chain; }
 namespace mc { class Database; }
+namespace mc { class CandidateManager; }
 namespace mc::crypto { struct KeyPair; }
 namespace mc::store { class SwarmIndex; }
 namespace mc::net   { class NetworkManager; }
@@ -30,6 +31,7 @@ void run_tui(mc::api::HttpServer&    http,
              mc::Database&           db,
              mc::store::SwarmIndex&  swarm,
              mc::net::NetworkManager& net,
+             mc::CandidateManager&   candidates,
              const mc::crypto::KeyPair& node_keypair,
              const std::string&      data_dir,
              std::atomic<bool>&      should_quit);

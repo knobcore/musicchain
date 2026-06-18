@@ -1,5 +1,6 @@
 #include "keys.h"
 #include "hash.h"
+#include "keccak256.h"
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/obj_mac.h>
@@ -52,12 +53,10 @@ KeyPair fill_from_ec_key(EC_KEY* key) {
                                         kp.public_key.data(), 33, nullptr);
     if (pub_len != 33) throw std::runtime_error("pubkey compression failed");
 
-    // Address: last 20 bytes of SHA256(uncompressed pubkey)
-    std::vector<uint8_t> uncompressed(65);
-    EC_POINT_point2oct(group, pub, POINT_CONVERSION_UNCOMPRESSED,
-                       uncompressed.data(), 65, nullptr);
-    auto h = sha256(uncompressed.data(), uncompressed.size());
-    std::copy(h.end() - 20, h.end(), kp.address.begin());
+    // Address — keccak256 of the X||Y bytes of the uncompressed pubkey,
+    // last 20 bytes. Matches the public address_from_pubkey() function;
+    // both MUST stay in lock-step or verify_signature mismatches.
+    kp.address = address_from_pubkey(kp.public_key);
 
     return kp;
 }
@@ -115,6 +114,11 @@ std::vector<uint8_t> derive_seed_pbkdf2_sha512(const std::string& passphrase,
     return out;
 }
 
+// Ethereum-style address derivation: keccak256 over the X||Y bytes of
+// the uncompressed pubkey (skip the 0x04 prefix), take the last 20
+// bytes. Matches Ethereum / Tron / every EIP-55 ecosystem so existing
+// exchange integrations work against musicchain with zero custom
+// derivation code.
 Address address_from_pubkey(const PubKey33& pubkey) {
     EC_KEY*   key   = make_ec_key();
     const EC_GROUP* group = EC_KEY_get0_group(key);
@@ -125,10 +129,93 @@ Address address_from_pubkey(const PubKey33& pubkey) {
                        uncompressed.data(), 65, nullptr);
     EC_POINT_free(pub);
     EC_KEY_free(key);
-    auto h = sha256(uncompressed.data(), 65);
-    Address addr;
+
+    auto h = keccak256(uncompressed.data() + 1, 64);
+    Address addr{};
     std::copy(h.end() - 20, h.end(), addr.begin());
     return addr;
+}
+
+// Kept as an alias for any external caller that imported it during the
+// bridge-design phase; both now produce the same bytes.
+EthAddress eth_address_from_pubkey(const PubKey33& pubkey) {
+    auto a = address_from_pubkey(pubkey);
+    EthAddress out{};
+    std::copy(a.begin(), a.end(), out.begin());
+    return out;
+}
+
+// EIP-55 mixed-case checksum encoding. Returns "0x" + 40 hex chars
+// where each nibble is upper- or lower-cased based on keccak256 of
+// the lowercase hex string. Exchanges and block-explorers all use
+// this convention so a "wrong checksum" indicates either a typo or a
+// network mismatch.
+std::string to_checksum_hex(const Address& addr) {
+    // 1. Lowercase hex of the 20 bytes
+    static const char lut[] = "0123456789abcdef";
+    std::string lower(40, '\0');
+    for (size_t i = 0; i < 20; ++i) {
+        lower[2*i]     = lut[(addr[i] >> 4) & 0xF];
+        lower[2*i + 1] = lut[ addr[i]       & 0xF];
+    }
+    // 2. keccak256 of the ASCII bytes of the lowercase hex
+    auto h = keccak256(reinterpret_cast<const uint8_t*>(lower.data()),
+                       lower.size());
+    // 3. Upper-case the i-th nibble of the address iff the i-th nibble
+    //    of the hash is >= 8.
+    std::string out;
+    out.reserve(42);
+    out.append("0x");
+    for (size_t i = 0; i < 40; ++i) {
+        uint8_t hash_nibble = (i % 2 == 0)
+                                ? (h[i/2] >> 4) & 0xF
+                                :  h[i/2]       & 0xF;
+        char c = lower[i];
+        if (hash_nibble >= 8 && c >= 'a' && c <= 'f') c -= 32; // to upper
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Parse a hex string into a 20-byte address. Accepts either:
+//   * a raw 40-char hex string (no prefix, any case)
+//   * a "0x"-prefixed 40-char hex string (any case)
+// In the EIP-55 case (mixed case), we ALSO verify the checksum and
+// reject malformed inputs to catch typos. All-lowercase or all-
+// uppercase is accepted as-is (no checksum to verify).
+bool parse_address_checksummed(const std::string& s, Address& out) {
+    std::string h = s;
+    if (h.size() == 42 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) {
+        h = h.substr(2);
+    }
+    if (h.size() != 40) return false;
+    bool has_upper = false, has_lower = false;
+    for (char c : h) {
+        if (c >= 'a' && c <= 'f') has_lower = true;
+        else if (c >= 'A' && c <= 'F') has_upper = true;
+        else if (!((c >= '0' && c <= '9'))) return false;
+    }
+    auto h2 = [](char c)->int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+    for (size_t i = 0; i < 20; ++i) {
+        int hi = h2(h[2*i]);
+        int lo = h2(h[2*i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    // If the caller sent us a mixed-case string, verify the EIP-55
+    // checksum; if it's all-one-case, skip the check (legacy form).
+    if (has_upper && has_lower) {
+        auto canonical = to_checksum_hex(out);
+        // canonical has "0x" prefix; the input may or may not.
+        std::string want = canonical.substr(2);
+        if (want != h) return false;
+    }
+    return true;
 }
 
 // ---- Key encryption -------------------------------------------------

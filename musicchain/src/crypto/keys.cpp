@@ -90,6 +90,24 @@ KeyPair keypair_from_seed(const uint8_t* seed, size_t len) {
     return kp;
 }
 
+KeyPair keypair_from_priv_bytes(const uint8_t priv32[32]) {
+    // Identical to keypair_from_seed minus the SHA-256 step — the input
+    // IS already the secp256k1 scalar. Used by the libwally/BIP32 path
+    // so the address we end up with matches every other EVM wallet.
+    EC_KEY*   key   = make_ec_key();
+    BIGNUM*   bn    = BN_bin2bn(priv32, 32, nullptr);
+    const EC_GROUP* group = EC_KEY_get0_group(key);
+    EC_POINT* pub = EC_POINT_new(group);
+    EC_KEY_set_private_key(key, bn);
+    EC_POINT_mul(group, pub, bn, nullptr, nullptr, nullptr);
+    EC_KEY_set_public_key(key, pub);
+    auto kp = fill_from_ec_key(key);
+    EC_POINT_free(pub);
+    BN_free(bn);
+    EC_KEY_free(key);
+    return kp;
+}
+
 bool keypair_from_hex(const std::string& priv_hex, KeyPair& out) {
     auto bytes = from_hex(priv_hex);
     if (bytes.size() != 32) return false;

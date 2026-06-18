@@ -184,34 +184,30 @@ bool CandidateManager::commit_block(
     const std::vector<std::pair<Hash256, std::vector<uint8_t>>>& consumed_txs,
     std::string& err) {
 
-    // GENESIS FAST PATH (HEIGHT == 0 AND NO PEERS ONLY).
+    // GENESIS FAST PATH (HEIGHT == 0 ONLY).
     //
     // At chain height 0 there is, by definition, nothing for a
     // confirmation gossip to converge on — no peer-validator could have
     // confirmed a block we just minted, because the founder GRANT that
-    // empowers any moderator system hasn't itself landed yet. We
-    // self-sign and connect directly, **gated strictly to height 0**,
-    // so this can't be re-used as a "skip validation" shortcut on any
-    // later block. Once height > 0, every subsequent block — even in
-    // solo operation — goes through the full add_candidate + confirm
-    // path below.
+    // empowers any moderator system hasn't itself landed yet.
+    //
+    // We *don't* gate this on peer_count anymore. The peers we see at
+    // this moment are connected over librats (most likely the VPS
+    // mini-node, which is a relay with no chain of its own) — they're
+    // not consensus participants. Even with several connected peers,
+    // if nobody has a chain past height 0 yet, our genesis block is the
+    // network's genesis block.
+    //
+    // The exploit gate the operator asked for is preserved:
+    // **chain.tip().height == 0** strictly. Once height >= 1 every
+    // block goes through the full add_candidate + confirm path below.
+    // There's no path back to fast-self-sign after genesis.
     //
     // chain.connect_block STILL runs the real validation (block
     // structure + apply_transactions); the fast path only skips the
     // candidate/confirmation theater that exists for peer
     // coordination.
-    //
-    // TODO(next chunk): before allowing this fast path, also probe the
-    // mini-node network for any existing chain. If another node out
-    // there already has a chain with height > 0, we should be syncing
-    // to it instead of bootstrapping a parallel genesis. Stub gate
-    // here: network.network_chain_height_probe() returns the max
-    // height observed across known peers, or 0 if no peers have been
-    // reached yet. Until that method lands, peer_count == 0 alone
-    // gates the fast path (the operator running solo on first boot has
-    // no peer connections, so this is correct for the only intended
-    // use today).
-    if (network.peer_count() == 0 && chain.tip().height == 0) {
+    if (chain.tip().height == 0) {
         auto block_hash_bytes = block.hash();
         std::vector<Confirmation> sigs;
         sigs.reserve(REQUIRED_CONFIRMATIONS);
@@ -476,8 +472,27 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
         // dropped from the mempool right here so it can't poison
         // another attempt. The chain still does the full
         // apply-rules check; pre-flight is only the cheap floor.
-        std::vector<std::pair<Hash256, std::vector<uint8_t>>> pending_txs;
-        pending_txs.reserve(all_pending.size());
+        // We can't rely on leveldb iteration order here: pending txs are
+        // keyed by tx_hash (sha256 of the serialized tx), and that's
+        // effectively random. If a single address queues two txs (e.g.
+        // the bootstrap path: GRANT nonce=0 then UsernameTx nonce=1),
+        // the UsernameTx may sort BEFORE the GRANT in the resulting
+        // block; the chain then runs UsernameTx first, sees DB nonce 0,
+        // rejects "nonce mismatch (tx=1 expected=0)" and the entire
+        // block fails apply_transactions. We hit this on every cold
+        // bootstrap.
+        //
+        // Fix: collect (sender, nonce) for every tx during the verify
+        // pass, then sort by (sender, nonce) so consecutive nonces from
+        // the same address always appear in the right order.
+        struct TxSlot {
+            Hash256              hash;
+            std::vector<uint8_t> raw;
+            Address              sender{};   // zero for MINT (no per-sender nonce)
+            uint64_t             nonce = 0;
+        };
+        std::vector<TxSlot> slots;
+        slots.reserve(all_pending.size());
         for (auto& [tx_hash, raw] : all_pending) {
             if (raw.empty()) {
                 db.del_pending_tx(tx_hash);
@@ -485,6 +500,8 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             }
             bool ok = false;
             const char* why = "ok";
+            TxSlot slot;
+            slot.hash = tx_hash;
             TxType type = static_cast<TxType>(raw[0]);
             switch (type) {
                 case TxType::TRANSFER: {
@@ -493,7 +510,11 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                         why = "TRANSFER: deserialize failed";
                     } else if (!tx.verify_signature()) {
                         why = "TRANSFER: verify_signature failed";
-                    } else { ok = true; }
+                    } else {
+                        slot.sender = tx.from_address;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
                     break;
                 }
                 case TxType::MODERATOR_OP: {
@@ -502,7 +523,11 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                         why = "MODERATOR_OP: deserialize failed";
                     } else if (!tx.verify_signature()) {
                         why = "MODERATOR_OP: verify_signature failed";
-                    } else { ok = true; }
+                    } else {
+                        slot.sender = tx.proposer;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
                     break;
                 }
                 case TxType::MODERATOR_PROPOSAL: {
@@ -511,7 +536,11 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                         why = "PROPOSAL: deserialize failed";
                     } else if (!tx.verify_signature()) {
                         why = "PROPOSAL: verify_signature failed";
-                    } else { ok = true; }
+                    } else {
+                        slot.sender = tx.proposer;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
                     break;
                 }
                 case TxType::USERNAME_REGISTER: {
@@ -520,7 +549,11 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                         why = "USERNAME_REGISTER: deserialize failed";
                     } else if (!tx.verify_signature()) {
                         why = "USERNAME_REGISTER: verify_signature failed";
-                    } else { ok = true; }
+                    } else {
+                        slot.sender = tx.owner;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
                     break;
                 }
                 case TxType::MINT: {
@@ -541,13 +574,40 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                 db.del_pending_tx(tx_hash);
                 continue;
             }
-            pending_txs.emplace_back(tx_hash, std::move(raw));
+            slot.raw = std::move(raw);
+            slots.push_back(std::move(slot));
+        }
+        // Stable sort by (sender, nonce). Same-address txs end up in
+        // monotonic nonce order; addresses are grouped lexicographically
+        // but the grouping is purely cosmetic — apply_transactions only
+        // cares about per-sender monotonicity.
+        std::sort(slots.begin(), slots.end(), [](const TxSlot& a, const TxSlot& b) {
+            if (a.sender != b.sender) return a.sender < b.sender;
+            return a.nonce < b.nonce;
+        });
+        std::vector<std::pair<Hash256, std::vector<uint8_t>>> pending_txs;
+        pending_txs.reserve(slots.size());
+        for (auto& s : slots) {
+            pending_txs.emplace_back(s.hash, std::move(s.raw));
         }
 
         // No registration AND no pending transactions AND heartbeat
         // window not yet elapsed → nothing to do this tick.
         if (!reg && pending_txs.empty()
             && (now - last_at < HEARTBEAT_INTERVAL_MS)) continue;
+
+        // Pre-genesis guard. At chain.tip().height == 0 we must NOT mint
+        // empty heartbeat blocks. last_block_at_ms_ is initialised to 0
+        // so the elapsed-window check above always wants to fire on the
+        // very first tick — without this guard the producer races the
+        // user's bootstrap action and turns an empty block 1 into the
+        // chain's genesis, leaving the GRANT to land at height 1 where
+        // the multi-node confirmation path then times out for 300 s.
+        // Wait until the operator's bootstrap puts the GRANT into the
+        // mempool; only then mint block 1.
+        if (chain.tip().height == 0 && !reg && pending_txs.empty()) {
+            continue;
+        }
         Block block;
         block.header.version          = BLOCK_VERSION;
         block.header.prev_hash        = chain.tip().hash;

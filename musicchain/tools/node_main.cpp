@@ -26,6 +26,9 @@
 #include "../src/sync/sync_manager.h"
 #include "../src/sync/deep_audit.h"
 #include "../src/net/load_monitor.h"
+#include "../src/net/relay_credit_tracker.h"
+#include "../src/crypto/bip39.h"
+#include "../src/core/transaction.h"
 #include "../src/crypto/keys.h"
 #include "../src/crypto/hash.h"
 #include "../src/crypto/signature.h"
@@ -331,6 +334,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     // Start upload worker thread
     std::cerr << "[dbg] starting upload worker\n";
     candidates.start(chain, db, network, cfg, keypair);
+    // Kick the producer immediately so a cold start with mempool txs
+    // (e.g. founder GRANT + UsernameTx queued in a previous run) doesn't
+    // wait out the 30-second heartbeat poll before minting block 1.
+    // Without this poke the wake predicate only fires for song
+    // registrations or explicit TUI actions — the wallet/login flow
+    // sits on "GRANT not yet on chain" for half a minute on every cold
+    // start.
+    candidates.wake();
 
     (void)exe_path;  // bootstrap file no longer shipped — kept for ABI
 
@@ -580,6 +591,80 @@ fuzzy_ok: ;
         // the gate against fingerprint-vs-audio forgery.
         static mc::DeepAuditor audit(chain, db, cfg.data_dir + "/audio");
         audit.start();
+
+        // ---- Relay credit tracker + periodic RelayRewardTx sweep ----
+        //
+        // Counts every mini-node tunneled delivery this full node serves
+        // (populated by rats_api hooks, persisted to leveldb under "rc:"
+        // so credits aren't lost across restarts). Every 5 minutes we
+        // sweep the counters into one RelayRewardTx per mini-node,
+        // signed by the founder key (loaded from founder.seed alongside
+        // the chain data dir). Counter zeroes when the tx hits a block.
+        //
+        // The mint callback is no-op until the operator has bootstrapped
+        // the founder seed — before that we can't sign a RELAY_REWARD
+        // since only the founder can issue them.
+        static mc::net::RelayCreditTracker relay_tracker(db);
+        relay_tracker.start(
+            [&chain, &db, &candidates, &cfg](const mc::Address& mini_addr, uint64_t count) {
+                // Read the founder seed off disk on every sweep so the
+                // operator can hot-swap it without restarting the node.
+                const std::string seed_path = cfg.data_dir + "/founder.seed";
+                std::ifstream sf(seed_path);
+                if (!sf) {
+                    std::cerr << "[relay] no founder.seed at " << seed_path
+                              << " — skipping reward sweep for "
+                              << count << " credits\n";
+                    // Re-credit so we don't lose them.
+                    return;
+                }
+                std::string mnemonic;
+                std::getline(sf, mnemonic);
+                while (!mnemonic.empty() &&
+                       (mnemonic.back() == '\r' || mnemonic.back() == '\n'
+                        || mnemonic.back() == ' ')) mnemonic.pop_back();
+                auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+                if (!kp_opt) {
+                    std::cerr << "[relay] founder.seed mnemonic failed BIP32 derive\n";
+                    return;
+                }
+                const auto founder_kp = *kp_opt;
+                // Confirm the seed actually owns the chain's founder
+                // address. Otherwise our signature won't verify under
+                // apply_relay_reward's founder check.
+                auto chain_founder = db.get_founder();
+                if (!chain_founder ||
+                    std::memcmp(chain_founder->data(),
+                                founder_kp.address.data(), 20) != 0) {
+                    std::cerr << "[relay] founder.seed doesn't match "
+                                 "chain founder — skipping sweep\n";
+                    return;
+                }
+                mc::RelayRewardTx tx{};
+                tx.target_address  = mini_addr;
+                tx.count           = count;
+                tx.issuer_address  = founder_kp.address;
+                tx.issuer_pubkey   = founder_kp.public_key;
+                tx.nonce           = db.get_nonce(founder_kp.address);
+                {
+                    auto msg  = tx.sign_message();
+                    auto h    = mc::crypto::sha256(msg.data(), msg.size());
+                    tx.signature = mc::crypto::sign_ecdsa(h, founder_kp.private_key);
+                }
+                if (!tx.verify_signature()) {
+                    std::cerr << "[relay] internal sign/verify mismatch — bug\n";
+                    return;
+                }
+                auto h = tx.tx_hash();
+                if (!db.put_pending_tx(h, tx.serialize())) {
+                    std::cerr << "[relay] put_pending_tx failed\n";
+                    return;
+                }
+                candidates.wake();
+                std::cout << "[relay] queued RelayRewardTx: "
+                          << count << " MC → mini "
+                          << db.hex(mini_addr).substr(0, 12) << "…\n";
+            });
     }
 
     // UPnP removed. NAT traversal is now mc_rats_quic's job (QUIC peers all

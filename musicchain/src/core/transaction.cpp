@@ -359,6 +359,57 @@ bool UsernameTx::verify_signature() const {
     return crypto::verify_ecdsa(hash, signature, owner_pubkey);
 }
 
+// ---- RelayRewardTx --------------------------------------------------
+
+std::vector<uint8_t> RelayRewardTx::sign_message() const {
+    std::vector<uint8_t> msg;
+    write_u32le(msg, MC_CHAIN_ID);
+    write_bytes(msg, target_address.data(), 20);
+    write_u64le(msg, count);
+    write_bytes(msg, issuer_address.data(), 20);
+    write_bytes(msg, issuer_pubkey.data(),  33);
+    write_u64le(msg, nonce);
+    return msg;
+}
+
+std::vector<uint8_t> RelayRewardTx::serialize() const {
+    std::vector<uint8_t> buf;
+    buf.push_back(static_cast<uint8_t>(TxType::RELAY_REWARD));
+    write_bytes(buf, target_address.data(), 20);
+    write_u64le(buf, count);
+    write_bytes(buf, issuer_address.data(), 20);
+    write_bytes(buf, issuer_pubkey.data(),  33);
+    write_u64le(buf, nonce);
+    write_bytes(buf, signature.data(),       64);
+    return buf;
+}
+
+bool RelayRewardTx::deserialize(const uint8_t* data, size_t len, RelayRewardTx& out) {
+    const uint8_t* p   = data;
+    const uint8_t* end = data + len;
+    if (p >= end || *p++ != static_cast<uint8_t>(TxType::RELAY_REWARD)) return false;
+    if (!read_bytes(p, end, out.target_address.data(), 20)) return false;
+    if (!read_u64le(p, end, out.count))                     return false;
+    if (!read_bytes(p, end, out.issuer_address.data(), 20)) return false;
+    if (!read_bytes(p, end, out.issuer_pubkey.data(),  33)) return false;
+    if (!read_u64le(p, end, out.nonce))                     return false;
+    if (!read_bytes(p, end, out.signature.data(),      64)) return false;
+    return true;
+}
+
+Hash256 RelayRewardTx::tx_hash() const {
+    auto raw = serialize();
+    return crypto::sha256(raw.data(), raw.size());
+}
+
+bool RelayRewardTx::verify_signature() const {
+    auto msg  = sign_message();
+    auto hash = crypto::sha256(msg.data(), msg.size());
+    Address derived = crypto::address_from_pubkey(issuer_pubkey);
+    if (std::memcmp(derived.data(), issuer_address.data(), 20) != 0) return false;
+    return crypto::verify_ecdsa(hash, signature, issuer_pubkey);
+}
+
 // ---- SlashTx --------------------------------------------------------
 
 std::vector<uint8_t> SlashTx::sign_message() const {

@@ -39,22 +39,36 @@ if [ ! -f "$ARTIFACT_DIR/musicchain-node" ]; then
     exit 1
 fi
 
-# Pick SSH transport. sshpass means we can pass a password non-interactively;
-# without it we rely on the local ssh-agent / authorized_keys.
-SSH="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
-SCP="scp -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+# SSH transport. We deliberately avoid eval'ing a quoted password into a
+# shell line: passwords with @ / $ / spaces / backslashes blow that up.
+# Instead, when VPS_PASS is set, we export SSHPASS and use `sshpass -e`,
+# which reads the password from the environment with zero shell parsing.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null)
+USE_SSHPASS=0
 if [ -n "${VPS_PASS:-}" ]; then
     if ! command -v sshpass >/dev/null; then
         echo "[deploy] VPS_PASS set but sshpass not installed." >&2
         echo "        apt-get install sshpass, or unset VPS_PASS and use a key." >&2
         exit 1
     fi
-    SSH="sshpass -p \"$VPS_PASS\" $SSH"
-    SCP="sshpass -p \"$VPS_PASS\" $SCP"
+    export SSHPASS="$VPS_PASS"
+    USE_SSHPASS=1
 fi
 
-run() { eval "$SSH \"$VPS_USER@$VPS_HOST\" \"\$@\""; }
-put() { eval "$SCP \"\$1\" \"$VPS_USER@$VPS_HOST:\$2\""; }
+run() {
+    if [ "$USE_SSHPASS" = 1 ]; then
+        sshpass -e ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"
+    else
+        ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"
+    fi
+}
+put() {
+    if [ "$USE_SSHPASS" = 1 ]; then
+        sshpass -e scp "${SSH_OPTS[@]}" "$1" "$VPS_USER@$VPS_HOST:$2"
+    else
+        scp "${SSH_OPTS[@]}" "$1" "$VPS_USER@$VPS_HOST:$2"
+    fi
+}
 
 echo "[deploy] preparing $VPS_INSTALL_DIR and $VPS_DATA_DIR on $VPS_HOST"
 run "mkdir -p $VPS_INSTALL_DIR $VPS_DATA_DIR/blockchain.db $VPS_DATA_DIR/blocks $VPS_DATA_DIR/keys $VPS_DATA_DIR/logs $VPS_DATA_DIR/audio"

@@ -1933,15 +1933,21 @@ void action_bootstrap_founder(mc::Database& db,
         mv.last_action_color = CP_WARN;
         return;
     }
-    auto seed = mc::crypto::bip39_mnemonic_to_seed(mnemonic, "");
-    if (seed.size() != 64) {
-        mv.last_action = "bootstrap: BIP39 seed derivation failed";
+    // Use the SAME derivation path as action_login (BIP32 m/44'/19779'/0'/0/0)
+    // so the address the GRANT registers matches the address login resolves
+    // for the same mnemonic. Previously bootstrap used keypair_from_seed
+    // over the raw BIP39 seed[0:32] while login used bip39_mnemonic_to_keypair
+    // → BIP32 derive, which produced two different addresses for the same
+    // 12 words. The GRANT then landed on the wrong address and login
+    // permanently said "GRANT not yet on chain".
+    auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+    if (!kp_opt) {
+        mv.last_action = "bootstrap: BIP32 derivation failed";
         mv.last_action_color = CP_WARN;
         std::fill(mnemonic.begin(), mnemonic.end(), '\0');
         return;
     }
-    auto kp = mc::crypto::keypair_from_seed(seed.data(), 32);
-    std::fill(seed.begin(), seed.end(), 0);
+    auto kp = *kp_opt;
 
     // Render the seed on screen until the operator acknowledges. This
     // is the only chance to write the words down off-disk; if the

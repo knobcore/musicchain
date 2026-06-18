@@ -15,8 +15,11 @@
 // bindings header instead.
 #include "librats_c.h"
 #include "../src/net/load_monitor.h"
+#include "../src/crypto/keys.h"
+#include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
 #include <fstream>
 #include <memory>
+#include <sys/stat.h>
 
 // librats vendors nlohmann::json at src/json.hpp; reuse it here so we can
 // parse incoming RPC envelopes properly (the previous ad-hoc string-search
@@ -337,6 +340,13 @@ uint64_t json_get_uint(const std::string& src, const std::string& key) {
 // rule out reassignment. main() builds it once with the resolved cfg.
 std::unique_ptr<mc::net::LoadMonitor> g_load_mon;
 
+// Mini-node's wallet identity — same BIP39 + BIP32 derivation the user
+// wallet uses. Address is published in routes.get so full nodes know
+// where to send the RelayRewardTx credits. main() loads or generates
+// it before the rats client starts.
+std::string g_wallet_address_hex;  // EIP-55 checksummed
+std::string g_wallet_address_raw;  // 40-char lowercase hex
+
 std::string routes_json() {
     std::ostringstream ss;
     mc::net::LoadMonitor::Snapshot self_load{};
@@ -346,7 +356,8 @@ std::string routes_json() {
        << "\"cpu_load\":"    << self_load.cpu_load            << ","
        << "\"net_bps\":"     << self_load.net_bytes_per_sec   << ","
        << "\"is_busy\":"     << (self_load.is_busy ? "true" : "false")
-       << "},\"peers\":[";
+       << "},\"wallet\":\""  << g_wallet_address_hex
+       << "\",\"peers\":[";
     bool first = true;
     std::lock_guard<std::mutex> lk(g_routes_mu);
     for (const auto& kv : g_routes) {
@@ -1502,6 +1513,68 @@ int main(int argc, char** argv) {
     }
     g_load_mon = std::make_unique<mc::net::LoadMonitor>(load_cfg);
     g_load_mon->start();
+
+    // ---- Wallet identity ---------------------------------------------
+    //
+    // First-launch: generate a fresh 12-word BIP39 mnemonic and write it
+    // to mini-node.seed in the working directory (or the operator-
+    // supplied path via $MUSICCHAIN_MINI_SEED). Re-launch: load whatever
+    // is already there. Either way we derive the secp256k1 keypair via
+    // the same path the user wallets use (m/44'/19779'/0'/0/0) so the
+    // resulting address is portable — an operator can import the
+    // mnemonic into MetaMask, ethers.js, the player's wallet flow, etc.
+    // and see the same address.
+    {
+        std::string seed_path = "mini-node.seed";
+        if (const char* env = std::getenv("MUSICCHAIN_MINI_SEED")) {
+            if (*env) seed_path = env;
+        }
+        std::string mnemonic;
+        {
+            std::ifstream f(seed_path);
+            if (f) std::getline(f, mnemonic);
+        }
+        while (!mnemonic.empty() &&
+               (mnemonic.back() == '\r' || mnemonic.back() == '\n' ||
+                mnemonic.back() == ' ')) {
+            mnemonic.pop_back();
+        }
+        if (mnemonic.empty()) {
+            mnemonic = mc::crypto::bip39_generate_12();
+            if (mnemonic.empty()) {
+                std::cerr << "[mini-node] FATAL: entropy source failed\n";
+                return 5;
+            }
+            std::ofstream out(seed_path, std::ios::trunc);
+            if (!out) {
+                std::cerr << "[mini-node] FATAL: cannot write "
+                          << seed_path << " — refusing to lose seed\n";
+                return 5;
+            }
+            out << mnemonic << "\n";
+            std::cout << "[mini-node] generated new wallet seed at "
+                      << seed_path << "\n";
+            std::cout << "[mini-node] FIRST-LAUNCH MNEMONIC: " << mnemonic
+                      << "\n";
+            std::cout << "[mini-node] WRITE THIS DOWN. After this run it's "
+                         "only on disk at the path above. Reward MC tokens "
+                         "earned via tunneled traffic go to this address.\n";
+        }
+        auto kp_opt = mc::crypto::bip39_mnemonic_to_keypair(mnemonic, "");
+        if (!kp_opt) {
+            std::cerr << "[mini-node] FATAL: BIP32 derivation failed\n";
+            return 5;
+        }
+        g_wallet_address_hex = mc::crypto::to_checksum_hex(kp_opt->address);
+        std::ostringstream raw;
+        for (uint8_t b : kp_opt->address) {
+            raw << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(b);
+        }
+        g_wallet_address_raw = raw.str();
+        std::cout << "[mini-node] wallet address: " << g_wallet_address_hex
+                  << "\n";
+    }
 
     // In TUI mode librats' own console logger would scribble over our redraws,
     // so disable it. In --quiet mode (systemd) we let librats log to stdout.

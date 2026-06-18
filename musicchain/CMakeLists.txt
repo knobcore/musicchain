@@ -370,6 +370,7 @@ set(MC_SOURCES
   src/sync/sync_manager.cpp
   src/sync/deep_audit.cpp
   src/net/load_monitor.cpp
+  src/net/relay_credit_tracker.cpp
   src/tokens/ledger.cpp
   src/tokens/mint.cpp
   src/network/manager.cpp       # thin shim now — no TCP mesh
@@ -459,10 +460,32 @@ endif()
 endif() # NOT MC_MINI_NODE_ONLY
 
 # Mini-node — VPS rendezvous binary, vanilla librats TCP transport.
+#
+# Pulls in a focused subset of the wallet stack (libwally BIP39+BIP32,
+# secp256k1, OpenSSL signing, keccak256 address derivation, RelayRewardTx
+# serialization) so the mini-node can hold its own EVM-shaped identity
+# and let the full node credit it for served tunnel traffic via the
+# RELAY_REWARD tx type.
 add_executable(musicchain-mini-node
   tools/mini_node.cpp
-  src/net/load_monitor.cpp)
-target_link_libraries(musicchain-mini-node PRIVATE mc_rats_quic)
+  src/net/load_monitor.cpp
+  src/crypto/hash.cpp
+  src/crypto/keys.cpp
+  src/crypto/keccak256.cpp
+  src/crypto/signature.cpp
+  src/crypto/wally_bip39.cpp
+  src/core/block.cpp
+  src/core/transaction.cpp)
+target_link_libraries(musicchain-mini-node PRIVATE
+  mc_rats_quic
+  wallycore
+  secp256k1
+  ${MC_OPENSSL_SSL}
+  ${MC_OPENSSL_CRYPTO})
+target_include_directories(musicchain-mini-node PRIVATE
+  ${OPENSSL_INCLUDE_DIR}
+  ${CMAKE_SOURCE_DIR}/deps/libwally-core/include
+  ${CMAKE_SOURCE_DIR}/deps/libwally-core/src/secp256k1/include)
 if(WIN32)
   target_link_libraries(musicchain-mini-node PRIVATE ws2_32 iphlpapi bcrypt)
 endif()

@@ -13,6 +13,7 @@ enum class TxType : uint8_t {
     MODERATOR_PROPOSAL   = 0x30,
     USERNAME_REGISTER    = 0x40,
     SLASH                = 0x50,
+    RELAY_REWARD         = 0x60,
 };
 
 // Sub-kinds of evidence carried inside a SlashTx. Two payload shapes for
@@ -222,6 +223,47 @@ struct UsernameTx {
 
     std::vector<uint8_t> serialize() const;
     static bool deserialize(const uint8_t* data, size_t len, UsernameTx& out);
+
+    std::vector<uint8_t> sign_message() const;
+    Hash256              tx_hash() const;
+    bool                 verify_signature() const;
+};
+
+// ---- Relay reward transaction ---------------------------------------
+//
+// Issued by a full node to credit a mini-node for serving binary relay
+// traffic on its behalf. The full node is the source of truth (it sees
+// the librats connection metadata and knows when a request came in via
+// a mini-node tunnel) so the mini-node cannot inflate its claim. One
+// `RelayRewardTx` is emitted per (mini-node, sweep window). 1 MC per
+// relayed transfer (download or stream chunk) — `count` is the number
+// of transfers accumulated since the last sweep.
+//
+// Wire format (all little-endian):
+//   u8          TxType::RELAY_REWARD
+//   Address(20) target_address     — mini-node wallet receiving the MC
+//   u64         count              — number of relayed transfers
+//   Address(20) issuer_address     — full node operator (founder)
+//   PubKey33    issuer_pubkey
+//   u64         nonce              — issuer's nonce
+//   Sig64       signature          — issuer signs the preimage
+//
+// On apply, chain credits target_address by count * 1_00000000 internal
+// units (8 decimals, so "1 MC" = 100_000_000) and advances the issuer
+// nonce. Without the founder signature the tx is rejected, so phantom
+// mini-nodes can't claim rewards — only a real full node operator can
+// emit one. (Once Phase-3 decentralized signing lands, this becomes
+// "any validator" rather than "founder only", same pattern as MintTx.)
+struct RelayRewardTx {
+    Address  target_address{};
+    uint64_t count          = 0;
+    Address  issuer_address{};
+    PubKey33 issuer_pubkey{};
+    uint64_t nonce          = 0;
+    Sig64    signature{};
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t* data, size_t len, RelayRewardTx& out);
 
     std::vector<uint8_t> sign_message() const;
     Hash256              tx_hash() const;

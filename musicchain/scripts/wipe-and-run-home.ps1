@@ -4,14 +4,16 @@
   Stop the home node if running, wipe its chain state, and re-start it.
 
 .DESCRIPTION
-  Wipes:
+  Full reset — wipes EVERYTHING tied to the previous chain identity so a
+  fresh bootstrap can pick a new founder seed:
     - $DATA_DIR/blockchain.db   (leveldb)
     - $DATA_DIR/blocks          (.blk dump tree)
     - $DATA_DIR/logs            (old log files)
-  Keeps:
-    - $DATA_DIR/keys            (founder keypair survives so the chain
-                                 can be re-bootstrapped under the same
-                                 identity)
+    - $DATA_DIR/keys            (the founder keypair — gone)
+    - $DATA_DIR/founder.seed    (the seed bytes — gone)
+    - $DATA_DIR/dmca            (DMCA submissions tied to old chain)
+    - $DATA_DIR/kyc             (KYC submissions tied to old chain)
+    - $DATA_DIR/moderator.txt   (moderator handle cache)
 
   Env vars:
     DATA_DIR      Default: C:\Users\lain\Music\musicchain
@@ -44,16 +46,26 @@ if ($running) {
 }
 
 Write-Host "[wipe] DATA_DIR=$DATA_DIR"
-foreach ($sub in @("blockchain.db", "blocks", "logs")) {
+# Directories: full recursive wipe + recreate empty.
+foreach ($sub in @("blockchain.db", "blocks", "logs", "keys", "dmca", "kyc")) {
     $p = Join-Path $DATA_DIR $sub
     if (Test-Path $p) {
         Write-Host "[wipe] rm -rf $p"
         Remove-Item -Recurse -Force $p
     }
 }
-New-Item -ItemType Directory -Force (Join-Path $DATA_DIR "blockchain.db") | Out-Null
-New-Item -ItemType Directory -Force (Join-Path $DATA_DIR "blocks")        | Out-Null
-New-Item -ItemType Directory -Force (Join-Path $DATA_DIR "logs")          | Out-Null
+# Loose files at the data-dir root (founder.seed, moderator.txt, etc.).
+foreach ($f in @("founder.seed", "moderator.txt")) {
+    $p = Join-Path $DATA_DIR $f
+    if (Test-Path $p) {
+        Write-Host "[wipe] rm $p"
+        Remove-Item -Force $p
+    }
+}
+# Re-create the dirs the node expects to find on startup.
+foreach ($sub in @("blockchain.db", "blocks", "logs", "keys")) {
+    New-Item -ItemType Directory -Force (Join-Path $DATA_DIR $sub) | Out-Null
+}
 
 # Patch the config to point at the home data_dir (in case it was checked
 # in with ./data).

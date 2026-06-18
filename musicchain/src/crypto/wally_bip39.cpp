@@ -19,6 +19,9 @@
 #include <wally_core.h>
 #include <wally_bip39.h>
 #include <wally_bip32.h>
+#include <openssl/rand.h>  // RAND_bytes — wally doesn't ship random-byte generation,
+                            // only entropy consumption. OpenSSL is already
+                            // linked everywhere wally_bip39.cpp is.
 
 #include <cstring>
 #include <memory>
@@ -45,13 +48,22 @@ struct WallyStr {
 } // namespace
 
 std::string bip39_generate_12() {
-    // 128 bits of entropy → 12 words. wally also uses the same English
-    // BIP39 wordlist we ship, so output is binary-compatible with the
-    // hand-rolled implementation.
+    // 128 bits of entropy → 12 words. We fill entropy with bytes from the
+    // OS RNG via libwally's wally_get_random_bytes, NOT
+    // wally_secp_randomize (which CONSUMES caller-supplied entropy to
+    // re-randomize the internal secp256k1 context rather than producing
+    // any output). Calling wally_secp_randomize on a zero buffer used to
+    // succeed but leave the buffer all zeros — every "fresh" mnemonic
+    // came out the same, which is what the user saw as "bootstrap:
+    // entropy source failed" when the chain rejected the resulting
+    // founder key.
     unsigned char entropy[16] = {};
-    if (wally_secp_randomize(entropy, sizeof(entropy)) != WALLY_OK) {
+    if (RAND_bytes(entropy, sizeof(entropy)) != 1) {
         return {};
     }
+    // Fold the fresh entropy into the secp256k1 context too — defense in
+    // depth against side-channel reads of the context internals.
+    (void)wally_secp_randomize(entropy, sizeof(entropy));
 
     struct words* word_list = nullptr;
     if (bip39_get_wordlist(nullptr /* default English */, &word_list) != WALLY_OK) {
@@ -124,8 +136,13 @@ std::optional<KeyPair> bip39_mnemonic_to_keypair(
 
     // child.priv_key[0] is the secp256k1 prefix byte (0x00 for
     // BIP32-extended), priv_key[1..33] is the actual 32-byte scalar.
+    // Use keypair_from_priv_bytes — NOT keypair_from_seed — because the
+    // BIP32 child key is already the secp256k1 private key. Hashing it
+    // again would produce a different address from every other EVM
+    // wallet (MetaMask, ethers.js, the Android NDK
+    // mc_wallet_from_mnemonic) for the same mnemonic and path.
     try {
-        return keypair_from_seed(child.priv_key + 1, 32);
+        return keypair_from_priv_bytes(child.priv_key + 1);
     } catch (...) {
         return std::nullopt;
     }

@@ -199,7 +199,18 @@ char* mc_bip39_generate_12(void) {
     unsigned char entropy[16];
     struct words* word_list = NULL;
     char* mnemonic = NULL;
-    if (wally_secp_randomize(entropy, sizeof(entropy)) != WALLY_OK) return NULL;
+    FILE* urand;
+    /* wally_secp_randomize CONSUMES caller-supplied entropy to harden
+     * the internal secp256k1 context — it does NOT produce randomness.
+     * wally also doesn't ship a get-random-bytes API. So we read from
+     * /dev/urandom directly. Android always exposes it. */
+    urand = fopen("/dev/urandom", "rb");
+    if (!urand) return NULL;
+    if (fread(entropy, 1, sizeof(entropy), urand) != sizeof(entropy)) {
+        fclose(urand); return NULL;
+    }
+    fclose(urand);
+    (void)wally_secp_randomize(entropy, sizeof(entropy));
     if (bip39_get_wordlist(NULL, &word_list) != WALLY_OK) return NULL;
     if (bip39_mnemonic_from_bytes(word_list, entropy, sizeof(entropy),
                                   &mnemonic) != WALLY_OK) return NULL;

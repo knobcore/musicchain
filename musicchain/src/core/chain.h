@@ -147,6 +147,14 @@ public:
     // not counted toward block-finality quorum.
     bool apply_slash(const SlashTx& tx, leveldb::WriteBatch& batch);
 
+    // Relay reward — issued by a full node to credit a mini-node for
+    // serving binary tunnel traffic. Verifies the issuer signature,
+    // verifies issuer is current chain founder (Phase 2; Phase 3 widens
+    // to any validator), then mints count*1_00000000 internal units to
+    // target_address. Advances issuer nonce.
+    bool apply_relay_reward(const RelayRewardTx& tx,
+                            leveldb::WriteBatch& batch);
+
     // Has this address been slashed? Used by the consensus path that
     // tallies confirmations — slashed addresses' votes return zero
     // weight. Reads the "slashed:" prefix in the DB.

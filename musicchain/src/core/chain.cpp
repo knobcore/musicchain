@@ -210,6 +210,14 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
             if (!apply_slash(s_tx, batch)) {
                 std::cerr << "[chain] apply: SLASH apply failed\n"; return false;
             }
+        } else if (type == TxType::RELAY_REWARD) {
+            RelayRewardTx rr;
+            if (!RelayRewardTx::deserialize(raw_tx.data(), raw_tx.size(), rr)) {
+                std::cerr << "[chain] apply: RELAY_REWARD deserialize failed\n"; return false;
+            }
+            if (!apply_relay_reward(rr, batch)) {
+                std::cerr << "[chain] apply: RELAY_REWARD apply failed\n"; return false;
+            }
         } else {
             std::cerr << "[chain] apply: unknown TxType " << static_cast<int>(type) << "\n";
             return false;
@@ -432,6 +440,51 @@ bool Chain::apply_username_register(const UsernameTx& tx,
     db_.set_username(batch, tx.name, tx.owner);
     db_.set_nonce(batch, tx.owner, expected + 1);
     record_applied_nonce(tx.owner, expected + 1);
+    return true;
+}
+
+// ---- Relay reward ---------------------------------------------------
+
+bool Chain::apply_relay_reward(const RelayRewardTx& tx,
+                               leveldb::WriteBatch& batch) {
+    // Verify the issuer's signature first — the issuer is the only one
+    // who can authorize a credit.
+    if (!tx.verify_signature()) {
+        std::cerr << "[chain] relay_reward reject: issuer signature invalid\n";
+        return false;
+    }
+    // Issuer must be the founder for now. Phase 3 widens this to any
+    // active validator with a non-slashed key.
+    auto founder = db_.get_founder();
+    if (!founder.has_value() ||
+        std::memcmp(founder->data(), tx.issuer_address.data(), 20) != 0) {
+        std::cerr << "[chain] relay_reward reject: issuer is not the founder\n";
+        return false;
+    }
+    // Nonce check against issuer's chain nonce.
+    uint64_t expected = next_expected_nonce(tx.issuer_address);
+    if (tx.nonce != expected) {
+        std::cerr << "[chain] relay_reward reject: nonce mismatch (tx="
+                  << tx.nonce << " expected=" << expected << ")\n";
+        return false;
+    }
+    // Don't accept absurd claims — bound the credit per tx so a buggy
+    // counter can't mint a fortune in one shot.
+    constexpr uint64_t kMaxCountPerTx = 1'000'000ull;
+    if (tx.count == 0 || tx.count > kMaxCountPerTx) {
+        std::cerr << "[chain] relay_reward reject: count out of range ("
+                  << tx.count << ")\n";
+        return false;
+    }
+    // 1 MC = 1_00000000 internal units (8 decimals). Credit the target.
+    constexpr uint64_t kUnitPerMc = 100'000'000ull;
+    uint64_t amount = tx.count * kUnitPerMc;
+    Ledger ledger(db_);
+    ledger.credit(batch, tx.target_address, amount);  // void — no supply-cap guard for now
+    db_.set_nonce(batch, tx.issuer_address, expected + 1);
+    record_applied_nonce(tx.issuer_address, expected + 1);
+    std::cout << "[chain] RELAY_REWARD: +" << tx.count << " MC to "
+              << db_.hex(tx.target_address).substr(0, 12) << "…\n";
     return true;
 }
 

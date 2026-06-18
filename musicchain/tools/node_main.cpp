@@ -567,7 +567,23 @@ fuzzy_ok: ;
         // SyncManager fetches missing history from peers on startup. Wires
         // a librats inbound-reply handler so RPC replies from peers reach
         // the correlator and unblock the matching pending request.
-        static mc::SyncManager sync(chain, rats, /*min_peers=*/2);
+        //
+        // min_peers controls eclipse defense — refuse to adopt a peer's
+        // chain unless at least N independent tips agree. Sensible
+        // production default is 2-3, but a fresh dev deploy with just
+        // home node + VPS only has one peer reachable per side via the
+        // mini-node tunnel, so leave it env-overrideable:
+        //   MUSICCHAIN_MIN_SYNC_PEERS=1 ./musicchain-node start ...
+        uint32_t min_sync_peers = 2;
+        if (const char* env = std::getenv("MUSICCHAIN_MIN_SYNC_PEERS")) {
+            if (*env) {
+                try { min_sync_peers = static_cast<uint32_t>(std::stoi(env)); }
+                catch (...) {}
+            }
+        }
+        std::cout << "[sync] min_peers=" << min_sync_peers
+                  << " (override with MUSICCHAIN_MIN_SYNC_PEERS)\n";
+        static mc::SyncManager sync(chain, rats, min_sync_peers);
         rats_on_message(rats.client(), "musicchain.reply",
             [](void* /*user*/, const char* peer_id,
                 const char* message_data) {

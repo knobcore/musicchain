@@ -170,14 +170,16 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Set up your wallet')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: switch (_step) {
-          _Step.chooseFlow    => _buildChooseFlow(),
-          _Step.showSeed      => _buildShowSeed(),
-          _Step.restoreSeed   => _buildRestoreSeed(),
-          _Step.pickIdentity  => _buildPickIdentity(),
-        },
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: switch (_step) {
+            _Step.chooseFlow    => _buildChooseFlow(),
+            _Step.showSeed      => _buildShowSeed(),
+            _Step.restoreSeed   => _buildRestoreSeed(),
+            _Step.pickIdentity  => _buildPickIdentity(),
+          },
+        ),
       ),
     );
   }
@@ -274,7 +276,7 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
             ),
           ],
         ),
-        const Spacer(),
+        const SizedBox(height: 24),
         ElevatedButton(
           onPressed: _proceedToIdentityFromCreate,
           child: const Text('I\'ve written it down'),
@@ -310,7 +312,7 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
           const SizedBox(height: 12),
           Text(_error!, style: const TextStyle(color: Colors.redAccent)),
         ],
-        const Spacer(),
+        const SizedBox(height: 24),
         ElevatedButton(
           onPressed: _proceedToIdentityFromRestore,
           child: const Text('Continue'),
@@ -356,7 +358,7 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
           const SizedBox(height: 12),
           Text(_error!, style: const TextStyle(color: Colors.redAccent)),
         ],
-        const Spacer(),
+        const SizedBox(height: 24),
         ElevatedButton(
           onPressed: _busy ? null : _finish,
           child: _busy

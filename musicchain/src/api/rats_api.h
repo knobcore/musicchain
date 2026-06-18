@@ -15,6 +15,8 @@
 
 extern "C" { typedef void* rats_client_t; }
 
+namespace mc { class BlockPropagator; }
+
 namespace mc::api {
 
 class HttpServer; // forward — RatsApi borrows its verb handlers
@@ -44,6 +46,12 @@ public:
     void start(rats_client_t client);
     void stop();
 
+    /// Plug a BlockPropagator in. handle_request forwards every
+    /// envelope whose `type` starts with `block.` to the propagator;
+    /// on/off-peer callbacks are forwarded so the propagator can fire
+    /// block.hello on connect and clean up state on drop.
+    void set_block_propagator(BlockPropagator* bp) { propagator_ = bp; }
+
     /// Read-only handle to the in-memory swarm index so the full node
     /// TUI can render live song-count / member stats without going
     /// through an RPC round trip.
@@ -68,6 +76,7 @@ private:
     net::NodeConfig             config_;
     mc::crypto::KeyPair         keypair_;
     rats_client_t               client_ = nullptr;
+    BlockPropagator*            propagator_ = nullptr;
 
     static void on_request_cb(void* user_data, const char* peer_id,
                               const char* message_data);

@@ -367,7 +367,7 @@ set(MC_SOURCES
   src/consensus/validator.cpp
   src/consensus/candidate.cpp
   src/consensus/slashing.cpp
-  src/sync/sync_manager.cpp
+  src/sync/block_propagator.cpp
   src/sync/deep_audit.cpp
   src/net/load_monitor.cpp
   src/net/relay_credit_tracker.cpp

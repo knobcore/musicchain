@@ -3,6 +3,7 @@
 #include "../audio/fingerprint.h"
 #include "../moderation/mod_action.h"
 #include "../util/traffic.h"
+#include "../sync/block_propagator.h"
 
 // mc_rats_quic.h was the old stub. We now link the real librats and
 // consume its C bindings header so functions like rats_get_peer_info_json
@@ -127,6 +128,14 @@ void RatsApi::on_peer_connected_cb(void* user_data, const char* peer_id) {
             rats_send_message(self->client_, peer_id,
                               MC_REQUEST_TYPE, req.dump().c_str());
         }
+
+        // Block-distribution handshake: send block.hello so the new
+        // peer learns our tip. If they're a full node and we're behind,
+        // they'll respond with their tip + we'll fire block.getblocks
+        // through the existing handle_request path.
+        if (self->propagator_) {
+            self->propagator_->on_peer_connected(peer_id);
+        }
     }
     if (peer_id) rats_string_free(peer_id);
 }
@@ -135,6 +144,7 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
     auto* self = static_cast<RatsApi*>(user_data);
     if (self && peer_id && *peer_id) {
         self->swarm_.mark_peer_offline(peer_id);
+        if (self->propagator_) self->propagator_->on_peer_disconnected(peer_id);
     }
     // NOTE: do NOT rats_string_free here. The disconnect callback wrapper
     // in deps/librats/src/librats_c.cpp does NOT strdup peer_id (unlike
@@ -257,62 +267,21 @@ void RatsApi::handle_request(const std::string& peer_id,
         } else if (type == "dht.peers") {
             reply = wrap_handler_result(req_id, http_.verb_dht_peers());
         }
-        // ---- chain sync ---------------------------------------------
+        // ---- bitcoin-style block distribution -----------------------
         //
-        // chain.tip               → { height, hash, timestamp_ms }
-        // chain.list_block_hashes → { from_height, max=128 } →
-        //                            { hashes: [hex,hex,...] }
-        // chain.get_block         → { hash } | { height } →
-        //                            { block_b64: "..." }
-        //
-        // SyncManager on a fresh node calls chain.tip on every peer it
-        // can reach, picks the best peer per fork-choice, then walks
-        // chain.list_block_hashes paginated forward from its current
-        // tip+1 and pulls each block via chain.get_block. Each pulled
-        // block runs the same five-step validation rebuild_derived_state
-        // runs before connect_block.
-        else if (type == "chain.tip") {
-            const auto t = chain_.tip();
-            reply = {{"req_id", req_id}, {"status", "ok"},
-                     {"body", {{"height",       t.height},
-                                {"hash",         crypto::to_hex(t.hash)},
-                                {"timestamp_ms", t.timestamp_ms}}}};
-        } else if (type == "chain.list_block_hashes") {
-            const uint32_t from = static_cast<uint32_t>(
-                in.value("from_height", 0));
-            uint32_t max  = static_cast<uint32_t>(in.value("max", 128));
-            if (max == 0 || max > 512) max = 128; // cap per-call cost
-            const auto t = chain_.tip();
-            std::vector<std::string> out;
-            for (uint32_t h = from; h <= t.height && out.size() < max; ++h) {
-                if (auto bh = chain_.get_block_hash(h))
-                    out.push_back(crypto::to_hex(*bh));
-                else break;
-            }
-            reply = {{"req_id", req_id}, {"status", "ok"},
-                     {"body", {{"from_height", from},
-                                {"hashes",      out}}}};
-        } else if (type == "chain.get_block") {
-            std::optional<Block> block;
-            if (in.contains("hash")) {
-                Hash256 h{};
-                if (crypto::parse_hash256(in.value("hash", ""), h))
-                    block = chain_.get_block(h);
-            } else if (in.contains("height")) {
-                const uint32_t height =
-                    static_cast<uint32_t>(in.value("height", 0));
-                if (auto bh = chain_.get_block_hash(height))
-                    block = chain_.get_block(*bh);
-            }
-            if (!block) {
-                reply = {{"req_id", req_id}, {"status", "not_found"},
+        // Replaces the old chain.tip / chain.list_block_hashes /
+        // chain.get_block trio. BlockPropagator owns every verb whose
+        // type starts with "block." (hello, getblocks, inv, getdata,
+        // data). See src/sync/block_propagator.h for the protocol
+        // doc.
+        else if (type.rfind("block.", 0) == 0) {
+            if (!propagator_) {
+                reply = {{"req_id", req_id}, {"status", "not_ready"},
                          {"body", nullptr}};
             } else {
-                const auto bytes = block->serialize();
+                json body_out = propagator_->handle_request(peer_id, type, in);
                 reply = {{"req_id", req_id}, {"status", "ok"},
-                         {"body", {{"block_b64",
-                                    audio::base64_encode(bytes.data(),
-                                                          bytes.size())}}}};
+                         {"body",   std::move(body_out)}};
             }
         } else if (type == "songs.list") {
             // Inject the live swarm size next to each chain entry so the

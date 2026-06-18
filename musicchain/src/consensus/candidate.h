@@ -3,6 +3,7 @@
 #include "../core/block.h"
 #include "../core/transaction.h"
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -101,7 +102,16 @@ public:
     /// on the producer's internal state — pure notify.
     void wake();
 
+    /// Fires after every successful chain.connect_block in
+    /// commit_block. node_main wires this to
+    /// BlockPropagator::announce_new_block so freshly-minted blocks
+    /// gossip out as INV + get DHT-announced for multi-source catch-up.
+    using BlockAnnouncer = std::function<void(const Hash256& hash)>;
+    void set_block_announcer(BlockAnnouncer f) { announcer_ = std::move(f); }
+
 private:
+    BlockAnnouncer announcer_;
+
     mutable std::mutex                               mutex_;
     std::unordered_map<std::string, BlockCandidate>  candidates_;
     std::condition_variable                          confirm_cv_;

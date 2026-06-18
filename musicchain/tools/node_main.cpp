@@ -23,7 +23,7 @@
 // it back.
 #include "../src/consensus/candidate.h"
 #include "../src/consensus/validator.h"
-#include "../src/sync/sync_manager.h"
+#include "../src/sync/block_propagator.h"
 #include "../src/sync/deep_audit.h"
 #include "../src/net/load_monitor.h"
 #include "../src/net/relay_credit_tracker.h"
@@ -86,6 +86,11 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     if (j.contains("seed_nodes")) {
         for (auto& s : j["seed_nodes"]) cfg.seed_nodes.push_back(s);
     }
+    if (j.contains("sync_seeds")) {
+        for (auto& s : j["sync_seeds"]) cfg.sync_seeds.push_back(s);
+    }
+    if (j.contains("dht_bootstrap_hash"))
+        cfg.dht_bootstrap_hash = j["dht_bootstrap_hash"];
     if (j.contains("registry_url"))  cfg.registry_url  = j["registry_url"];
     if (j.contains("load_monitor")) {
         const auto& lm = j["load_monitor"];
@@ -129,6 +134,8 @@ static void save_config(const std::string& path,
     j["log_level"]         = cfg.log_level;
     j["tui_mode"]          = tui_mode;
     j["seed_nodes"]        = cfg.seed_nodes;
+    j["sync_seeds"]        = cfg.sync_seeds;
+    j["dht_bootstrap_hash"]= cfg.dht_bootstrap_hash;
     j["registry_url"]      = cfg.registry_url;
     json lm = json::object();
     lm["max_bandwidth_bps"]    = g_load_cfg.max_bandwidth_bps;
@@ -564,57 +571,20 @@ fuzzy_ok: ;
         std::cerr << "[node] rats link failed to start — continuing without NAT punch\n";
     }
     if (rats.client()) {
-        // SyncManager fetches missing history from peers on startup. Wires
-        // a librats inbound-reply handler so RPC replies from peers reach
-        // the correlator and unblock the matching pending request.
-        //
-        // min_peers controls eclipse defense — refuse to adopt a peer's
-        // chain unless at least N independent tips agree. Sensible
-        // production default is 2-3, but a fresh dev deploy with just
-        // home node + VPS only has one peer reachable per side via the
-        // mini-node tunnel, so leave it env-overrideable:
-        //   MUSICCHAIN_MIN_SYNC_PEERS=1 ./musicchain-node start ...
-        uint32_t min_sync_peers = 2;
-        if (const char* env = std::getenv("MUSICCHAIN_MIN_SYNC_PEERS")) {
-            if (*env) {
-                try { min_sync_peers = static_cast<uint32_t>(std::stoi(env)); }
-                catch (...) {}
-            }
-        }
-        std::cout << "[sync] min_peers=" << min_sync_peers
-                  << " (override with MUSICCHAIN_MIN_SYNC_PEERS)\n";
-        static mc::SyncManager sync(chain, rats, min_sync_peers);
-        // Background thread: once librats has the mini-node validated as
-        // a peer, hand its peer_id to SyncManager. SyncManager uses it as
-        // its relay anchor for routes.get + relay.forward to other full
-        // nodes. Re-checks every 10 s so a transient librats reconnect
-        // doesn't permanently break discovery.
-        std::thread([&rats]() {
-            std::string last;
-            while (true) {
-                auto pids = rats.peer_ids();
-                if (!pids.empty() && pids.front() != last) {
-                    last = pids.front();
-                    sync.set_mini_node_peer_id(last);
-                    std::cout << "[sync] mini-node peer set: "
-                              << last.substr(0, 12) << "…\n";
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(10));
-            }
-        }).detach();
-        rats_on_message(rats.client(), "musicchain.reply",
-            [](void* /*user*/, const char* peer_id,
-                const char* message_data) {
-                if (!peer_id || !message_data) {
-                    if (peer_id)       rats_string_free(peer_id);
-                    if (message_data)  rats_string_free(message_data);
-                    return;
-                }
-                sync.on_rpc_reply(peer_id, message_data);
-                rats_string_free(peer_id);
-                rats_string_free(message_data);
-            }, nullptr);
-        sync.start();
+        // BlockPropagator — bitcoin-style block distribution over
+        // librats with BitTorrent-style DHT multi-source fetch.
+        // Replaces the old SyncManager + routes.get / relay.forward
+        // path: full nodes find each other via the librats DHT
+        // (announce + find under cfg.dht_bootstrap_hash), exchange
+        // tips on connect via block.hello, and catch up via
+        // block.getblocks → block.inv → block.getdata → block.data.
+        // New locally-minted blocks are gossiped via block.inv.
+        // See src/sync/block_propagator.h for the wire protocol.
+        static mc::BlockPropagator propagator(chain, rats, cfg);
+        rats_api.set_block_propagator(&propagator);
+        candidates.set_block_announcer(
+            [](const mc::Hash256& h) { propagator.announce_new_block(h); });
+        propagator.start(rats.client());
 
         // DeepAuditor runs the chromaprint↔audio re-check on a random
         // recent block every kAuditIntervalMs. Catches producers that

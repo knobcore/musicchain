@@ -40,8 +40,8 @@ inline std::vector<Checkpoint> hardcoded_checkpoints() {
     return {};
 }
 
-// Fork-choice rule used by SyncManager when comparing a peer's tip to
-// our own. "Better" means we should adopt theirs.
+// Fork-choice rule used by BlockPropagator when comparing a peer's tip
+// to our own. "Better" means we should adopt theirs.
 //
 //   1. Longer chain wins (higher height).
 //   2. On ties, newer block timestamp wins.

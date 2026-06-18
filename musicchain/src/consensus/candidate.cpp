@@ -234,6 +234,9 @@ bool CandidateManager::commit_block(
             err = "Chain connect_block rejected";
             return false;
         }
+        // Gossip the new block out — INV broadcast to connected peers
+        // + DHT-announce so multi-source catch-up can find this node.
+        if (announcer_) announcer_(block.hash());
         // Best-effort write the .blk dump for the operator.
         try {
             // Scale fix: bucket the .blk dumps by height/1000 so we
@@ -356,6 +359,9 @@ bool CandidateManager::commit_block(
         err = "Chain connect_block rejected";
         return false;
     }
+    // Gossip the new block out — INV broadcast to connected peers
+    // + DHT-announce so multi-source catch-up can find this node.
+    if (announcer_) announcer_(final_block.hash());
 
     block = final_block; // Caller sees the committed form (with confirmations).
     uint32_t height = chain.tip().height;

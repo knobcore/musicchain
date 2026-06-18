@@ -24,6 +24,19 @@ struct NodeConfig {
     uint16_t    api_port     = 9334;
     uint16_t    rats_port    = 8080;
     std::vector<std::string> seed_nodes;
+    // Explicit "host:port" full-node sync seeds for BlockPropagator's
+    // initial dial. Optional — when empty, BlockPropagator falls back to
+    // librats DHT discovery (announce + find under the configured
+    // dht_bootstrap_hash). Useful for a brand-new VPS that hasn't yet
+    // populated its DHT routing table, or for an air-gapped test where
+    // you want a deterministic peer.
+    std::vector<std::string> sync_seeds;
+    // sha1-hex DHT key every full node announces itself under. Anyone
+    // searching this key on the BitTorrent-style DHT gets back the
+    // set of musicchain full nodes currently online. Defaults to
+    // sha1("musicchain-fullnode-mainnet") computed at boot; override
+    // in config to spin up a private network.
+    std::string dht_bootstrap_hash;
     uint32_t    max_peers    = 125;
     uint32_t    max_sessions = 10000;
     bool        validator_enabled = true;

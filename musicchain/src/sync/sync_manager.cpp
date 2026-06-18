@@ -290,88 +290,116 @@ void SyncManager::run_pass() {
     // can pick a different peer. Multi-peer striped download is a
     // future optimisation — sequential is correct + fits a normal
     // boot-time sync window.
-    // Phase 1: ask the mini-node who the other full nodes are. With one
-    // mini-node + one home node + this VPS, this is the only way the VPS
-    // discovers the home node — direct librats peer_ids() shows just the
-    // mini-node itself, which has no chain.
-    discover_full_nodes();
-    std::vector<std::string> peer_ids;
-    {
-        std::lock_guard<std::mutex> lk(discovery_mu_);
-        for (const auto& d : discovered_) {
-            if (!d.rats_peer_id.empty()) peer_ids.push_back(d.rats_peer_id);
-        }
-    }
-    std::cout << "[sync] startup pass: local height="
-              << chain_.tip().height
-              << ", discovered full nodes=" << peer_ids.size()
-              << ", min_required=" << min_peers_ << "\n";
-    if (peer_ids.size() < min_peers_) {
-        std::cout << "[sync] not enough peers — deferred (eclipse-safe)\n";
-        return;
-    }
-
-    struct PeerWithTip { std::string peer_id; PeerTip tip; };
-    std::vector<PeerWithTip> tips;
-    tips.reserve(peer_ids.size());
-    for (const auto& pid : peer_ids) {
-        if (!running_) return;
-        auto t = peer_chain_tip(pid);
-        if (t) tips.push_back({pid, *t});
-    }
-    if (tips.size() < min_peers_) {
-        std::cout << "[sync] " << tips.size()
-                  << " peers responded with tips — below min_peers, "
-                     "deferred\n";
-        return;
-    }
-
-    const auto local = chain_.tip();
-    auto as_chain_tip = [](const PeerTip& p) {
-        return ChainTip{p.hash, p.height, p.timestamp_ms};
+    // Retry loop: the first attempt typically fires before the rats
+    // handshake to the mini-node completes (so discover_full_nodes()
+    // sees 0 peers); subsequent passes recover from new blocks the
+    // home node minted while we were idle. We sleep between passes
+    // proportionally to whether we found work or not.
+    auto sleep_for = [this](int seconds) {
+        for (int i = 0; i < seconds && running_; ++i)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
     };
-    PeerWithTip best = tips.front();
-    for (const auto& p : tips) {
-        if (tip_is_better(as_chain_tip(p.tip), as_chain_tip(best.tip)))
-            best = p;
-    }
-    if (!tip_is_better(as_chain_tip(best.tip), local)) {
-        std::cout << "[sync] local tip already ≥ best peer tip — no sync\n";
-        return;
-    }
-    std::cout << "[sync] best peer tip height=" << best.tip.height
-              << " ts=" << best.tip.timestamp_ms
-              << " peer=" << best.peer_id.substr(0, 12) << "…\n";
+    while (running_) {
+        // Phase 1: ask the mini-node who the other full nodes are.
+        discover_full_nodes();
+        std::vector<std::string> peer_ids;
+        {
+            std::lock_guard<std::mutex> lk(discovery_mu_);
+            for (const auto& d : discovered_) {
+                if (!d.rats_peer_id.empty()) peer_ids.push_back(d.rats_peer_id);
+            }
+        }
+        // Filter ourselves out (we appear in the routes table too).
+        {
+            const auto own = rats_.rats_peer_id();
+            if (!own.empty()) {
+                peer_ids.erase(std::remove(peer_ids.begin(), peer_ids.end(), own),
+                                peer_ids.end());
+            }
+        }
+        std::cout << "[sync] pass: local height="
+                  << chain_.tip().height
+                  << ", discovered full nodes=" << peer_ids.size()
+                  << ", min_required=" << min_peers_ << "\n";
+        if (peer_ids.size() < min_peers_) {
+            std::cout << "[sync] not enough peers — retrying in 10s\n";
+            sleep_for(10);
+            continue;
+        }
 
-    Hash256 prev_hash = local.hash;
-    uint32_t cursor   = local.height + 1;
-    while (running_ && cursor <= best.tip.height) {
-        auto hashes = peer_list_block_hashes(best.peer_id, cursor, 128);
-        if (hashes.empty()) {
-            std::cerr << "[sync] peer returned no hashes at " << cursor
-                      << " — aborting\n";
-            return;
-        }
-        for (const auto& h : hashes) {
+        struct PeerWithTip { std::string peer_id; PeerTip tip; };
+        std::vector<PeerWithTip> tips;
+        tips.reserve(peer_ids.size());
+        for (const auto& pid : peer_ids) {
             if (!running_) return;
-            auto bytes = peer_get_block(best.peer_id, h);
-            if (!bytes) {
-                std::cerr << "[sync] failed to fetch block " << cursor
-                          << " — aborting\n";
-                return;
-            }
-            if (!ingest_block(*bytes, h, prev_hash)) {
-                std::cerr << "[sync] ingest_block failed at " << cursor
-                          << " — aborting\n";
-                return;
-            }
-            prev_hash = h;
-            ++cursor;
-            if (cursor > best.tip.height) break;
+            auto t = peer_chain_tip(pid);
+            if (t) tips.push_back({pid, *t});
         }
+        if (tips.size() < min_peers_) {
+            std::cout << "[sync] " << tips.size()
+                      << " peers replied — below min_peers, retrying in 10s\n";
+            sleep_for(10);
+            continue;
+        }
+
+        const auto local = chain_.tip();
+        auto as_chain_tip = [](const PeerTip& p) {
+            return ChainTip{p.hash, p.height, p.timestamp_ms};
+        };
+        PeerWithTip best = tips.front();
+        for (const auto& p : tips) {
+            if (tip_is_better(as_chain_tip(p.tip), as_chain_tip(best.tip)))
+                best = p;
+        }
+        if (!tip_is_better(as_chain_tip(best.tip), local)) {
+            std::cout << "[sync] local tip already ≥ best peer tip — sleeping 30s\n";
+            sleep_for(30);
+            continue;
+        }
+        std::cout << "[sync] best peer tip height=" << best.tip.height
+                  << " ts=" << best.tip.timestamp_ms
+                  << " peer=" << best.peer_id.substr(0, 12) << "…\n";
+
+        Hash256 prev_hash = local.hash;
+        uint32_t cursor   = local.height + 1;
+        bool aborted = false;
+        while (running_ && cursor <= best.tip.height) {
+            auto hashes = peer_list_block_hashes(best.peer_id, cursor, 128);
+            if (hashes.empty()) {
+                std::cerr << "[sync] peer returned no hashes at " << cursor
+                          << " — aborting pass\n";
+                aborted = true;
+                break;
+            }
+            for (const auto& h : hashes) {
+                if (!running_) return;
+                auto bytes = peer_get_block(best.peer_id, h);
+                if (!bytes) {
+                    std::cerr << "[sync] failed to fetch block " << cursor
+                              << " — aborting pass\n";
+                    aborted = true;
+                    break;
+                }
+                if (!ingest_block(*bytes, h, prev_hash)) {
+                    std::cerr << "[sync] ingest_block failed at " << cursor
+                              << " — aborting pass\n";
+                    aborted = true;
+                    break;
+                }
+                prev_hash = h;
+                ++cursor;
+                if (cursor > best.tip.height) break;
+            }
+            if (aborted) break;
+        }
+        if (aborted) {
+            sleep_for(10);
+            continue;
+        }
+        std::cout << "[sync] caught up to height " << chain_.tip().height
+                  << " — sleeping 30s before next pass\n";
+        sleep_for(30);
     }
-    std::cout << "[sync] caught up to height " << chain_.tip().height
-              << "\n";
 }
 
 } // namespace mc

@@ -43,6 +43,11 @@ PKGS=(
     libogg-dev libvorbis-dev libopus-dev libopusfile-dev
     # Storage
     libleveldb-dev
+    # leveldb's link-time dependency on snappy. The runtime libsnappy.so.1
+    # comes for free when libleveldb-dev is installed, but the bare
+    # libsnappy.so symlink the linker resolves -lsnappy through only
+    # arrives via libsnappy-dev.
+    libsnappy-dev
     # Network + JSON (cpp-httplib is vendored at deps/cpp-httplib —
     # no apt package needed)
     libuv1-dev

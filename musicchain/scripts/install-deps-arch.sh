@@ -36,6 +36,7 @@ PKGS=(
     libogg libvorbis opus opusfile
     # Storage
     leveldb
+    snappy
     # Network + JSON
     libuv
     nlohmann-json

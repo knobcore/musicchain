@@ -90,9 +90,13 @@ class LibratsDiscovery extends ChangeNotifier {
       // tagged "relay" are unreachable from outside their NAT — their
       // RPCs must be tunneled through the mini-node. Nodes tagged "direct"
       // are reachable so we send to them straight.
-      final vpsPeer = rats.validatedPeerIds.isNotEmpty
-          ? rats.validatedPeerIds.first
-          : '';
+      // The relay anchor MUST be the mini-node, never a random
+      // validated peer (post-pivot full nodes don't handle
+      // relay.forward — they'd silently drop the tunneled body).
+      final vpsPeer = rats.firstMiniNodePeerId
+                   ?? (rats.validatedPeerIds.isNotEmpty
+                       ? rats.validatedPeerIds.first
+                       : '');
       for (final r in routes.values) {
         final pid   = r['rats_peer_id']   as String? ?? '';
         final reach = r['reachability']   as String? ?? 'unknown';
@@ -169,10 +173,43 @@ class LibratsDiscovery extends ChangeNotifier {
         // discovery, or a different node won the freshness sort. With
         // SwarmIndex persistence this fires only on actual identity
         // changes, not every 30 s refresh.
-        if (autoSelectedRatsPeerId.isNotEmpty &&
-            autoSelectedRatsPeerId != _lastNotifiedNodePid) {
+        final identityChanged = autoSelectedRatsPeerId.isNotEmpty &&
+                                autoSelectedRatsPeerId != _lastNotifiedNodePid;
+        if (identityChanged) {
           _lastNotifiedNodePid = autoSelectedRatsPeerId;
           try { onAutoNodeChanged?.call(autoSelectedRatsPeerId); } catch (_) {}
+        }
+
+        // Open a direct librats peer connection to the home node so
+        // its peer id ends up in validatedPeerIds — without this, the
+        // routing layer in RatsClient.request never picks a direct
+        // path and every RPC tunnels through the VPS (or, when the
+        // mini-node tagged the home node `direct`, the relay fallback
+        // is suppressed and the send lands on an empty peer table and
+        // times out silently). public_address is the host:port the
+        // mini-node's STUN probe observed for the home node — that's
+        // our reachability hint. librats.connect is async and
+        // dedupes, so re-dialing on every 30 s refresh is cheap and
+        // recovers from a home-node restart that rebinds an
+        // ephemeral port.
+        if (pickPub.isNotEmpty) {
+          final colon = pickPub.indexOf(':');
+          if (colon > 0) {
+            final host = pickPub.substring(0, colon);
+            final port = int.tryParse(pickPub.substring(colon + 1));
+            if (port != null && port > 0) {
+              final rc = rats.connect(host, port);
+              if (identityChanged) {
+                debugPrint('[discovery] rats.connect($host:$port) rc=$rc '
+                           'peers=${rats.peerCount}');
+                Timer(const Duration(seconds: 5), () {
+                  debugPrint('[discovery] post-connect '
+                             'peers=${rats.peerCount} '
+                             'validated=${rats.validatedPeerIds.length}');
+                });
+              }
+            }
+          }
         }
 
         // Save peer ids for offline restart (mirrors old DHT cache).

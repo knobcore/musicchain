@@ -19,7 +19,9 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 
+import '../services/librats_discovery.dart';
 import '../services/wallet_service.dart';
 
 class WalletFirstLaunchScreen extends StatefulWidget {
@@ -168,18 +170,92 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Watch the discovery layer so the connection banner — and the
+    // pickIdentity-step "Finish setup" gate — re-render every time the
+    // mini-node handshake or the auto-selected full node changes.
+    final disc = context.watch<LibratsDiscovery>();
     return Scaffold(
       appBar: AppBar(title: const Text('Set up your wallet')),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
-          child: switch (_step) {
-            _Step.chooseFlow    => _buildChooseFlow(),
-            _Step.showSeed      => _buildShowSeed(),
-            _Step.restoreSeed   => _buildRestoreSeed(),
-            _Step.pickIdentity  => _buildPickIdentity(),
-          },
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildConnectionBanner(disc),
+              switch (_step) {
+                _Step.chooseFlow    => _buildChooseFlow(),
+                _Step.showSeed      => _buildShowSeed(),
+                _Step.restoreSeed   => _buildRestoreSeed(),
+                _Step.pickIdentity  => _buildPickIdentity(connected: _hasFullNode(disc)),
+              },
+            ],
+          ),
         ),
+      ),
+    );
+  }
+
+  /// True once the discovery layer has handshaken with the mini-node
+  /// AND received at least one full node in the routes.get response.
+  /// We require both because the wallet's first publish-fingerprint
+  /// call after setup hits the full node directly.
+  bool _hasFullNode(LibratsDiscovery disc) =>
+      disc.autoSelectedRatsPeerId.isNotEmpty;
+
+  /// Banner shown on every step. Reads green when a full-node handshake
+  /// is live, amber while the player is still discovering, red if the
+  /// VPS rendezvous threw an error. Same widget across all four steps
+  /// so the user has constant feedback throughout the setup flow.
+  Widget _buildConnectionBanner(LibratsDiscovery disc) {
+    final hasNode  = _hasFullNode(disc);
+    final hasError = disc.lastError.isNotEmpty;
+    final Color color;
+    final IconData icon;
+    final String text;
+    if (hasNode) {
+      color = Colors.green.shade700;
+      icon  = Icons.check_circle;
+      text  = 'Connected to full node '
+              '${disc.autoSelectedRatsPeerId.substring(
+                  0, disc.autoSelectedRatsPeerId.length < 10
+                        ? disc.autoSelectedRatsPeerId.length : 10)}…'
+              '${disc.autoSelectedReachability == 'direct'
+                    ? '  (direct)'
+                    : '  (via VPS)'}';
+    } else if (hasError) {
+      color = Colors.red.shade700;
+      icon  = Icons.error_outline;
+      text  = 'Network error: ${disc.lastError}';
+    } else {
+      color = Colors.orange.shade700;
+      icon  = Icons.sync;
+      text  = disc.vpsStatus.isEmpty
+              ? 'Connecting to the musicchain mesh…'
+              : disc.vpsStatus;
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        // ignore: deprecated_member_use
+        color: color.withOpacity(0.08),
+        border: Border.all(color: color),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(text,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                )),
+          ),
+        ],
       ),
     );
   }
@@ -321,7 +397,20 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
     );
   }
 
-  Widget _buildPickIdentity() {
+  Widget _buildPickIdentity({required bool connected}) {
+    // Gate Finish on having a live full-node handshake. The first
+    // operation right after _finish (username register + initial
+    // library announce) needs to reach a full node; running it before
+    // discovery completes drops every tx on the floor.
+    final canFinish = !_busy && connected;
+    final String buttonLabel;
+    if (_busy) {
+      buttonLabel = 'Setting up…';
+    } else if (!connected) {
+      buttonLabel = 'Waiting for full node connection…';
+    } else {
+      buttonLabel = 'Finish setup';
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -360,10 +449,14 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
         ],
         const SizedBox(height: 24),
         ElevatedButton(
-          onPressed: _busy ? null : _finish,
+          onPressed: canFinish ? _finish : null,
           child: _busy
-              ? const CircularProgressIndicator()
-              : const Text('Finish setup'),
+              ? const SizedBox(
+                  height: 20,
+                  width:  20,
+                  child:  CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Text(buttonLabel),
         ),
       ],
     );

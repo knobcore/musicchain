@@ -120,6 +120,27 @@ class RatsClient {
   /// Tracks stream_id → stream sink so binary chunks can be reassembled.
   final Map<int, _AudioReceiver> _streams = {};
 
+  /// Peer ids that self-identified as a mini-node by sending us a
+  /// `mini.hello`. The post-pivot full node dropped the routes.get /
+  /// stun.observe surface (those verbs return unknown_type now), so
+  /// the helpers that need a mini-node specifically — requestRoutes,
+  /// _observePublicAddressViaVps — must route to one of these peers,
+  /// NOT to whatever validatedPeerIds.first happens to be. Populated
+  /// in _dispatchRequest when an inbound mini.hello arrives.
+  final Set<String> _miniNodePeerIds = {};
+
+  /// First currently-validated mini-node peer id, or null if no
+  /// mini-node is connected. Prefer this over validatedPeerIds.first
+  /// for any RPC only a mini-node answers.
+  String? get firstMiniNodePeerId {
+    if (!_started) return null;
+    final ids = validatedPeerIds;
+    for (final id in ids) {
+      if (_miniNodePeerIds.contains(id)) return id;
+    }
+    return null;
+  }
+
   /// Per-target relay routing. Populated by `LibratsDiscovery` from the
   /// `reachability` field returned by routes.get. When set, requests bound
   /// for `targetPeerId` are wrapped as `relay.forward` and sent to the
@@ -503,7 +524,11 @@ class RatsClient {
     }
     if (!_started)                return;
     if (validatedPeerIds.isEmpty) return;
-    final vps = validatedPeerIds.first;
+    // stun.observe is mini-node-only; full nodes return unknown_type
+    // post-pivot. Wait briefly for a mini-node to identify itself if
+    // none has yet — the watchdog calls this on every reconnect so a
+    // delayed mini.hello recovers on the next tick anyway.
+    final vps = firstMiniNodePeerId ?? validatedPeerIds.first;
     try {
       final reply = await request(vps, 'stun.observe', const {},
           timeout: const Duration(seconds: 6));
@@ -946,6 +971,32 @@ class RatsClient {
     final originator = env['originator_peer_id'] as String? ?? '';
     if (reqId.isEmpty || type.isEmpty) return;
 
+    // mini-node identity. The mini-node sends mini.hello to every
+    // fresh peer; the player snapshots which connected peer is a
+    // mini-node so requestRoutes / stun.observe can target it
+    // directly instead of guessing via validatedPeerIds.first (which
+    // is wrong any time librats also handed us a full-node DHT peer).
+    if (type == 'mini.hello') {
+      _miniNodePeerIds.add(peerId);
+      // Ack so the mini-node logs a clean request/reply pair.
+      final ack = jsonEncode({
+        'req_id': reqId,
+        'status': 'ok',
+        'body':   const <String, dynamic>{},
+      });
+      final peerPtr = peerId.toNativeUtf8();
+      final typePtr = 'musicchain.reply'.toNativeUtf8();
+      final bodyPtr = ack.toNativeUtf8();
+      try {
+        _b.sendMessage(_handle, peerPtr, typePtr, bodyPtr);
+      } finally {
+        malloc.free(peerPtr);
+        malloc.free(typePtr);
+        malloc.free(bodyPtr);
+      }
+      return;
+    }
+
     Future<void> answer() async {
       Map<String, dynamic>? body;
       String status = 'ok';
@@ -1105,13 +1156,17 @@ class RatsClient {
   }
 
   /// Pull the current routing table from the VPS mini-node by sending a
-  /// `routes.get` RPC. Until a real list of connected peers is exposed we
-  /// take the first validated peer id as the VPS rendezvous.
+  /// `routes.get` RPC. Targets a peer that self-identified as a
+  /// mini-node via mini.hello; falls back to validatedPeerIds.first
+  /// only when no mini-node is known (cold start before the hello
+  /// lands). Sending to a full-node returns unknown_type post-pivot,
+  /// which silently empties the UI — hence the explicit preference.
   Future<List<Map<String, dynamic>>> requestRoutes(
       {Duration timeout = const Duration(seconds: 6)}) async {
     final ids = validatedPeerIds;
     if (ids.isEmpty) return const [];
-    final body = await request(ids.first, 'routes.get', const {},
+    final target = firstMiniNodePeerId ?? ids.first;
+    final body = await request(target, 'routes.get', const {},
                                 timeout: timeout);
     final m = (body as Map<String, dynamic>?) ?? const {};
     final peers = (m['peers'] as List?) ?? const [];

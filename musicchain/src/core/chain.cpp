@@ -829,6 +829,25 @@ bool Chain::validate_block_quick_duplicate(const Hash256& content_hash) const {
     return db_.get_fingerprint(content_hash).has_value();
 }
 
+bool Chain::validate_candidate(const Block& block, std::string& error) const {
+    // Structural validation only — signatures, fingerprint hash
+    // consistency, format. prev_hash deliberately skipped: the
+    // follower may not yet have the producer's previous block applied
+    // via BlockPropagator's inv/getdata loop when this candidate
+    // arrives. See chain.h declaration for the full rationale.
+    if (!block.validate()) { error = "block internal validation failed"; return false; }
+    // Duplicate-song check still applies — if our chain already has
+    // the song, the producer's block can't be canonical for it. (Race
+    // window: another producer might've registered the same song
+    // milliseconds before us; in that case the slower producer's block
+    // legitimately can't connect anyway.)
+    if (block.has_song && db_.get_fingerprint(block.song.content_hash)) {
+        error = "duplicate song";
+        return false;
+    }
+    return true;
+}
+
 bool Chain::disconnect_block() {
     std::lock_guard<std::mutex> lk(mu_);
     if (tip_.height == 0) return false;

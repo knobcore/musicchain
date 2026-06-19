@@ -467,12 +467,14 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
                     return;
                 }
                 std::string err;
-                if (!chain.validate_block(block, err)) {
-                    // Note: Block::validate (called from chain.validate_block)
-                    // already enforces sha256(compressed_fingerprint bytes)
-                    // == header.fingerprint_hash, so we don't repeat that
-                    // check here. A producer can't lie about which
-                    // fingerprint a header claims.
+                if (!chain.validate_candidate(block, err)) {
+                    // Structural check only — prev_hash race against
+                    // BlockPropagator is handled by validate_candidate
+                    // (which skips it). Block::validate, called inside
+                    // validate_candidate, still enforces
+                    // sha256(compressed_fingerprint) ==
+                    // header.fingerprint_hash, so a producer can't lie
+                    // about which fingerprint the header claims.
                     std::cerr << "[consensus] dropped candidate: validate failed — "
                               << err << "\n";
                     return;

@@ -101,6 +101,20 @@ public:
     // Does NOT connect it.
     bool validate_block(const Block& block, std::string& error) const;
 
+    // Validate a producer's candidate block (signed by the producer,
+    // about to be co-signed by validators) WITHOUT enforcing prev_hash.
+    // Used by the consensus path on follower nodes: a follower may not
+    // yet have applied the producer's previous block via BlockPropagator
+    // when the candidate broadcast arrives, so the strict prev_hash
+    // gate in validate_block would reject the candidate and the
+    // producer would time out waiting for confirmations even though
+    // the block is structurally fine. The actual block-application
+    // path (Chain::connect_block) still enforces prev_hash, so a
+    // candidate that looks OK here but fails the strict check later
+    // simply doesn't connect — and the producer's authoritative chain
+    // wins via the longest-chain rule.
+    bool validate_candidate(const Block& block, std::string& error) const;
+
     // Fast yes/no — is `content_hash` already on chain? Used by the
     // producer's re-queue logic so a duplicate-song registration gets
     // dropped instead of looping forever.

@@ -126,8 +126,13 @@ class LibraryScanner {
     final digest = _hashSetDigest(sorted);
 
     // Preflight. When the full node already has our set cached with
-    // the same digest, this is the only verb that fires — no list
-    // bytes, just a 64-character hex digest.
+    // the same digest AND the chain still has at least one of those
+    // hashes registered as a song, fast-skip the full swarm.hello +
+    // resubmit. If the chain was wiped between sessions (heartbeats
+    // only, no song-bearing blocks) the swarm cache can still match
+    // because it lives in a separate leveldb prefix — in that case we
+    // MUST fall through and re-fire fingerprint.submit so the chain
+    // gets the songs back.
     try {
       final reply = await rats.request(homePid, 'swarm.hello_digest', {
         'peer_id': rats.ownPeerId,
@@ -135,10 +140,34 @@ class LibraryScanner {
         'count':   sorted.length,
       }, timeout: const Duration(seconds: 6));
       if (reply is Map && reply['match'] == true) {
+        // Sanity-probe the chain: does it actually carry any of our
+        // local songs? `songs.get` always returns a stub object even
+        // for unknown content_hashes (play_count=0, discoverer=zeros),
+        // so the right signal is whether `discoverer` is non-zero —
+        // that's only set when the song was actually registered. A
+        // miss here with a non-empty local library means the chain
+        // was wiped between sessions while the server's swarm cache
+        // didn't expire; we fall through and re-fire fingerprint.submit.
+        bool chainHasOurSongs = false;
+        try {
+          final probe = await rats.request(homePid, 'songs.get',
+              {'content_hash': sorted.first},
+              timeout: const Duration(seconds: 5));
+          if (probe is Map) {
+            final disc = (probe['discoverer'] as String? ?? '')
+                .replaceAll('0', '');
+            chainHasOurSongs = disc.isNotEmpty;
+          }
+        } catch (_) { /* treat as missing */ }
+        if (chainHasOurSongs) {
+          // ignore: avoid_print
+          print('[scanner] swarm digest matched (${sorted.length} hashes)'
+                ' + chain confirmed — no resync needed');
+          return;
+        }
         // ignore: avoid_print
-        print('[scanner] swarm digest matched (${sorted.length} hashes)'
-              ' — no resync needed');
-        return;
+        print('[scanner] swarm digest matched BUT chain lost songs — '
+              'forcing full swarm.hello + resubmit');
       }
     } catch (_) { /* fall through to full sync */ }
 
@@ -157,6 +186,30 @@ class LibraryScanner {
         // ignore: avoid_print
         print('[scanner] swarm.hello -> known=${reply['peer_size']}'
               ' unknown=${unknown.length}');
+        // The chain doesn't know these `unknown` hashes (either fresh
+        // chain, or chain was wiped between sessions). Re-fire
+        // fingerprint.submit for each one so the songs actually land in
+        // the mempool and get minted — swarm.hello alone only registers
+        // membership in the swarm tracker, not the chain. We use
+        // _processFile(force: true) so the hash-only preflight inside
+        // it shortcuts when the chain DOES already have a match, and
+        // re-fingerprints + submits the full blob when it doesn't.
+        if (unknown.isNotEmpty) {
+          // ignore: avoid_print
+          print('[scanner] re-submitting ${unknown.length} unknown hashes '
+                'to chain via fingerprint.submit');
+          final unknownSet = unknown.toSet();
+          for (final entry in lib.entries) {
+            if (!unknownSet.contains(entry.contentHash) &&
+                !unknownSet.contains(entry.canonicalHash)) {
+              continue;
+            }
+            if (entry.filePath.isEmpty) continue;
+            final file = File(entry.filePath);
+            if (!await file.exists()) continue;
+            await _processFile(file, lib, rats, homePid, force: true);
+          }
+        }
       }
     } catch (_) {/* best effort — next sync will retry */}
   }

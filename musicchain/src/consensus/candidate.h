@@ -27,16 +27,17 @@ static constexpr uint32_t MAX_CONFIRMATIONS       = 5;
 
 /// Compute the quorum required for a block given the current peer
 /// count seen by the producer. Solo mode (peer_count==0) lands at 1
-/// (just the producer's own signature); each additional reachable peer
-/// raises the bar by one until MAX_CONFIRMATIONS caps it. This is what
-/// candidate.cpp's producer loops and BlockCandidate::is_final use; the
-/// chain layer + BlockPropagator's ingest accept any block with >=1
-/// valid signature, since they don't know the peer count that was in
-/// effect when the block was minted.
+/// (just the producer's own signature). With any peer connected we
+/// require 2 sigs (producer + one confirmation) — peer_count here is
+/// the librats validated peer set, which includes DHT-discovered peers
+/// that aren't musicchain validators and won't co-sign. Without the
+/// cap the quorum scaled past the number of actual signing validators
+/// and the producer hung on every block waiting for confirmations
+/// nobody could give. Proper validator-set-driven quorum (count only
+/// peers registered as validators on chain) layers on top later.
 inline uint32_t dynamic_quorum(size_t peer_count) {
-    const uint64_t want = static_cast<uint64_t>(peer_count) + 1;
-    return want > MAX_CONFIRMATIONS ? MAX_CONFIRMATIONS
-                                     : static_cast<uint32_t>(want);
+    if (peer_count == 0) return 1;
+    return 2;
 }
 
 static constexpr uint32_t BLOCK_TIMEOUT_SECONDS   = 300;

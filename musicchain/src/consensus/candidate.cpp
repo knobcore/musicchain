@@ -113,6 +113,20 @@ void CandidateManager::start(Chain& chain, Database& db,
         // exact behaviour we want.
         last_block_at_ms_ = 0;
     }
+    // validator_enabled gates the heartbeat producer. Without this
+    // gate every full node on the network minted its own heartbeat,
+    // forking the chain at every block ("prev_hash break at height N"
+    // floods on both directions). The flag was parsed from config but
+    // never actually consulted, so all nodes acted as producers
+    // regardless. Setting it false lets a node SERVE the chain
+    // (answer songs.list, sync blocks, hold the swarm index) without
+    // competing for block production — proper multi-producer
+    // consensus (leader election + reorg) can layer on top later.
+    if (!cfg.validator_enabled) {
+        std::cout << "[chain] validator_enabled=false — running as "
+                     "follower (sync + serve only, no block production)\n";
+        return;
+    }
     heartbeat_thread_ = std::thread([this, &chain, &db, &network, &cfg, &keypair] {
         heartbeat_loop(chain, db, network, cfg, keypair);
     });

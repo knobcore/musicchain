@@ -131,6 +131,7 @@ class WalletProvider extends ChangeNotifier {
           .padRight(8, '0')
           .substring(0, 8);
       final amount = whole * 100000000 + int.parse(frac);
+      if (amount <= 0) return 'Amount must be greater than zero';
 
       // Build 60-byte sign message:
       //   chain_id(4 LE) | from(20) | to(20) | amount(8 LE) | nonce(8 LE)

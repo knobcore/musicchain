@@ -58,11 +58,20 @@ class _WalletGateState extends State<WalletGate> {
   }
 
   void _onLoggedIn() {
-    if (mounted) setState(() => _state = _GateState.home);
+    // ignore: avoid_print
+    print('[wallet-gate] _onLoggedIn called, mounted=$mounted, '
+          'current=$_state');
+    if (mounted) {
+      setState(() => _state = _GateState.home);
+      // ignore: avoid_print
+      print('[wallet-gate] _state -> home (rebuild scheduled)');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    // ignore: avoid_print
+    print('[wallet-gate] build: _state=$_state');
     return switch (_state) {
       _GateState.loading => const Scaffold(
           body: Center(child: CircularProgressIndicator()),
@@ -73,7 +82,19 @@ class _WalletGateState extends State<WalletGate> {
         ),
       _GateState.login => WalletLoginScreen(
           walletService: _walletService,
-          onLoggedIn: _onLoggedIn,
+          onLoggedIn:    _onLoggedIn,
+          onResetWallet: () {
+            // ignore: avoid_print
+            print('[wallet-gate] onResetWallet — re-running _decide');
+            // Don't jump straight to firstLaunch: that skips the loading
+            // state and trusts that reset fully cleared the wallet from
+            // disk. Re-run the decision tree so we actually re-check
+            // hasSavedWallet() / tryAutoLoad() against the filesystem.
+            if (mounted) {
+              setState(() => _state = _GateState.loading);
+              _decide();
+            }
+          },
         ),
       _GateState.home => widget.child,
     };

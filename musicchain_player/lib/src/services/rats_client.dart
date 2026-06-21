@@ -977,10 +977,22 @@ class RatsClient {
     // directly instead of guessing via validatedPeerIds.first (which
     // is wrong any time librats also handed us a full-node DHT peer).
     if (type == 'mini.hello') {
-      _miniNodePeerIds.add(peerId);
-      // ignore: avoid_print
-      print('[rats] mini.hello from ${peerId.substring(0, peerId.length < 12 ? peerId.length : 12)}'
-            '… (wallet=${(inner['wallet'] as String? ?? '').isNotEmpty})');
+      // Prune entries that librats no longer reports as validated before
+      // recording the new one. Every reconnect of the same mini-node
+      // hands us a fresh peer_id (librats peer ids are per-handshake),
+      // so without this _miniNodePeerIds accumulates dead ids
+      // indefinitely over a long session (VPS restarts, network flaps).
+      // firstMiniNodePeerId already filters via validatedPeerIds so the
+      // public API stays correct, but the set itself would otherwise
+      // grow without bound.
+      final live = validatedPeerIds.toSet();
+      _miniNodePeerIds.removeWhere((id) => !live.contains(id));
+      final fresh = _miniNodePeerIds.add(peerId);
+      if (fresh) {
+        // ignore: avoid_print
+        print('[rats] mini.hello from ${peerId.substring(0, peerId.length < 12 ? peerId.length : 12)}'
+              '… (wallet=${(inner['wallet'] as String? ?? '').isNotEmpty})');
+      }
       // Ack so the mini-node logs a clean request/reply pair.
       final ack = jsonEncode({
         'req_id': reqId,
@@ -1048,8 +1060,14 @@ class RatsClient {
       Pointer<Void> dataPtr, int size) {
     final self = _activeForCallback;
     if (self == null) {
+      // FFI listener fired before initialize completed or after dispose.
+      // Free BOTH buffers librats handed us — patched librats malloc()s
+      // the binary data buffer too (see normal path below), so leaving
+      // it for "librats itself" leaks the chunk (up to 1 MB per fire).
+      // rats_string_free is just free() under the hood and ignores type,
+      // so plain malloc.free on the cast pointer is equivalent.
       if (peerIdPtr.address != 0) malloc.free(peerIdPtr);
-      // dataPtr is freed by librats itself for binary payloads.
+      if (dataPtr.address   != 0) malloc.free(dataPtr.cast<Utf8>());
       return;
     }
     final b = self._b;
@@ -1405,7 +1423,12 @@ class RatsClient {
   ) async {
     bool direct = false;
     if (addr != null) {
-      final colon = addr.indexOf(':');
+      // Use lastIndexOf so IPv6 literals like 2001:db8::1:8080 parse to
+      // host=2001:db8::1 / port=8080 instead of host=2001 / port=garbage.
+      // The mini-node list parsers (_loadKnownMiniNodes, _refreshMiniNodes)
+      // already do this; the indexOf here silently dropped every IPv6
+      // public_address into the relay fallback path.
+      final colon = addr.lastIndexOf(':');
       if (colon > 0) {
         final host = addr.substring(0, colon);
         final port = int.tryParse(addr.substring(colon + 1)) ?? 0;
@@ -1563,18 +1586,35 @@ class RatsClient {
     } catch (_) {
       return;
     }
-    final reqId = j['req_id'] as String?;
+    final reqId = j['req_id'] is String ? j['req_id'] as String : null;
     if (reqId != null) {
       final p = _pending.remove(reqId);
       if (p != null) {
         p.timeout.cancel();
         if (!p.completer.isCompleted) {
-          final status = j['status'] as String? ?? 'ok';
-          if (status == 'ok') {
-            p.completer.complete(j['body']); // may be Map / List / primitive
-          } else {
-            final err = j['error'] as String? ?? 'server error';
-            p.completer.completeError(RatsRpcException(status, err));
+          // Extract status/error/body defensively. A malformed reply
+          // (e.g. `status` arrives as a JSON number) would otherwise
+          // throw a TypeError between the `_pending.remove` above and
+          // the `complete()`/`completeError()` below, orphaning the
+          // completer — the timer has been cancelled and the entry
+          // removed, so the caller awaiting `completer.future` would
+          // hang forever. Type-check instead of casting.
+          try {
+            final rawStatus = j['status'];
+            final status = rawStatus is String ? rawStatus : 'ok';
+            if (status == 'ok') {
+              p.completer.complete(j['body']); // may be Map / List / primitive
+            } else {
+              final rawErr = j['error'];
+              final err = rawErr is String ? rawErr : 'server error';
+              p.completer.completeError(RatsRpcException(status, err));
+            }
+          } catch (e, st) {
+            // Any unexpected failure decoding the envelope must still
+            // surface to the caller — never leave the completer dangling.
+            p.completer.completeError(
+                RatsRpcException('malformed_reply', 'reply decode failed: $e'),
+                st);
           }
         }
         return;

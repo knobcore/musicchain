@@ -49,17 +49,37 @@ static constexpr uint64_t SUPPLY_CAP   = 2'000'000'000ULL * 100000000ULL; // 2B 
 ///   "hyperdrive" deflation pressure becomes.
 uint64_t compute_burn_rate(uint64_t total_supply);
 
+struct AddressLess {
+    bool operator()(const Address& a, const Address& b) const {
+        return std::lexicographical_compare(
+            a.begin(), a.end(), b.begin(), b.end());
+    }
+};
+
 class Ledger {
 public:
     explicit Ledger(Database& db);
 
-    // Credit an address (minting)
+    // Credit an address (minting). Reads/writes balance + total_supply
+    // through the batch. NOT safe to call more than once for the SAME
+    // address in the same batch — see credit_many for that case.
     void credit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount);
 
-    // Debit an address; returns false if insufficient balance
+    // Credit a list of (address, amount) outputs in one shot. Pre-
+    // aggregates per-address amounts so a mint with multiple outputs
+    // to the same recipient composes correctly, and updates
+    // total_supply with the FULL sum once. Use this from apply_mint
+    // instead of the per-output credit loop the previous
+    // implementation used.
+    void credit_many(leveldb::WriteBatch& batch,
+                     const std::vector<std::pair<Address, uint64_t>>& outs);
+
+    // Debit an address; returns false if insufficient balance.
+    // Zero-amount debit is a no-op that returns true.
     bool debit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount);
 
-    // Transfer between addresses; returns false if insufficient balance
+    // Transfer between addresses; returns false if insufficient
+    // balance. Self-transfer is a no-op that returns true.
     bool transfer(leveldb::WriteBatch& batch,
                   const Address& from, const Address& to, uint64_t amount);
 

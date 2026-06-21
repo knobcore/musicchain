@@ -102,6 +102,13 @@ class OfflineSubmitService {
         wallet:        wallet,
       );
 
+      // Snapshot the cutoff BEFORE the RPC. The mark-submitted call
+      // below uses this to flush sensor/transition rows; if we instead
+      // took "now" after the RPC (which can be up to 60 s later) we'd
+      // silently mark rows captured during the RPC as submitted even
+      // though they were never in the bundle, losing them forever.
+      final cutoffWallMs = HeartbeatCapture.instance.wallMs();
+
       try {
         await RatsClient.instance.request(
           peerId, 'offline.play_proof.submit', bundle,
@@ -109,6 +116,7 @@ class OfflineSubmitService {
         );
         await HeartbeatCapture.instance.markSubmitted(
           sessions.map((s) => s.sessionId).toList(),
+          cutoffWallMs: cutoffWallMs,
         );
         // ignore: avoid_print
         print('[offline-play-log] submitted bundle: '

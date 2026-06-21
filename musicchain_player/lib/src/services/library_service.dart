@@ -101,29 +101,42 @@ class LibraryService extends ChangeNotifier {
   final Map<String, LibraryEntry> _byCanonical = {};
   final List<String>              _folders = [];
   bool _loaded = false;
+  Future<void>? _loading;
 
   static const _kFoldersKey = 'mc_library_folders';
   static const _kEntriesKey = 'mc_library_entries';
 
-  Future<void> ensureLoaded() async {
-    if (_loaded) return;
-    final prefs = await SharedPreferences.getInstance();
-    _folders
-      ..clear()
-      ..addAll(prefs.getStringList(_kFoldersKey) ?? const []);
-    final raw = prefs.getString(_kEntriesKey);
-    if (raw != null && raw.isNotEmpty) {
-      try {
-        final list = (jsonDecode(raw) as List).cast<dynamic>();
-        for (final item in list) {
-          final e = LibraryEntry.fromJson(
-              (item as Map).cast<String, dynamic>());
-          _index(e);
-        }
-      } catch (_) { /* corrupt prefs: start empty */ }
+  Future<void> ensureLoaded() {
+    if (_loaded) return Future.value();
+    // Cache the in-flight load so concurrent callers await the same
+    // future instead of each re-reading prefs and re-indexing entries.
+    // Without this, a second ensureLoaded() racing with the first could
+    // clobber entries that an upsert() inserted between the two reads.
+    return _loading ??= _doLoad();
+  }
+
+  Future<void> _doLoad() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _folders
+        ..clear()
+        ..addAll(prefs.getStringList(_kFoldersKey) ?? const []);
+      final raw = prefs.getString(_kEntriesKey);
+      if (raw != null && raw.isNotEmpty) {
+        try {
+          final list = (jsonDecode(raw) as List).cast<dynamic>();
+          for (final item in list) {
+            final e = LibraryEntry.fromJson(
+                (item as Map).cast<String, dynamic>());
+            _index(e);
+          }
+        } catch (_) { /* corrupt prefs: start empty */ }
+      }
+      _loaded = true;
+      notifyListeners();
+    } finally {
+      _loading = null;
     }
-    _loaded = true;
-    notifyListeners();
   }
 
   /// Insert / update [e] in all three lookup maps (hash, canonical, path).

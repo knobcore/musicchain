@@ -63,18 +63,25 @@ class Fingerprinter {
         final reply = await _decode.invokeMethod<Map<dynamic, dynamic>>(
             'fingerprint', {'path': path});
         if (reply != null) {
-          final compressed   = reply['compressed']    as String;
-          final sampleRate   = reply['sample_rate']   as int;
-          final channelCount = reply['channel_count'] as int;
-          final pcmSamples   = (reply['pcm_samples']  as num).toInt();
-          final digest = crypto.sha256.convert(utf8.encode(compressed));
-          return FingerprintResult(
-            compressed:      compressed,
-            fingerprintHash: digest.toString(),
-            sampleRate:      sampleRate,
-            channelCount:    channelCount,
-            pcmSamples:      pcmSamples,
-          );
+          // Kotlin returns Map<String, Any?>; values come through as
+          // nullable on the Dart side. Bail out to the legacy decode
+          // path rather than NPE-via-TypeError if the bridge omitted
+          // the fingerprint string (e.g. older APK, malformed reply).
+          final compressedRaw = reply['compressed'];
+          if (compressedRaw is String && compressedRaw.isNotEmpty) {
+            final compressed   = compressedRaw;
+            final sampleRate   = reply['sample_rate']   as int;
+            final channelCount = reply['channel_count'] as int;
+            final pcmSamples   = (reply['pcm_samples']  as num).toInt();
+            final digest = crypto.sha256.convert(utf8.encode(compressed));
+            return FingerprintResult(
+              compressed:      compressed,
+              fingerprintHash: digest.toString(),
+              sampleRate:      sampleRate,
+              channelCount:    channelCount,
+              pcmSamples:      pcmSamples,
+            );
+          }
         }
       } on MissingPluginException {/* fall through to legacy */}
       on PlatformException catch (e) {

@@ -292,9 +292,12 @@ class HeartbeatCapture {
   /// latest heartbeat for the same session.
   Future<List<CapturedSession>> unsubmittedSessions(String playerAddress) async {
     if (_db == null) await init();
+    // On-chain player addresses are lowercase, but openSession may have
+    // stored a mixed-case form (e.g. EIP-55 checksummed). Normalize both
+    // sides so the bundle isn't silently dropped on the case mismatch.
     final rows = await _db!.rawQuery('''
       SELECT s.* FROM sessions s
-      WHERE s.player_address = ? AND s.submitted = 0
+      WHERE LOWER(s.player_address) = LOWER(?) AND s.submitted = 0
       ORDER BY s.started_wall_ms ASC
     ''', [playerAddress]);
     final out = <CapturedSession>[];
@@ -381,21 +384,22 @@ class HeartbeatCapture {
 
   /// Mark every row that participated in the bundle as submitted so
   /// the next reconnect doesn't double-submit. Caller passes the same
-  /// session ids it just shipped.
-  Future<void> markSubmitted(List<String> sessionIds) async {
+  /// session ids it just shipped, plus the wall-ms cutoff that was
+  /// captured *before* the RPC went out — anything inserted after that
+  /// instant is for the NEXT bundle and must stay unsubmitted.
+  Future<void> markSubmitted(List<String> sessionIds, {required int cutoffWallMs}) async {
     if (_db == null) await init();
     if (sessionIds.isEmpty) {
       // Even with no sessions we may have shipped sensor / transition
-      // rows — mark everything currently unsubmitted (≤ wallMs()) as
-      // sent so we don't re-ship.
-      final cutoff = wallMs();
+      // rows — mark everything ≤ cutoffWallMs as sent so we don't
+      // re-ship, but leave anything captured during the RPC alone.
       await _db!.update('network_transitions', {'submitted': 1},
-          where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoff]);
+          where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoffWallMs]);
       await _db!.update('battery_samples', {'submitted': 1},
-          where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoff]);
+          where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoffWallMs]);
       await _db!.update('screen_intervals', {'submitted': 1},
           where: 'submitted = 0 AND off_wall_ms IS NOT NULL '
-                 'AND off_wall_ms <= ?', whereArgs: [cutoff]);
+                 'AND off_wall_ms <= ?', whereArgs: [cutoffWallMs]);
       return;
     }
     final placeholders = List.filled(sessionIds.length, '?').join(',');
@@ -412,15 +416,15 @@ class HeartbeatCapture {
       whereArgs: sessionIds,
     );
     // Sensor / transition rows aren't keyed by session_id; flush
-    // everything older than the latest heartbeat we just sent.
-    final cutoff = wallMs();
+    // everything captured at-or-before the cutoff we snapshotted before
+    // the RPC. New rows inserted during the RPC stay unsubmitted.
     await _db!.update('network_transitions', {'submitted': 1},
-        where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoff]);
+        where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoffWallMs]);
     await _db!.update('battery_samples', {'submitted': 1},
-        where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoff]);
+        where: 'submitted = 0 AND wall_ms <= ?', whereArgs: [cutoffWallMs]);
     await _db!.update('screen_intervals', {'submitted': 1},
         where: 'submitted = 0 AND off_wall_ms IS NOT NULL '
-               'AND off_wall_ms <= ?', whereArgs: [cutoff]);
+               'AND off_wall_ms <= ?', whereArgs: [cutoffWallMs]);
   }
 
   /// Cap on disk usage. Drops oldest rows beyond 7 days OR beyond

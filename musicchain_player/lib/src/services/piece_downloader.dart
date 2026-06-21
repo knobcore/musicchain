@@ -436,6 +436,17 @@ class PieceDownloader {
       throw _PeerProtocolException('empty data_b64');
     }
     final bytes = base64Decode(dataB64);
+    // Reject any peer whose payload length doesn't match what we asked
+    // for. Without this check, a too-long reply would scribble over
+    // adjacent pieces already fetched correctly from other peers — the
+    // whole-file SHA-256 at the end would catch it, but only after the
+    // download is "complete" and after good bytes have been clobbered.
+    // Treat it as a protocol violation so the peer is banned and the
+    // piece is released for retry against a different source.
+    if (bytes.length != length) {
+      throw _PeerProtocolException(
+          'length mismatch: asked $length got ${bytes.length}');
+    }
     final total = (m['total_size'] as num?)?.toInt() ?? 0;
     return _PieceReply(
         offset:    offset,

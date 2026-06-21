@@ -36,6 +36,10 @@ class HeartbeatService {
               String blockHash      = '',
               String playerAddress  = '',
               int    songDurationMs = 0}) {
+    // Defensive: cancel any pre-existing timer so a start() called
+    // without an intervening stop() (e.g. song-skip on the player UI)
+    // doesn't leak a Timer that keeps firing against the new session.
+    _timer?.cancel();
     _sessionId     = sessionId;
     _contentHash   = contentHash;
     _getPositionMs = getPositionMs;

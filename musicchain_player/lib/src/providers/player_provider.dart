@@ -21,7 +21,16 @@ class PlayerProvider extends ChangeNotifier {
     // Share the same NodeClient so heartbeats use the same resolved URL
     _heartbeat = HeartbeatService(_client);
     _player.stream.playing.listen((playing) {
-      if (state == PlayerState.loading) return;
+      // Ignore stream events while loading (open() races with play()), and
+      // while the player is in a terminal state owned by us (stopped/idle).
+      // Otherwise mpv emitting `playing: false` right after stop()/complete()
+      // would flip our state back to `paused` and resurrect a session that
+      // we just tore down.
+      if (state == PlayerState.loading ||
+          state == PlayerState.stopped ||
+          state == PlayerState.idle) {
+        return;
+      }
       state = playing ? PlayerState.playing : PlayerState.paused;
       notifyListeners();
     });
@@ -259,7 +268,11 @@ class PlayerProvider extends ChangeNotifier {
       unawaited(_completeSessionSilently(finishedId));
     }
     currentSession = null;
-    if (playlist.length > 1) {
+    // Advance only when there's a real next track. `playlist.length > 1` is
+    // the wrong gate: on a 5-track queue it stays true when the last track
+    // finishes, so playNext() wraps via `% playlist.length` back to index 0
+    // and the player loops the whole album forever instead of stopping.
+    if (_playlistIdx < playlist.length - 1) {
       playNext();
     } else {
       state      = PlayerState.stopped;

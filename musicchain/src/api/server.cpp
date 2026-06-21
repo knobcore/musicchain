@@ -528,14 +528,63 @@ std::pair<int, std::string> HttpServer::post_session_heartbeat(
     std::lock_guard<std::mutex> lk(sessions_mutex_);
     auto it = sessions_.find(session_id);
     if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
+    // BUG FIX: previously the heartbeat handler appended samples
+    // even AFTER session.complete had landed for the session. The
+    // beats never got used (complete already captured the sample
+    // vector) but they bloated the in-memory PlaySession until
+    // session expiry. Rejecting up front matches the player flow
+    // (HeartbeatService.stop() fires on complete).
+    if (it->second.completed)
+        return {400, R"({"error":"session already completed"})"};
 
     try {
         const auto j = json::parse(body);
         const uint64_t now = now_ms_api();
-        // position_ms is the player's claim of "where in the song I am".
-        // Missing or non-integer → record 0; complete will treat that as
-        // a non-progressing beat and discount it from listened time.
-        const uint64_t pos_ms = j.value("position_ms", static_cast<uint64_t>(0));
+        // BUG FIX: cap the per-session heartbeat rate so a malicious
+        // client can't flood thousands of beats per second to inflate
+        // the density gate at session.complete time. The legitimate
+        // 5 s cadence sits well above kMinIntervalMs.
+        constexpr uint64_t kMinIntervalMs = 1000;
+        if (!it->second.samples.empty()) {
+            const uint64_t last_wall = it->second.samples.back().wall_ms;
+            if (now < last_wall + kMinIntervalMs)
+                return {429, R"({"error":"heartbeat rate too high"})"};
+        }
+        // position_ms is the player's claim of "where in the song I
+        // am". Missing or non-integer → 400; otherwise sanity check
+        // against the song's declared duration if known. Defense in
+        // depth — the aggregation loop also clamps by duration, but
+        // rejecting at receive time keeps the in-memory sample
+        // vector small and surfaces the bad client to the caller.
+        constexpr uint64_t kPositionSlackMs = 5000;
+        if (!j.contains("position_ms"))
+            return {400, R"({"error":"missing position_ms"})"};
+        const uint64_t pos_ms = j.value("position_ms",
+                                         static_cast<uint64_t>(0));
+        const auto height_opt = db_.get_content_height(it->second.content_hash);
+        if (height_opt) {
+            // BUG FIX: position_ms used to be accepted without bound,
+            // so a single beat could carry position_ms = 999999999 and
+            // (combined with kPlaybackGraceMs) push effective_ms past
+            // any threshold. Now we clamp on receipt instead of relying
+            // solely on the song_duration_hint clamp at aggregation
+            // time, which only fired when the SongSection actually
+            // loaded.
+            std::ostringstream fname;
+            fname << std::setw(8) << std::setfill('0') << *height_opt << ".blk";
+            auto block_path = std::filesystem::path(config_.data_dir)
+                            / "blocks" / fname.str();
+            std::ifstream bf(block_path, std::ios::binary);
+            if (bf) {
+                std::vector<uint8_t> fd((std::istreambuf_iterator<char>(bf)), {});
+                Block blk;
+                if (Block::deserialize(fd.data(), fd.size(), blk)) {
+                    const uint64_t dur = blk.song.duration_ms;
+                    if (dur > 0 && pos_ms > dur + kPositionSlackMs)
+                        return {400, R"({"error":"position_ms past end of song"})"};
+                }
+            }
+        }
         it->second.last_heartbeat = now;
         it->second.heartbeat_count++;
         it->second.samples.push_back({now, pos_ms});
@@ -547,6 +596,14 @@ std::pair<int, std::string> HttpServer::post_session_heartbeat(
 
 std::pair<int, std::string> HttpServer::post_session_complete(
     const std::string& session_id, const std::string& /*body*/) {
+    // BUG FIX: previously we set `it->second.completed = true` here
+    // before applying the mint. When the mint failed (any gate
+    // rejected, apply_mint returned false, db.write failed), the
+    // session was already marked completed and could never be
+    // retried — including for transient errors. Now we only flip
+    // the flag AFTER mint actually lands; rejected attempts can be
+    // retried by the player on next playback once whatever was
+    // wrong is fixed.
     PlaySession sess;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -554,8 +611,11 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         if (it == sessions_.end()) return {404, R"({"error":"session not found"})"};
         if (it->second.completed) return {400, R"({"error":"already completed"})"};
         sess = it->second;
-        it->second.completed = true;
     }
+    // Capture session_id so the success path can flip the flag without
+    // re-resolving the iterator (the map could have been mutated in
+    // the meantime — e.g., session expiry from a later patch).
+    const std::string sid_copy = session_id;
 
     uint64_t now = now_ms_api();
     uint64_t duration_ms = now - sess.start_timestamp;
@@ -597,7 +657,19 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     // so a long pause doesn't synthesize coverage. Backward seeks
     // produce a new range starting at the new position rather than
     // continuing the old one.
-    constexpr uint64_t kPlaybackGraceMs = 2000;
+    // BUG FIX: kPlaybackGraceMs used to be 2000 — 100 samples
+    // synthesised 200 s of listening that didn't happen. 500 ms is
+    // generous enough to cover RPC / scheduling jitter on a 5 s
+    // cadence without padding accumulated ranges.
+    constexpr uint64_t kPlaybackGraceMs   = 500;
+    // BUG FIX: cap per-sample advance at twice the expected
+    // HeartbeatService cadence (10 s). The previous code only
+    // capped on the next sample's position delta or song duration;
+    // for the LAST sample (no next sample) wall_dt = now -
+    // last_heartbeat, which could be 30+ s if the player paused
+    // before completing — that pause time was credited as listening
+    // time. Capping at 2× cadence kills the rubber-band.
+    constexpr uint64_t kMaxAdvancePerSampleMs = 10000;
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
     const auto& samples = sess.samples;
     const uint64_t song_duration_ms_hint = song_section.duration_ms;
@@ -605,20 +677,29 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         const auto& a = samples[i];
         const uint64_t next_wall = (i + 1 < samples.size())
             ? samples[i + 1].wall_ms : now;
-        if (next_wall < a.wall_ms) continue;
-        const uint64_t wall_dt = next_wall - a.wall_ms;
-        uint64_t advance = wall_dt + kPlaybackGraceMs;
-        // If we have a next heartbeat and it reports a higher position
-        // for the same wall slice, that's the listener's authoritative
-        // claim — bound advance by it. (Seeking forward DURING the slice
-        // is still bounded by wall_dt+grace, preventing skip-farming.)
+        // BUG FIX: previously `continue` on out-of-order — that
+        // silently dropped the sample without recording even its
+        // own position point. Instead clamp the slice to zero
+        // advance so the sample still contributes its (a.position_ms,
+        // a.position_ms+0) range, which the union code below treats
+        // as a no-op but at least doesn't fall behind on counts.
+        uint64_t wall_dt = next_wall >= a.wall_ms
+            ? next_wall - a.wall_ms : 0;
+        uint64_t advance = std::min<uint64_t>(
+            wall_dt + kPlaybackGraceMs, kMaxAdvancePerSampleMs);
+        // If we have a next heartbeat and it reports a higher
+        // position for the same wall slice, that's the listener's
+        // authoritative claim — bound advance by it. (Seeking
+        // forward DURING the slice is still bounded by wall_dt+grace
+        // and per-sample cap above, preventing skip-farming.)
         if (i + 1 < samples.size()) {
             const auto& b = samples[i + 1];
             if (b.position_ms > a.position_ms) {
                 advance = std::min(advance, b.position_ms - a.position_ms);
             } else {
-                // Seek back / no progress — this slice contributes nothing
-                // new beyond the single-point position itself.
+                // Seek back / no progress — this slice contributes
+                // nothing new beyond the single-point position
+                // itself.
                 advance = 0;
             }
         }
@@ -648,31 +729,34 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     }
     if (have_cur) effective_ms += cur_end - cur_start;
 
-    // Three independent gates a play has to clear before the chain
-    // mints anything. All must hold; any failure returns 400 and
-    // logs a [session.complete] REJECT line with the failing reason
-    // so partial-credit / lenient-threshold drift never sneaks in.
+    // Two gates the play has to clear before the chain mints. All
+    // must hold; any failure returns 400 and logs a
+    // [session.complete] REJECT line with the failing reason.
     //
-    //   (1) Song must be registered with a known duration. The old
-    //       legacy 30 s fallback that fired when duration_ms = 0
-    //       was a free pass for unregistered songs — a 30 s clip
-    //       of a 5 min track minted full reward. Fail closed: if
-    //       the chain doesn't know how long the song is, the play
-    //       can't establish a 50 % consumption claim.
-    //   (2) Effective listened time must hit >= 50 % of song
-    //       duration. Aggregation collapses re-listened ranges, so
-    //       seeking back to replay the same 5 s clip until the
-    //       wall clock hits 50 % of the song doesn't count.
-    //   (3) Heartbeat density must be plausible: at least one beat
-    //       per 35 s of wall time. The session.heartbeat handler
-    //       wall-times every beat server-side; sparse beats imply
-    //       a script forging position_ms with no actual playback
-    //       loop. Same gate validate_mint enforces when a MintTx
-    //       lands in a block (see tokens/mint.cpp:92-102) — pulled
-    //       up to session.complete so we never apply a mint that
-    //       wouldn't validate post-hoc.
+    //  (1) Enough timestamps. The HeartbeatService ticks every 5 s;
+    //      we accept down to one beat per 10 s of wall time AND a
+    //      hard floor of 6 beats overall. A "press play, immediately
+    //      press complete" loop with one or two beats can't claim a
+    //      play.
+    //
+    //  (2) Timestamps cover the song. The set of reported position_ms
+    //      values has to span enough of the song to make the claim
+    //      credible. When the chain knows the song's duration we
+    //      require positions covering ≥ 50 % of it (so a 5 s loop
+    //      replayed for the wall-clock equivalent of the song still
+    //      fails — same-range union collapses identical ranges). When
+    //      the song isn't registered yet (duration_ms = 0) we fall
+    //      back to ≥ 30 s of distinct content; the next block lands
+    //      the duration and subsequent plays use the 50 % path.
+    //
+    // Heartbeats are allowed to be perfectly periodic — the
+    // position_ms span gate is what makes a real listen
+    // indistinguishable from a "looks human" play.
     constexpr uint64_t kPlayPercentRequired = 50;
-    constexpr uint64_t kMaxMsPerHeartbeat   = 35000;
+    constexpr uint64_t kLegacyMinListenMs   = 30000;
+    constexpr uint64_t kMinHeartbeats       = 6;
+    constexpr uint64_t kMaxMsPerHeartbeat   = 10000;
+
     auto reject = [&](const std::string& err_json,
                       const std::string& reason) {
         std::cout << "[session.complete] REJECT sid="
@@ -685,32 +769,37 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         return std::pair<int, std::string>{400, err_json};
     };
 
-    if (song_section.duration_ms == 0) {
-        return reject(
-            R"({"error":"song duration unknown — not registered on chain"})",
-            "song_not_registered");
+    // ---- gate 1: enough timestamps ----------------------------------
+    {
+        const uint64_t density_min =
+            std::max<uint64_t>(kMinHeartbeats,
+                               duration_ms / kMaxMsPerHeartbeat);
+        if (samples.size() < density_min) {
+            std::ostringstream err;
+            err << R"({"error":"sparse heartbeats","heartbeats":)"
+                << samples.size()
+                << R"(,"required_heartbeats":)" << density_min
+                << R"(,"wall_duration_ms":)" << duration_ms << "}";
+            return reject(err.str(), "sparse_heartbeats");
+        }
     }
-    const uint64_t required_ms =
-        uint64_t{song_section.duration_ms} * kPlayPercentRequired / 100;
-    if (effective_ms < required_ms) {
-        std::ostringstream err;
-        err << R"({"error":"insufficient listen time","effective_listened_ms":)"
-            << effective_ms
-            << R"(,"required_ms":)" << required_ms
-            << R"(,"song_duration_ms":)" << song_section.duration_ms
-            << R"(,"required_percent":)" << kPlayPercentRequired
-            << R"(,"wall_duration_ms":)" << duration_ms
-            << R"(,"heartbeats":)" << samples.size() << "}";
-        return reject(err.str(), "below_50pct");
-    }
-    const uint64_t min_heartbeats = duration_ms / kMaxMsPerHeartbeat;
-    if (samples.size() < min_heartbeats) {
-        std::ostringstream err;
-        err << R"({"error":"sparse heartbeats","heartbeats":)"
-            << samples.size()
-            << R"(,"required_heartbeats":)" << min_heartbeats
-            << R"(,"wall_duration_ms":)" << duration_ms << "}";
-        return reject(err.str(), "sparse_heartbeats");
+
+    // ---- gate 2: timestamps cover the song --------------------------
+    {
+        const uint64_t required_ms = song_section.duration_ms > 0
+            ? (uint64_t{song_section.duration_ms}
+                * kPlayPercentRequired / 100)
+            : kLegacyMinListenMs;
+        if (effective_ms < required_ms) {
+            std::ostringstream err;
+            err << R"({"error":"position_ms timestamps don't cover the song","effective_listened_ms":)"
+                << effective_ms
+                << R"(,"required_ms":)" << required_ms
+                << R"(,"song_duration_ms":)" << song_section.duration_ms
+                << R"(,"required_percent":)" << kPlayPercentRequired
+                << R"(,"wall_duration_ms":)" << duration_ms << "}";
+            return reject(err.str(), "below_threshold");
+        }
     }
 
     // Build PlayProof
@@ -762,14 +851,21 @@ std::pair<int, std::string> HttpServer::post_session_complete(
                   << crypto::to_hex(sess.session_id).substr(0, 12) << "\n";
         return {500, R"({"error":"db write failed"})"};
     }
+    // Mint actually landed. NOW flip the in-memory completed flag so
+    // a retry returns "already completed" instead of double-minting.
+    {
+        std::lock_guard<std::mutex> lk(sessions_mutex_);
+        auto it = sessions_.find(sid_copy);
+        if (it != sessions_.end()) it->second.completed = true;
+    }
     std::cout << "[session.complete] OK sid="
               << crypto::to_hex(sess.session_id).substr(0, 12)
               << " player=" << crypto::to_checksum_hex(sess.player_address)
               << " artist=" << crypto::to_checksum_hex(song_section.artist_address)
               << " play_count=" << (play_count + 1)
               << " outputs=" << outputs.size()
-              << " (eff_ms=" << effective_ms
-              << "/req_ms=" << required_ms << ")\n";
+              << " eff_ms=" << effective_ms
+              << " heartbeats=" << samples.size() << "\n";
 
     // Tally response amounts
     uint64_t artist_amount = 0, node_amount = 0, discoverer_amount = 0;

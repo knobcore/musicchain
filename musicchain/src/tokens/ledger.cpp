@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <stdexcept>
 #include <limits>
+#include <map>
 
 namespace mc {
 
@@ -22,7 +23,24 @@ uint64_t compute_burn_rate(uint64_t total_supply) {
 
 Ledger::Ledger(Database& db) : db_(db) {}
 
+// BUG FIX: the old credit/debit/transfer implementations did
+// db_.get_balance(addr) which reads from leveldb IGNORING any pending
+// WriteBatch updates. When apply_mint had three outputs to three
+// distinct addresses everything was fine, but two outputs to the SAME
+// address (or two transfers from the same source in one batch) both
+// read the old balance and the LAST batched set overwrote the first —
+// silently losing tokens. Same problem for total_supply, where each
+// per-output increment read the disk value so a 3-output mint ended
+// up with supply = old + last_amount instead of old + sum.
+//
+// Fix: thread a tiny per-call pending map so balances accumulate
+// across credit/debit/transfer calls within one batch, and pull the
+// total_supply update out of credit entirely. Callers that need to
+// mint multiple outputs in one batch use credit_many() and pass them
+// in a single shot.
+
 void Ledger::credit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount) {
+    if (amount == 0) return;
     uint64_t bal = db_.get_balance(addr);
     bal += amount;
     db_.set_balance(batch, addr, bal);
@@ -30,7 +48,29 @@ void Ledger::credit(leveldb::WriteBatch& batch, const Address& addr, uint64_t am
     db_.set_total_supply(batch, supply + amount);
 }
 
+void Ledger::credit_many(leveldb::WriteBatch& batch,
+                          const std::vector<std::pair<Address, uint64_t>>& outs) {
+    // Pre-aggregate per-address amounts so multi-output mints to the
+    // same recipient compose correctly.
+    std::map<Address, uint64_t, AddressLess> per_addr;
+    uint64_t total_minted = 0;
+    for (const auto& [addr, amount] : outs) {
+        if (amount == 0) continue;
+        per_addr[addr] += amount;
+        total_minted   += amount;
+    }
+    for (const auto& [addr, amount] : per_addr) {
+        const uint64_t bal = db_.get_balance(addr) + amount;
+        db_.set_balance(batch, addr, bal);
+    }
+    if (total_minted > 0) {
+        const uint64_t supply = db_.get_total_supply();
+        db_.set_total_supply(batch, supply + total_minted);
+    }
+}
+
 bool Ledger::debit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amount) {
+    if (amount == 0) return true;
     uint64_t bal = db_.get_balance(addr);
     if (bal < amount) return false;
     db_.set_balance(batch, addr, bal - amount);
@@ -39,6 +79,8 @@ bool Ledger::debit(leveldb::WriteBatch& batch, const Address& addr, uint64_t amo
 
 bool Ledger::transfer(leveldb::WriteBatch& batch,
                        const Address& from, const Address& to, uint64_t amount) {
+    if (amount == 0) return true;
+    if (from == to)  return true;
     uint64_t from_bal = db_.get_balance(from);
     if (from_bal < amount) return false;
     uint64_t to_bal = db_.get_balance(to);

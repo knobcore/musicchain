@@ -36,10 +36,15 @@ class NodeService {
       _waitForPref('auto_rats_peer_id', waitFor);
 
   /// Called by [LibratsDiscovery] after a `routes.get` cycle. Stores the
-  /// librats peer id of the selected full node.
+  /// librats peer id of the selected full node, or clears the cached
+  /// value when [ratsPeerId] is empty so a post-wipe / no-routes cycle
+  /// doesn't leave a stale peer id behind for getRatsPeerId to return.
   static Future<void> updateAutoNode({required String ratsPeerId}) async {
-    if (ratsPeerId.isEmpty) return;
     final prefs = await SharedPreferences.getInstance();
+    if (ratsPeerId.isEmpty) {
+      await prefs.remove('auto_rats_peer_id');
+      return;
+    }
     await prefs.setString('auto_rats_peer_id', ratsPeerId);
   }
 

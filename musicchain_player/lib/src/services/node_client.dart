@@ -94,9 +94,15 @@ class NodeClient {
       return true;
     } on RatsRpcException catch (e) {
       // Treat only error-style replies as "not present"; transport
-      // failures bubble.
+      // failures bubble. wrap_handler_result on the full node maps any
+      // non-2xx HTTP status into `http_<code>`, so a server-side blowup
+      // arrives here as `http_5xx` — not `server_error`. Bubble those
+      // too, otherwise a transient 500/502/503 looks indistinguishable
+      // from "song isn't on chain" and the upload-skip logic dupes the
+      // file across every retry.
       if (e.status == 'timeout' || e.status == 'send_failed' ||
-          e.status == 'server_error') {
+          e.status == 'server_error' ||
+          e.status.startsWith('http_5')) {
         rethrow;
       }
       return false;
@@ -512,11 +518,34 @@ class NodeClient {
   // ---- Sessions -------------------------------------------------------
 
   Future<PlaySession> startSession(String contentHash, String playerAddress) async {
+    // Reject empty / obviously-malformed inputs before we burn an RPC
+    // round trip on something the chain will 400 anyway. content_hash
+    // must be a 32-byte (64 hex char) value; player_address must decode
+    // to 20 bytes (40 hex chars, optionally 0x-prefixed). Bouncing
+    // bad inputs here surfaces a precise ArgumentError to the caller
+    // instead of an opaque "RatsRpcException(http_400)".
+    final ch = contentHash.trim();
+    if (ch.length != 64 || !RegExp(r'^[0-9a-fA-F]+$').hasMatch(ch)) {
+      throw ArgumentError.value(
+          contentHash, 'contentHash', 'must be 64-char hex (32 bytes)');
+    }
+    final pa = playerAddress.trim();
+    final paHex = pa.startsWith('0x') || pa.startsWith('0X')
+        ? pa.substring(2) : pa;
+    if (paHex.length != 40 || !RegExp(r'^[0-9a-fA-F]+$').hasMatch(paHex)) {
+      throw ArgumentError.value(playerAddress, 'playerAddress',
+          'must be 40-char hex address (optionally 0x-prefixed)');
+    }
     final r = await _rpc('session.start', {
-      'content_hash':   contentHash,
-      'player_address': playerAddress,
+      'content_hash':   ch,
+      'player_address': pa,
     });
-    return PlaySession.fromJson(Map<String, dynamic>.from(r as Map));
+    // Chain reply is {session_id, block_hash} — it does not echo back
+    // content_hash. Inject the caller's value so the resulting
+    // PlaySession carries the hash forward instead of defaulting to ''.
+    final m = Map<String, dynamic>.from(r as Map);
+    m['content_hash'] ??= ch;
+    return PlaySession.fromJson(m);
   }
 
   Future<void> sendHeartbeat(String sessionId,

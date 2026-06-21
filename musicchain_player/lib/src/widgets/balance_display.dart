@@ -1,10 +1,27 @@
 import 'package:flutter/material.dart';
 
-class BalanceDisplay extends StatelessWidget {
+class BalanceDisplay extends StatefulWidget {
   final String balance;
   final Future<void> Function() onRefresh;
 
   const BalanceDisplay({super.key, required this.balance, required this.onRefresh});
+
+  @override
+  State<BalanceDisplay> createState() => _BalanceDisplayState();
+}
+
+class _BalanceDisplayState extends State<BalanceDisplay> {
+  bool _refreshing = false;
+
+  Future<void> _handleRefresh() async {
+    if (_refreshing) return;
+    setState(() => _refreshing = true);
+    try {
+      await widget.onRefresh();
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -20,14 +37,20 @@ class BalanceDisplay extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text('Balance', style: TextStyle(fontWeight: FontWeight.bold)),
-                  Text(balance,
+                  Text(widget.balance,
                       style: const TextStyle(fontSize: 24, fontFamily: 'monospace')),
                 ],
               ),
             ),
             IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: onRefresh,
+              icon: _refreshing
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh),
+              onPressed: _refreshing ? null : _handleRefresh,
             ),
           ],
         ),

@@ -83,9 +83,25 @@ class _WalletLoginScreenState extends State<WalletLoginScreen> {
       // Push WalletInfo directly into WalletProvider so the wallet
       // tab renders immediately — tryAutoLoad on next cold start
       // rebuilds the same WalletInfo from the saved mnemonic.
+      //
+      // If the provider lookup or setWallet itself throws (e.g. the
+      // provider isn't in the tree, or notifyListeners blows up in a
+      // listener), DON'T swallow it and march on to onLoggedIn — the
+      // gate would flip to "signed in" with an empty WalletProvider
+      // and the wallet tab would render as if there were no wallet,
+      // with no error shown anywhere. Surface it as a restore failure
+      // instead so the user can retry.
       try {
         if (mounted) context.read<WalletProvider>().setWallet(info);
-      } catch (_) {}
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _error = 'Restore failed: $e';
+          });
+        }
+        return;
+      }
       widget.onLoggedIn();
     } catch (e) {
       if (mounted) {

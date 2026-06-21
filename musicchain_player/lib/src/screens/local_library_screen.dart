@@ -59,11 +59,14 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
 
   Future<void> _scanNow() async {
     setState(() => _scanning = true);
-    await LibraryScanner.instance.scanOnce(
-      force: true,
-      onProgress: () { if (mounted) setState(() {}); },
-    );
-    if (mounted) setState(() => _scanning = false);
+    try {
+      await LibraryScanner.instance.scanOnce(
+        force: true,
+        onProgress: () { if (mounted) setState(() {}); },
+      );
+    } finally {
+      if (mounted) setState(() => _scanning = false);
+    }
   }
 
   // ---- Bucket / sort helpers ------------------------------------------

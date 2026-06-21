@@ -36,13 +36,17 @@ class SensorCapture with WidgetsBindingObserver {
     // Battery sample cadence is 60 s — dense enough to catch a 4-hour
     // session's slope, sparse enough to barely register against the
     // app's overall power draw.
-    if (_batteryTimer == null) {
-      // Run an initial sample so even very short sessions have at
-      // least one row.
-      await _sampleBattery();
-      _batteryTimer = Timer.periodic(
-          const Duration(seconds: 60), (_) => _sampleBattery());
+    if (_batteryTimer != null) {
+      // Already started — re-running start() (e.g. on hot reload) must
+      // not double-register the lifecycle observer or orphan the
+      // previously opened screen interval.
+      return;
     }
+    // Run an initial sample so even very short sessions have at
+    // least one row.
+    await _sampleBattery();
+    _batteryTimer = Timer.periodic(
+        const Duration(seconds: 60), (_) => _sampleBattery());
     // Hook the lifecycle observer once. The first onResume after
     // attach is treated as the opening screen-on event for the bundle.
     WidgetsBinding.instance.addObserver(this);

@@ -195,6 +195,12 @@ class _WalletFirstLaunchScreenState extends State<WalletFirstLaunchScreen> {
     } catch (e, st) {
       // ignore: avoid_print
       print('[wallet-setup] _finish: FAILED — $e\n$st');
+      // The await above can complete after the user has navigated away
+      // (or after setWallet/onComplete has already swapped this screen
+      // out on the success path before a late exception). Guard the
+      // setState so we don't crash with "setState() called after
+      // dispose()".
+      if (!mounted) return;
       setState(() {
         _busy  = false;
         _error = 'Wallet setup failed: $e';

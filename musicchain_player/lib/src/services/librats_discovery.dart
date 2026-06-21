@@ -139,7 +139,14 @@ class LibratsDiscovery extends ChangeNotifier {
         final candidates = routes.values
             .where((m) => (m['rats_peer_id'] as String? ?? '').isNotEmpty)
             .toList();
-        if (candidates.isEmpty) candidates.addAll(routes.values);
+        if (candidates.isEmpty) {
+          // Every route is missing a rats_peer_id — nothing we can talk to.
+          // Falling back to routes.values here used to "pick" a node with an
+          // empty peer id, clobber NodeService's auto-node, and still report
+          // success in vpsStatus. Treat it the same as routes.isEmpty.
+          vpsStatus = 'No reachable full nodes (routes missing peer ids)';
+          return;
+        }
 
         double scoreOf(Map m) {
           final loadScore = (m['load_score'] as num?)?.toDouble() ?? 0.0;

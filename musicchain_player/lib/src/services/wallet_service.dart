@@ -83,6 +83,9 @@ class WalletService {
     if (handle == null) {
       throw Exception('Failed to derive wallet from mnemonic');
     }
+    // Re-import path: free the old native handle before we drop the
+    // pointer, otherwise the previous wallet's libwally context leaks.
+    freeWallet();
     _walletHandle = handle;
     _updateCache();
     await _secureStorage.write(key: _walletMnemonicKey, value: cleaned);

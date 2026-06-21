@@ -371,7 +371,19 @@ class LibraryScanner {
       // After every file has been (re-)submitted individually, push
       // the consolidated digest to the full node so future boots can
       // skip the per-track work entirely via swarm.hello_digest.
-      unawaited(syncSwarm());
+      //
+      // Must be awaited under the _running guard: syncSwarm can itself
+      // invoke _processFile(force: true) for any hashes the full node
+      // doesn't recognize, which mutates _scanned/_matched/_registered/
+      // _errors and calls lib.upsert. If we fire-and-forget here, the
+      // finally clears _running while syncSwarm is still in flight; the
+      // next scanOnce trigger (periodic background, user tap, VPS
+      // reconnect) will pass the `if (_running) return` gate, zero the
+      // counters mid-flight, and run _processFile concurrently with
+      // the still-running syncSwarm on overlapping files — double
+      // fingerprint.submit RPCs, lost counter updates, and racing
+      // lib.upsert writes on the same entry.
+      await syncSwarm();
     } finally {
       _running = false;
       onProgress?.call();
@@ -496,7 +508,19 @@ class LibraryScanner {
         if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
       }, timeout: const Duration(seconds: 20));
 
-      final m = (reply as Map<String, dynamic>?) ?? const {};
+      // Safe narrowing: `as Map<String, dynamic>?` throws TypeError if
+      // the RPC came back as Map<dynamic, dynamic> (the common shape
+      // after a VPS relay decode/re-encode round-trip) or anything else
+      // non-null, which would jump straight to the outer catch and
+      // count this file as an error WITHOUT calling lib.upsert below —
+      // even though fingerprint.submit succeeded server-side and the
+      // chain already enqueued our registration. We'd then re-read,
+      // re-fingerprint, and re-submit the same file on every future
+      // scan cycle. Use an `is`-check (same pattern as the force-path
+      // probe earlier in this function) so an unparseable body just
+      // means "no matched/registered flag" and we still record the
+      // entry locally.
+      final m = (reply is Map) ? reply : const {};
       final matched    = m['matched']    == true;
       final registered = m['registered'] == true;
       if (matched) _matched += 1;

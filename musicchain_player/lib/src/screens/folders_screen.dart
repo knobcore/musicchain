@@ -4,9 +4,11 @@
 // library when closed.
 
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
 import '../services/library_scanner.dart';
@@ -19,7 +21,27 @@ class FoldersScreen extends StatelessWidget {
     // Without storage permissions the picker opens but every browse
     // attempt returns "empty folder". Prompt first so the user only
     // sees the picker once they've granted access.
+    final messenger = ScaffoldMessenger.maybeOf(context);
     await LibraryScanner.instance.ensureStoragePermissions();
+    // ensureStoragePermissions returns void — it doesn't tell us whether
+    // the user actually granted access. On Android, verify the request
+    // succeeded; otherwise the picker would open, the user would pick a
+    // folder, addFolder would persist it, and the scanner would silently
+    // find zero files because File(...).list() returns empty without
+    // READ_MEDIA_AUDIO / MANAGE_EXTERNAL_STORAGE.
+    if (Platform.isAndroid) {
+      final audio = await Permission.audio.status;
+      final mgr   = await Permission.manageExternalStorage.status;
+      if (!audio.isGranted && !mgr.isGranted) {
+        messenger?.showSnackBar(const SnackBar(
+          content: Text('Storage permission denied — grant '
+              '"Music & audio" or "All files access" in system '
+              'settings, then try adding a folder again.'),
+          duration: Duration(seconds: 4),
+        ));
+        return;
+      }
+    }
     final path = await FilePicker.platform.getDirectoryPath();
     if (path == null) return;
     await LibraryService.instance.addFolder(path);

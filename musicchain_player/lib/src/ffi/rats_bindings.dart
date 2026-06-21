@@ -82,9 +82,11 @@ typedef _DartAnnounce =
     int Function(RatsClient, Pointer<Utf8>, int,
                   Pointer<NativeFunction<NativePeersFoundCb>>, Pointer<Void>);
 
-// Returns size_t — Dart uses IntPtr to match native pointer width.
+// Returns size_t — Dart uses Size (unsigned, pointer-width) to match the
+// native return type exactly. IntPtr (signed) would silently flip to a
+// negative routing-table size if the upper bit ever got set.
 typedef _NativeDhtTableSize =
-    IntPtr Function(RatsClient);
+    Size Function(RatsClient);
 typedef _DartDhtTableSize   =
     int Function(RatsClient);
 

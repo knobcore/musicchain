@@ -126,7 +126,22 @@ class MusicChainApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => WalletProvider()),
+        ChangeNotifierProvider(
+          // Eager. WalletProvider's constructor is the only place that
+          // sets the static `_active` (used by PlayerProvider's silent
+          // session-complete path to refresh balance after a mint),
+          // kicks `_tryAutoLoad()` (which sets
+          // LibraryScanner.artistAddress so re-announces credit the
+          // right publisher), and starts the 20 s defensive balance
+          // refresh timer. With lazy:true, a user whose wallet auto-
+          // unlocks via WalletGate goes straight to HomeScreen
+          // without anything reading WalletProvider — so balance
+          // stays stale, artist_address ships empty on the first
+          // re-announce, and refreshNow() silently no-ops until the
+          // user finally taps the Wallet tab.
+          lazy: false,
+          create: (_) => WalletProvider(),
+        ),
         ChangeNotifierProvider(create: (_) => LibraryProvider()),
         ChangeNotifierProvider(create: (_) => PlayerProvider()),
         ChangeNotifierProvider.value(value: LibraryService.instance),

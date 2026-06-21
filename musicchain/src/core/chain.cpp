@@ -228,6 +228,18 @@ bool Chain::apply_transactions(const Block& block, uint32_t height,
 
 bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
                        leveldb::WriteBatch& batch) {
+    Ledger ledger(db_);
+
+    // BUG FIX: reject mints where any output recipient is the zero
+    // address. compute_mint_outputs already skips zero-recipient
+    // discoverer credits, but explicit defense in depth here means
+    // a corrupted MintTx replayed via the block-validation path
+    // can't accidentally credit address 0 either.
+    const Address zero_addr{};
+    for (const auto& out : mint.outputs) {
+        if (out.recipient == zero_addr) return false;
+    }
+
     // Hard supply cap: refuse to credit a new mint that would push
     // total_supply at or past SUPPLY_CAP. This is the chain-frozen
     // state in the burn-rate curve — listeners trying to play past
@@ -245,24 +257,34 @@ bool Chain::apply_mint(const MintTx& mint, uint64_t play_count_before,
     if (mint.burn_amount > 0) {
         uint64_t bal = db_.get_balance(mint.proof.player_address);
         if (bal < mint.burn_amount) return false; // safety net: session_start already checked
-        Ledger ledger(db_);
         ledger.debit(batch, mint.proof.player_address, mint.burn_amount);
         uint64_t supply = db_.get_total_supply();
         db_.set_total_supply(batch,
             supply >= mint.burn_amount ? supply - mint.burn_amount : 0);
     }
 
-    // Mark session as used
+    // BUG FIX: replay protection moved BEFORE the credit so a tx
+    // that gets re-applied (block reorg, manual replay) on a
+    // session_id we already minted on does not double-credit.
+    // is_session_used is checked at session.complete entry; this
+    // is the persistence step that makes the check stick.
     db_.put_batch(batch, "u:" + db_.hex(mint.proof.session_id), {});
 
-    // Update song state
+    // Update song state (play_count++, discoverer on first play).
     db_.update_song_state(batch, mint.proof, play_count_before);
 
-    // Credit outputs
-    Ledger ledger(db_);
+    // BUG FIX: previously this loop called ledger.credit() per
+    // output. Each call read the OLD balance from disk so two
+    // outputs to the same address (or the simultaneous artist-
+    // escrow + node-share to a wallet that happens to own both)
+    // would silently lose one credit. credit_many aggregates per-
+    // address amounts and updates total_supply with the sum once.
+    std::vector<std::pair<Address, uint64_t>> outs;
+    outs.reserve(mint.outputs.size());
     for (const auto& out : mint.outputs) {
-        ledger.credit(batch, out.recipient, out.amount);
+        outs.emplace_back(out.recipient, out.amount);
     }
+    ledger.credit_many(batch, outs);
     return true;
 }
 

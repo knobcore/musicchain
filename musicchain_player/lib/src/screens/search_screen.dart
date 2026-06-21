@@ -94,7 +94,7 @@ class _SearchScreenState extends State<SearchScreen> {
                       song: song,
                       onTap: () {
                         final wallet = context.read<WalletProvider>().info;
-                        if (wallet == null) return;
+                        if (wallet == null || wallet.address.isEmpty) return;
                         // Playback state lives in the bottom MiniPlayer —
                         // no separate now-playing screen to push.
                         context.read<PlayerProvider>().play(song, wallet.address);

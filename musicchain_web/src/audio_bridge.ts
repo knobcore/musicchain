@@ -9,7 +9,9 @@
 //                     body: { content_hash, peer_id? } }
 //   server → text:  { req_id, status: "ok",
 //                     body: { stream_id, total_bytes } }
-//   server → bin*:  [stream_id_be_u32 | audio_bytes…]   (one or more frames)
+//   server → bin*:  raw audio bytes (one or more frames; the gateway
+//                   stripped the librats 9-byte stream/seq/eof header
+//                   before forwarding, see audio_fetch_handler.h)
 //   server → text:  { req_id, status: "complete",
 //                     body: { sent } }
 //
@@ -24,8 +26,12 @@
 //
 // The bridge installs itself onto two NodeClient hooks:
 //   - `onBinaryFrame`     – every binary frame routes through `_onBytes`,
-//                           which peels the 4-byte big-endian stream_id
-//                           and appends the rest to the matching entry.
+//                           which appends the entire frame (raw audio
+//                           bytes, no wire header) to the currently-
+//                           active in-flight entry. The gateway's
+//                           rate-limit policy guarantees only one
+//                           `audio.fetch` is in flight per WS, so we
+//                           don't need a per-chunk stream id to demux.
 //   - `onUnmatchedReply`  – the trailing `status: "complete"` envelope
 //                           arrives AFTER NodeClient.request() already
 //                           resolved on the initial `status: "ok"`. The
@@ -41,10 +47,6 @@
 // a WS gateway), and the streaming bits of node_client.dart.
 
 import type { NodeClient } from './node_client';
-
-/** Header size on a binary chunk frame — the first four bytes are the
- *  stream_id encoded big-endian (`htonl` on the C++ side). */
-const STREAM_ID_HEADER_BYTES = 4;
 
 /** Default ceiling for a single song fetch. Two paths reach this:
  *  - The verb's reply gives us `total_bytes`; we use that to size
@@ -319,50 +321,56 @@ export class AudioBridge {
 
   // -- Internals -------------------------------------------------------
 
-  /** Handle one binary WS frame: parse the stream_id header, find the
-   *  matching entry, and append the rest of the bytes. */
+  /** Handle one binary WS frame. The mini-node gateway sends RAW audio
+   *  bytes — no stream_id prefix — because rate-limit policy on the
+   *  gateway only permits one `audio.fetch` stream in flight per
+   *  WebSocket connection (see docs/ws_gateway_rate_limits.md). So we
+   *  just append every binary frame to whichever entry is currently
+   *  in flight; if there's more than one (race window during teardown)
+   *  the oldest one wins. Earlier builds of this file peeled a 4-byte
+   *  "stream_id" header off the front of every frame, which
+   *  corrupted the leading bytes of the actual audio (OGG header
+   *  starts `OggS`, mp3 with ID3 or 0xFFFB sync — both got mangled). */
   private _onBytes(frame: ArrayBuffer): void {
     if (this._disposed) return;
-    if (frame.byteLength < STREAM_ID_HEADER_BYTES) {
-      // Malformed — emit at most an error and drop the frame. We can't
-      // know which entry to blame, so this stays silent w.r.t. the
-      // registry.
+    if (frame.byteLength === 0) return;
+    // Pick the single in-flight entry. Iteration order on Map is
+    // insertion order, so first() == oldest.
+    let entry: StreamEntry | undefined;
+    for (const e of this._inflight.values()) {
+      if (!e.finished) { entry = e; break; }
+    }
+    if (!entry) {
+      // No active fetch — chunk arrived after we finished, or before
+      // the user kicked off a fetchSong. Drop.
       return;
     }
-    const view = new DataView(frame);
-    const streamId = view.getUint32(0, /* littleEndian= */ false);
-    const entry = this._inflight.get(streamId);
-    if (!entry || entry.finished) {
-      // No matching entry — late chunk after we already finished, or
-      // a stale stream from a previous AudioBridge instance. Drop.
-      return;
-    }
-    const payloadByteLength = frame.byteLength - STREAM_ID_HEADER_BYTES;
-    if (payloadByteLength === 0) {
-      // Heartbeat / keep-alive — nothing to append. Reset progress
-      // callback anyway in case the UI wants to flash a "still alive".
-      entry.onProgress?.(entry.received, entry.totalBytes);
-      return;
-    }
-    const payload = new Uint8Array(frame, STREAM_ID_HEADER_BYTES, payloadByteLength);
-    // Slice into a new buffer so the chunk survives even if the
-    // underlying frame is recycled by the polyfilled WebSocket.
-    const owned = new Uint8Array(payloadByteLength);
-    owned.set(payload);
+    // Copy into our own backing buffer; the underlying frame may be
+    // recycled by ws/polyfilled WebSocket between event ticks.
+    const owned = new Uint8Array(frame.byteLength);
+    owned.set(new Uint8Array(frame));
     entry.chunks.push(owned);
-    entry.received += payloadByteLength;
+    entry.received += owned.byteLength;
     if (entry.received > entry.maxBytes) {
-      this._inflight.delete(streamId);
+      this._inflight.delete(entry.streamId);
       clearTimeout(entry.timer);
       entry.finished = true;
       entry.reject(new AudioFetchError(
         'overflow',
-        `audio.fetch stream ${streamId} exceeded ${entry.maxBytes} bytes (got ${entry.received})`,
+        `audio.fetch exceeded ${entry.maxBytes} bytes (got ${entry.received})`,
       ));
       return;
     }
     try { entry.onProgress?.(entry.received, entry.totalBytes); }
     catch (_) { /* user callback errors don't kill the stream */ }
+    // Self-terminate when we've received the announced total. The
+    // trailing "complete" envelope still arrives but is just a
+    // formality at that point — finishing eagerly means the user
+    // hears the song the instant the last byte lands instead of
+    // waiting for the gateway's bookkeeping reply to round-trip.
+    if (entry.totalBytes > 0 && entry.received >= entry.totalBytes) {
+      this._finishEntry(entry, entry.received);
+    }
   }
 
   /** Handle a trailing reply envelope (typically `status: "complete"`)

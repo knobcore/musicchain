@@ -200,13 +200,48 @@ export class AudioBridge {
       );
     }
 
-    // Step 1 — open the stream with the server. The mini-node replies
-    // with the stream_id we'll see on the binary frames + the total
-    // size we should expect.
+    // Step 1 — discover a swarm peer the mini-node can stream from,
+    // unless the caller already supplied peer_id. We do this even
+    // though `audio.fetch` itself can auto-discover, because:
+    //   (a) the mini-node's auto-discover only asks ONE full node
+    //       and ONLY for 4 s — if that full node is mid-sync or
+    //       behind on swarm-on/off events, the lookup returns no
+    //       peer and `audio.fetch` fails with "no_peer".
+    //   (b) we want the browser to see a useful error envelope
+    //       ("no swarm members hosting this song right now") that
+    //       names the song specifically, instead of the gateway's
+    //       generic timeout.
+    // The browser can call `stream.open` over the same WS gateway
+    // because the gateway forwards it via relay.forward to a full
+    // node — same path `songs.search` already takes successfully.
+    let peerId: string | undefined = opts.peerId;
+    if (peerId === undefined) {
+      type StreamOpenReply = { peers?: Array<{ peer_id?: string }> };
+      const streamOpen = await this._node.request<StreamOpenReply>(
+        'stream.open',
+        { content_hash: ch },
+      );
+      const peers = Array.isArray(streamOpen.peers) ? streamOpen.peers : [];
+      const first = peers.find((p) =>
+        typeof p?.peer_id === 'string' && /^[0-9a-fA-F]{40}$/.test(p.peer_id),
+      );
+      if (!first || !first.peer_id) {
+        throw new AudioFetchError(
+          'no_swarm',
+          `no swarm peers currently hosting ${ch.substring(0, 16)}… — ` +
+            `the player that uploaded this song may be offline`,
+        );
+      }
+      peerId = first.peer_id;
+    }
+
+    // Step 2 — open the audio stream. The mini-node replies with the
+    // stream_id we'll see on the binary frames + the total size we
+    // should expect.
     const reqBody: { content_hash: string; peer_id?: string } = {
       content_hash: ch,
     };
-    if (opts.peerId !== undefined) reqBody.peer_id = opts.peerId;
+    if (peerId !== undefined) reqBody.peer_id = peerId;
     const openReply = await this._node.request<AudioFetchOpenReply>(
       'audio.fetch',
       reqBody,

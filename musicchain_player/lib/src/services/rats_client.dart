@@ -770,8 +770,15 @@ class RatsClient {
       if (explicitRelay != null && explicitRelay.isNotEmpty) {
         routeVia = explicitRelay;
       } else if (!validatedPeerIds.contains(peerId)) {
-        final ids = validatedPeerIds;
-        if (ids.isNotEmpty) routeVia = ids.first;
+        // Prefer a peer we've confirmed is a mini-node (via mini.hello)
+        // over an arbitrary librats validated peer. Pre-fix this used
+        // `ids.first`, which after any peer-table churn (mini-node
+        // restart, network blip) could be ANOTHER PLAYER — and players
+        // don't handle relay.forward, so the relayed request bounced
+        // back as "no handler for type=relay.forward". Mirrors the
+        // pattern already used for stun.observe at line 531.
+        routeVia = firstMiniNodePeerId
+            ?? (validatedPeerIds.isNotEmpty ? validatedPeerIds.first : null);
       }
     }
     if (routeVia != null && routeVia != peerId) {

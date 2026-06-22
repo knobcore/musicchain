@@ -169,25 +169,28 @@ std::string new_req_id() {
     return buf;
 }
 
-// Pluck the first 40-hex peer id out of a `swarm.members` reply body.
-// Accepts either:
-//   { "members": ["<peer_hex>", ...] }
-//   { "members": [{"peer_id": "<peer_hex>", ...}, ...] }
-// to stay compatible with whichever shape the home node ends up
-// emitting.
+// Pluck the first 40-hex peer id out of a `stream.open` reply body.
+// The home node emits `{peers: [{peer_id, bitrate, audio_format,
+// content_hash}, ...], source: "swarm"|"no_swarm"}` per rats_api.cpp's
+// stream.open handler. We tolerate the older `members` spelling and
+// raw-string entries too, just in case a different node implementation
+// ever shows up on the same mesh.
 std::string first_swarm_peer(const nlohmann::json& body) {
     if (!body.is_object()) return {};
-    if (!body.contains("members")) return {};
-    const auto& arr = body["members"];
-    if (!arr.is_array()) return {};
-    for (const auto& item : arr) {
-        std::string candidate;
-        if (item.is_string()) candidate = item.get<std::string>();
-        else if (item.is_object() && item.contains("peer_id")
-                 && item["peer_id"].is_string()) {
-            candidate = item["peer_id"].get<std::string>();
+    const char* keys[] = { "peers", "members" };
+    for (const char* k : keys) {
+        if (!body.contains(k)) continue;
+        const auto& arr = body[k];
+        if (!arr.is_array()) continue;
+        for (const auto& item : arr) {
+            std::string candidate;
+            if (item.is_string()) candidate = item.get<std::string>();
+            else if (item.is_object() && item.contains("peer_id")
+                     && item["peer_id"].is_string()) {
+                candidate = item["peer_id"].get<std::string>();
+            }
+            if (is_hex_string(candidate, 40)) return candidate;
         }
-        if (is_hex_string(candidate, 40)) return candidate;
     }
     return {};
 }
@@ -330,9 +333,16 @@ void AudioFetchHandle::Impl::run_worker() {
         swarm_req_id = new_req_id();
         register_pending_swarm(swarm_req_id, state.get());
 
+        // Use the canonical `stream.open` verb — the home node's
+        // rats_api answers that with a `{peers: [{peer_id, bitrate,
+        // audio_format, ...}], source: "swarm"|"no_swarm"}` body. The
+        // earlier code targeted a `swarm.members` verb that never
+        // existed on the home node, so this lookup always failed with
+        // unknown_type and the audio.fetch returned "no usable
+        // peer_id" to the browser.
         nlohmann::json swarm_req = {
             {"req_id", swarm_req_id},
-            {"type",   "swarm.members"},
+            {"type",   "stream.open"},
             {"body",   {{"content_hash", content_hash}}},
         };
         auto rc = rats_send_message(rats, directory.c_str(),
@@ -341,7 +351,7 @@ void AudioFetchHandle::Impl::run_worker() {
             clear_pending_swarm(swarm_req_id);
             swarm_req_id.clear();
             send_error_envelope("peer_send_failed",
-                "swarm.members rats_send_message rc="
+                "stream.open rats_send_message rc="
                 + std::to_string(static_cast<int>(rc)));
             return;
         }
@@ -365,7 +375,7 @@ void AudioFetchHandle::Impl::run_worker() {
         if (state->abort.load()) return;
         if (!got_swarm) {
             send_error_envelope("swarm_lookup_timeout",
-                "home node did not answer swarm.members within "
+                "home node did not answer stream.open within "
                 + std::to_string(kSwarmLookupTimeoutMs) + "ms");
             return;
         }
@@ -376,7 +386,7 @@ void AudioFetchHandle::Impl::run_worker() {
             swarm_reply = nlohmann::json::parse(state->swarm_json);
         } catch (...) {
             send_error_envelope("peer_error",
-                "swarm.members reply was not JSON");
+                "stream.open reply was not JSON");
             return;
         }
         const auto& body = swarm_reply.value(
@@ -384,7 +394,7 @@ void AudioFetchHandle::Impl::run_worker() {
         std::string picked = first_swarm_peer(body);
         if (picked.empty()) {
             send_error_envelope("no_peer",
-                "swarm.members reply had no usable peer_id");
+                "stream.open reply had no usable peer_id");
             return;
         }
         peer_id = std::move(picked);

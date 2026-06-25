@@ -115,6 +115,14 @@ public:
     /// duplicates -- safe to call regardless of block origin.
     void announce_new_block(const Hash256& hash);
 
+    /// Number of connected peers that have identified as full nodes via
+    /// block.node_hello (role=="full-node"). This is the connectivity-gate
+    /// input: announce_new_block HOLDS (buffers, no INV/DHT fan-out) while
+    /// this is 0 so an isolated node doesn't shout a fork into the void, and
+    /// flushes the moment it becomes >=1. Minting is never gated on it.
+    /// Best-effort (counts live peers_ entries); never a safety invariant.
+    size_t full_node_peer_count();
+
     /// Inbound dispatch from rats_api::handle_request for envelopes
     /// whose `type` begins with "block.". Returns the JSON body to
     /// embed in the musicchain.reply. Always returns a body; status
@@ -136,6 +144,14 @@ private:
         uint64_t tip_weight{0};   // #8: peer's cumulative-play fork weight
         Hash256  tip_hash{};
         bool     hello_received{false};
+        // node.hello: set true once this peer sends a block.node_hello with
+        // role=="full-node". This — NOT hello_received (a player could answer
+        // block.hello too) — is the discriminator that counts toward the
+        // connectivity gate. node_id binds the transport peer_id to the peer's
+        // chain identity (advisory until signature verification is enabled).
+        bool        is_full_node{false};
+        std::string node_id;
+        std::chrono::steady_clock::time_point node_hello_at{};
         /// Hashes we know this peer already knows about — used to
         /// suppress re-INV (bitcoin's `setInventoryKnown`). Bounded
         /// via a periodic trim in dht_announce_loop so a long-lived
@@ -179,6 +195,16 @@ private:
     /// announce_new_block for gossip).
     bool ingest_block_bytes(const std::vector<uint8_t>& bytes,
                             const Hash256& expected_hash);
+
+    /// Unconditional INV-broadcast + DHT-announce of one hash — the body of
+    /// the old announce_new_block. Called only once we have a full-node peer
+    /// (announce_new_block gates entry to this).
+    void do_announce(const Hash256& hash);
+
+    /// Drain pending_announce_ (blocks we minted while isolated) through
+    /// do_announce. Called on announce when a peer exists, and on the 0->1
+    /// full-node-peer transition in the node.hello handler.
+    void flush_pending_announce();
 
     /// Queue a getdata for `hash` against any peer that doesn't
     /// currently have it in their `in_flight` set, preferring peers
@@ -229,6 +255,12 @@ private:
 
     std::mutex                                                            pending_mu_;
     std::unordered_map<Hash256, Block, Hash256Hash>                       pending_blocks_;
+    /// (connectivity gate) Hashes we minted while having zero full-node peers,
+    /// held back from INV/DHT fan-out until a full-node peer appears, then
+    /// flushed in order. Bounded by kPendingAnnounceCap — anything dropped is
+    /// backfilled by the normal block.hello/getblocks reconcile on reconnect.
+    /// Guarded by pending_mu_.
+    std::deque<Hash256>                                                   pending_announce_;
     /// Hashes we want, in chain order. Drained from the front when
     /// pending_blocks_ supplies the next one.
     std::deque<Hash256>                                                   expected_sequence_;
@@ -268,6 +300,8 @@ private:
     /// (#8) cap on a peer's `known` set; cleared past this so a long-lived
     /// connection can't grow it without bound (a re-INV is harmless/deduped).
     static constexpr size_t                  kKnownCap            = 8192;
+    /// (connectivity gate) cap on held-while-isolated announce hashes.
+    static constexpr size_t                  kPendingAnnounceCap  = 4096;
     /// Above this height we DHT-announce every block on startup; below
     /// it we walk the chain in batches and announce in bursts (gives
     /// brand-new nodes a chance to find the chain quickly via DHT).

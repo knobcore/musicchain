@@ -255,12 +255,12 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         if (cfg.max_peers == 125 && file_cfg.max_peers != 125) cfg.max_peers = file_cfg.max_peers;
         if (cfg.max_sessions == 10000 && file_cfg.max_sessions != 10000)
             cfg.max_sessions = file_cfg.max_sessions;
-        // validator_enabled defaults to true; only the explicit file
-        // value should be able to turn it off. Without this merge the
-        // file's false gets silently discarded and every full node
-        // ends up minting heartbeats — chain forks at every tick.
-        if (cfg.validator_enabled && !file_cfg.validator_enabled)
-            cfg.validator_enabled = false;
+        // validator_enabled is DEPRECATED and no longer gates anything (Model 1
+        // has no producer/follower split; every node mints on content and the
+        // connectivity gate in BlockPropagator decides propagation). The field
+        // is still parsed so old config files load without error, but the merge
+        // that used to honor a file `false` is gone — there is nothing left to
+        // turn off.
         if (cfg.log_level == "info" && file_cfg.log_level != "info")
             cfg.log_level = file_cfg.log_level;
         if (cfg.seed_nodes.empty())    cfg.seed_nodes    = file_cfg.seed_nodes;

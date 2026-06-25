@@ -143,6 +143,43 @@ void BlockPropagator::on_peers_found_cb(void* user_data,
 }
 
 void BlockPropagator::announce_new_block(const Hash256& hash) {
+    // Connectivity gate. Only fan out when we have a confirmed full-node peer.
+    // While isolated (count == 0) HOLD the hash and defer BOTH INV gossip and
+    // the DHT-announce: broadcasting into the void is pointless, and an
+    // isolated node that minted a fork shouldn't shout it (it would only emit
+    // INV that gets reorged away on rejoin). Minting is NEVER gated — the block
+    // is already in our chain (connect_block ran before this), so a lone
+    // bootstrap node still produces + serves and just flushes everything held
+    // the instant a full-node peer appears (here, or in the node.hello handler).
+    if (full_node_peer_count() == 0) {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        if (pending_announce_.size() < kPendingAnnounceCap)
+            pending_announce_.push_back(hash);
+        return;
+    }
+    flush_pending_announce();   // catch peers up on anything minted while alone
+    do_announce(hash);
+}
+
+size_t BlockPropagator::full_node_peer_count() {
+    std::lock_guard<std::mutex> lk(peers_mu_);
+    size_t n = 0;
+    for (const auto& kv : peers_) if (kv.second.is_full_node) ++n;
+    return n;
+}
+
+void BlockPropagator::flush_pending_announce() {
+    std::vector<Hash256> held;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        if (pending_announce_.empty()) return;
+        held.assign(pending_announce_.begin(), pending_announce_.end());
+        pending_announce_.clear();
+    }
+    for (const auto& h : held) do_announce(h);
+}
+
+void BlockPropagator::do_announce(const Hash256& hash) {
     // 1. INV broadcast to every connected librats peer that hasn't
     //    already told us they know the hash. This is the live
     //    propagation path -- DHT-announce takes seconds.
@@ -210,6 +247,21 @@ void BlockPropagator::on_peer_connected(const std::string& peer_id) {
         {"tip_weight",   t.weight},   // #8: cumulative audited plays
     };
     send_request(peer_id, "block.hello", body);
+
+    // node.hello — announce our full-node identity/role right after block.hello
+    // (same cooldown gate above). The peer records role=="full-node" so it
+    // counts us toward its connectivity gate; node_id binds our transport id to
+    // our chain identity. Reply is advisory; mutual registration is guaranteed
+    // because both sides send this on connect. (Signature is deferred:
+    // record-but-don't-reject for now — see fingerprint of the rollout plan.)
+    json nh_body = {
+        {"role",       "full-node"},
+        {"node_id",    crypto::to_hex(cfg_.node_id)},
+        {"tip_height", t.height},
+        {"tip_hash",   crypto::to_hex(t.hash)},
+        {"tip_weight", t.weight},
+    };
+    send_request(peer_id, "block.node_hello", nh_body);
 }
 
 void BlockPropagator::on_peer_disconnected(const std::string& peer_id) {
@@ -297,6 +349,38 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
             {"tip_hash",     crypto::to_hex(local.hash)},
             {"timestamp_ms", local.timestamp_ms},
             {"tip_weight",   local.weight},
+        };
+    }
+
+    if (type == "block.node_hello") {
+        // Full-node identity/role handshake. Record role + node_id into the
+        // peer entry; is_full_node is what the connectivity gate counts.
+        // Signature verification is intentionally deferred (record-but-don't-
+        // reject) so this can roll out without bricking the live node — a peer
+        // that spoofs role=full-node only causes us to gossip to a non-serving
+        // peer (harmless). Turn on ECDSA verification (node_id<->pubkey bind)
+        // before relying on the count for anything beyond the announce gate.
+        const std::string role = body.value("role",    std::string{});
+        const std::string nid  = body.value("node_id", std::string{});
+        bool became_full_node = false;
+        if (role == "full-node") {
+            std::lock_guard<std::mutex> lk(peers_mu_);
+            auto& ps = peers_[peer_id];
+            became_full_node = !ps.is_full_node;
+            ps.is_full_node  = true;
+            ps.node_id       = nid;
+            ps.node_hello_at = std::chrono::steady_clock::now();
+        }
+        // On the 0->1 (or any new full-node-peer) transition, flush blocks we
+        // minted while isolated so the peer catches up immediately. Done OUTSIDE
+        // peers_mu_ — flush_pending_announce + do_announce take peers_mu_ again.
+        if (became_full_node) flush_pending_announce();
+        // Symmetric reply with our identity (advisory; the sender ignores it,
+        // exactly like block.hello / mini.hello).
+        return {
+            {"role",     "full-node"},
+            {"node_id",  crypto::to_hex(cfg_.node_id)},
+            {"accepted", true},
         };
     }
 

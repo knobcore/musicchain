@@ -425,9 +425,20 @@ class LibraryScanner {
             'audio_format':     existingByPath.audioFormat,
             if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
           }, timeout: const Duration(seconds: 10));
-          final m = (reply is Map<String, dynamic>) ? reply : const {};
+          // `reply is Map` (not Map<String,dynamic>) so a relay-decoded
+          // Map<dynamic,dynamic> still hits the fast path instead of falling
+          // through to a needless full re-fingerprint.
+          final m = (reply is Map) ? reply : const {};
           if (m['matched'] == true) {
-            _matched += 1;
+            // Same corroboration gate as the full-submit path below: only count
+            // a match toward the displayed tally when the node names a chain
+            // song that actually has a swarm, so a fuzzy false-positive can't
+            // inflate "matched N". The early return (swarm-join already done)
+            // stays regardless — that's a real fingerprint_hash hit.
+            final chainHash = (m['content_hash'] as String?)?.trim() ?? '';
+            final swarmSize = (m['swarm_size'] is num)
+                ? (m['swarm_size'] as num).toInt() : 0;
+            if (chainHash.isNotEmpty && swarmSize > 0) _matched += 1;
             return; // full node has it, swarm join confirmed — done
           }
           // matched=false → song was never on chain or chain was
@@ -523,11 +534,27 @@ class LibraryScanner {
       final m = (reply is Map) ? reply : const {};
       final matched    = m['matched']    == true;
       final registered = m['registered'] == true;
-      if (matched) _matched += 1;
+      // Don't trust a bare matched/registered flag for the displayed tally.
+      // The node returns content_hash + swarm_size on a real match; only count
+      // a match when it names a chain song that actually has a swarm. This
+      // stops a node-side fuzzy false-positive (matched:true with no real
+      // swarm) from inflating the "matched N" progress counter into songs that
+      // aren't there. (The library list itself is built from local files +
+      // their own tags, so it was never mislabeled — this is the counter fix.)
+      final chainHash = (m['content_hash'] as String?)?.trim() ?? '';
+      final swarmSize = (m['swarm_size'] is num)
+          ? (m['swarm_size'] as num).toInt() : 0;
+      if (matched && chainHash.isNotEmpty && swarmSize > 0) _matched += 1;
       if (registered) _registered += 1;
 
       await lib.upsert(LibraryEntry(
         contentHash:     contentHash,
+        // On a genuine fuzzy match the chain song's canonical hash differs from
+        // our local byte hash; record it so variant-linking / the chain-library
+        // "local" badge resolve this file to the existing song. Title/artist
+        // stay LOCAL — we never adopt chain metadata.
+        canonicalHash:   (chainHash.isNotEmpty && chainHash != contentHash)
+                             ? chainHash : '',
         fingerprintHash: fp.fingerprintHash,
         title:           title,
         artist:          artist,

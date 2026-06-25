@@ -39,6 +39,9 @@ struct NodeConfig {
     std::string dht_bootstrap_hash;
     uint32_t    max_peers    = 125;
     uint32_t    max_sessions = 10000;
+    // DEPRECATED: no longer gates anything. Model 1 has no producer/follower
+    // split — every node mints on content; BlockPropagator's connectivity gate
+    // decides propagation. Retained only so old config files parse.
     bool        validator_enabled = true;
     std::string log_level    = "info";
     Hash256     node_id      = {};

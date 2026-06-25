@@ -218,12 +218,15 @@ json wrap_handler_result(const std::string& req_id,
 }
 
 json status_body(Chain& chain, net::NetworkManager& network,
-                 const net::NodeConfig& config) {
+                 const net::NodeConfig& config, size_t full_node_peers) {
     return {
         {"role",         "full-node"},
         {"node_id",      mc::crypto::to_hex(config.node_id)},
         {"chain_height", chain.tip().height},
         {"peer_count",   network.peer_count()},
+        // (connectivity gate) full nodes we've handshaked via block.node_hello.
+        // 0 here means the propagator is HOLDING new-block fan-out (isolated).
+        {"connected_full_nodes", full_node_peers},
         {"own_ipv6",     network.own_ipv6_str()},
         {"api_port",     config.api_port},
         {"p2p_port",     config.p2p_port},
@@ -279,7 +282,9 @@ void RatsApi::handle_request(const std::string& peer_id,
         // ---- read-only verbs --------------------------------------------
         if (type == "status") {
             reply = {{"req_id", req_id}, {"status", "ok"},
-                     {"body",   status_body(chain_, network_, config_)}};
+                     {"body",   status_body(
+                         chain_, network_, config_,
+                         propagator_ ? propagator_->full_node_peer_count() : 0)}};
         } else if (type == "stun.observe") {
             // Echo back the address we see the caller from. Vanilla
             // librats stores the connection's `ip` and `port` in peer
@@ -645,7 +650,9 @@ void RatsApi::handle_request(const std::string& peer_id,
                 // counts as the same song — swarm join, no duplicate
                 // block.
                 if (!match && !fp.empty()) {
-                    constexpr float kSimThreshold = 0.55f;
+                    // Shared with chain.cpp's replay dup-check (see
+                    // fingerprint.h) — these MUST stay equal or nodes fork.
+                    const float kSimThreshold = audio::kChromaprintSimThreshold;
                     auto submitted =
                         audio::Fingerprint::from_compressed(fp);
                     if (!submitted) {
@@ -656,6 +663,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                         std::unordered_set<std::string>      seen;
                         std::pair<Hash256, float> best{{}, 0.0f};
                         int n_candidates = 0;
+                        bool found = false;   // early-exit on first >= threshold
                         for (auto bucket : submitted->bucket_ids()) {
                             for (const auto& cand :
                                  db_.get_bucket(bucket)) {
@@ -675,7 +683,20 @@ void RatsApi::handle_request(const std::string& peer_id,
                                     best.first  = cand;
                                     best.second = sim;
                                 }
+                                // Early-exit: the swarm-join result only needs
+                                // ANY candidate >= threshold (it overrides the
+                                // swarm key with the player's local content_hash
+                                // below), not the global argmax. Mirrors the
+                                // consensus path (chain.cpp), which already
+                                // breaks on the first duplicate. Turns the
+                                // common duplicate case from a full candidate
+                                // scan into first-hit.
+                                if (sim >= kSimThreshold) {
+                                    found = true;
+                                    break;
+                                }
                             }
+                            if (found) break;
                         }
                         std::cout << "[rats-api] fuzzy probe: "
                                   << n_candidates << " candidates, best="

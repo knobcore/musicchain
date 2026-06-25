@@ -184,13 +184,38 @@ float Fingerprint::similarity(const Fingerprint& other) const {
             int bits = portable_popcount(diff);
             if (bits <= 2) ++matching;
         }
-        if (length > best_len || matching > best_matching) {
+        // Keep the offset with the best MATCH RATIO (matching/length), not the
+        // longest overlap. The old `length > best_len || matching > best_matching`
+        // updated both fields together but fired on EITHER condition: since
+        // off=0 gives the largest length, best_len got pinned near full length
+        // while best_matching could be bumped by a different, shorter, denser
+        // offset — so the returned ratio mixed a matching-count from one offset
+        // with an overlap-length from another. That inflated different-song
+        // scores AND deflated offset-shifted same-song transcodes. Compare
+        // ratios via integer cross-multiply (matching/length vs best_matching/
+        // best_len) to avoid float division in the hot loop.
+        // int64 (not `long`, which is 32-bit on x64-windows) so the
+        // cross-multiply is overflow-free + bit-identical on every consensus
+        // target regardless of fingerprint length — the >= comparison must
+        // never flip between platforms or nodes fork.
+        if (length > 0 &&
+            (best_len == 0 ||
+             static_cast<int64_t>(matching) * best_len >
+             static_cast<int64_t>(best_matching) * length)) {
             best_matching = matching;
             best_len      = length;
         }
     }
 
-    if (best_len == 0) return 0.0f;
+    // Minimum-overlap guard: reject short-overlap / silence-tail flukes. The
+    // low-information frames different songs legitimately share (digital
+    // silence = 0x00000000, sustained tones, identical fades) trivially pass
+    // the <=2-bit test, so a small overlap concentrated on those frames can
+    // score deceptively high. Require a meaningful overlap before trusting the
+    // ratio; otherwise treat as no-match.
+    const int min_overlap = std::max(
+        256, static_cast<int>(0.30 * std::min(a.size(), b.size())));
+    if (best_len == 0 || best_len < min_overlap) return 0.0f;
     return static_cast<float>(best_matching) / static_cast<float>(best_len);
 }
 

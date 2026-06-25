@@ -1150,8 +1150,9 @@ bool Chain::rebuild_derived_state() {
     //        merkle_root matches txs, structural fields well-formed.
     //   2. prev_hash chain link               — points at h-1's block hash.
     //   3. chromaprint fuzzy uniqueness       — incoming song's
-    //        fingerprint isn't ≥0.55-similar to anything already
-    //        replayed. Catches duplicate registrations.
+    //        fingerprint isn't >= audio::kChromaprintSimThreshold (0.70)
+    //        similar to anything already replayed. Catches duplicate
+    //        registrations.
     //   4. apply_transactions                 — every tx is well-formed,
     //        has sufficient balance / valid nonce / valid signature.
     //
@@ -1199,7 +1200,9 @@ bool Chain::rebuild_derived_state() {
             auto fp = audio::Fingerprint::from_compressed(
                 block->song.compressed_fingerprint);
             if (fp) {
-                constexpr float kSimThreshold = 0.55f;
+                // Shared with rats_api.cpp's swarm-join probe — MUST match or
+                // nodes disagree on duplicate-ness and fork (see fingerprint.h).
+                const float kSimThreshold = audio::kChromaprintSimThreshold;
                 std::unordered_set<std::string> seen;
                 float best_sim = 0.0f;
                 bool dup = false;

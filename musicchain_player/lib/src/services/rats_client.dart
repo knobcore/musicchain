@@ -506,6 +506,16 @@ class RatsClient {
       _dialOne(v);
     }
     _vpsWasUp = false;
+    // (discovery fix) An explicit network change means the full node has very
+    // likely already dropped our swarm entries (our socket died on its side),
+    // so our library MUST be re-announced once we reconnect or our songs go
+    // undiscoverable even though we're online. NEVER let the flap cooldown
+    // suppress that: reset the hysteresis + cooldown so the next stable-up
+    // tick fires onVpsReconnected → LibraryScanner.reAnnounce(). That path is
+    // digest-checked (syncSwarm only resubmits what the home node is actually
+    // missing), so firing it on every network change is cheap and idempotent.
+    _upSince = null;
+    _lastReconnectFired = null;
   }
 
   /// Set of mini-nodes the player will dial at startup / on reconnect.

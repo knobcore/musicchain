@@ -56,20 +56,17 @@ void CandidateManager::start(Chain& chain, Database& db,
         // exact behaviour we want.
         last_block_at_ms_ = 0;
     }
-    // validator_enabled gates the heartbeat producer. Without this
-    // gate every full node on the network minted its own heartbeat,
-    // forking the chain at every block ("prev_hash break at height N"
-    // floods on both directions). The flag was parsed from config but
-    // never actually consulted, so all nodes acted as producers
-    // regardless. Setting it false lets a node SERVE the chain
-    // (answer songs.list, sync blocks, hold the swarm index) without
-    // competing for block production — proper multi-producer
-    // consensus (leader election + reorg) can layer on top later.
-    if (!cfg.validator_enabled) {
-        std::cout << "[chain] validator_enabled=false — running as "
-                     "follower (sync + serve only, no block production)\n";
-        return;
-    }
+    // Model 1 (proof-of-unique-song): there is NO producer/follower split and
+    // NO central block producer. EVERY node runs the producer. A block is
+    // minted only when there is real content — a unique-song registration or
+    // pending txs — and the network converges on the heaviest valid chain
+    // (one-song-once uniqueness + cumulative-audited-play weight + reorg), so
+    // there is no central point of failure. The old `validator_enabled`
+    // "follower" gate existed ONLY because every node also minted empty
+    // heartbeat blocks, forking the chain each interval; empty heartbeats are
+    // now gone (see the producer body), so the gate is gone with them.
+    // (`validator_enabled` remains in the config schema but no longer gates
+    // anything.)
     heartbeat_thread_ = std::thread([this, &chain, &db, &network, &cfg, &keypair] {
         heartbeat_loop(chain, db, network, cfg, keypair);
     });
@@ -250,12 +247,6 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             }
         }
 
-        uint64_t last_at;
-        {
-            std::lock_guard<std::mutex> lk(producer_mu_);
-            last_at = last_block_at_ms_;
-        }
-
         const uint64_t now = now_ms_c();
         auto all_pending = db.get_all_pending_txs();
 
@@ -396,23 +387,24 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
             pending_txs.emplace_back(s.hash, std::move(s.raw));
         }
 
-        // No registration AND no pending transactions AND heartbeat
-        // window not yet elapsed → nothing to do this tick.
-        if (!reg && pending_txs.empty()
-            && (now - last_at < HEARTBEAT_INTERVAL_MS)) continue;
-
-        // Pre-genesis guard. At chain.tip().height == 0 we must NOT mint
-        // empty heartbeat blocks. last_block_at_ms_ is initialised to 0
-        // so the elapsed-window check above always wants to fire on the
-        // very first tick — without this guard the producer races the
-        // user's bootstrap action and turns an empty block 1 into the
-        // chain's genesis, leaving the GRANT to land at height 1 where
-        // the multi-node confirmation path then times out for 300 s.
-        // Wait until the operator's bootstrap puts the GRANT into the
-        // mempool; only then mint block 1.
-        if (chain.tip().height == 0 && !reg && pending_txs.empty()) {
-            continue;
-        }
+        // Model 1 — two block kinds, both validated by EVERY node:
+        //   * song block:      carries a unique-song registration (has a
+        //                      chromaprint fingerprint; validated by the
+        //                      one-song-once uniqueness check).
+        //   * heartbeat block: carries tx data only (founder GRANT, play
+        //                      mints, relay rewards, transfers, usernames) and
+        //                      NO fingerprint; validated by the tx rules.
+        // We mint whenever there is EITHER — a heartbeat block is a normal,
+        // fully-validated, propagated block, just without a song. What we do
+        // NOT mint is an empty time-based block (no song AND no txs): minting
+        // those on every node forked the chain each interval and was the sole
+        // reason the old validator_enabled gate existed. With empty heartbeats
+        // gone, every node runs the producer safely and the chain converges on
+        // the heaviest valid chain. Quiet periods (nothing to carry) simply
+        // produce no block — including pre-genesis, until the operator's
+        // bootstrap puts the founder GRANT in the mempool, which is when the
+        // first block (genesis) gets minted.
+        if (!reg && pending_txs.empty()) continue;
         Block block;
         block.header.version          = BLOCK_VERSION;
         block.header.prev_hash        = chain.tip().hash;

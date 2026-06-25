@@ -24,6 +24,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ffi/rats_bindings.dart';
 import 'player_server.dart';
+import 'wallet_service.dart';   // #10: sign relay.receipt with the wallet key
 
 /// Bootstrap mini-node used as the initial peer. The mesh-discovery layer
 /// (mini.hello + mininodes.list) grows this into a full list of VPSes
@@ -67,10 +68,21 @@ class MiniNodeAddr {
 /// `req_id` is echoed back so we can match the reply to the awaiting Future.
 /// `reply_to` is the librats peer id of the sender; the server fills it in
 /// and echoes it back so multi-peer routing stays straight.
+/// Hard ceiling on an inbound librats binary frame. Legit frames are an audio
+/// chunk (~16 KB) or a download piece (≤256 KB); anything larger is a
+/// malformed/hostile peer and would OOM-kill the app when copied. Dropped in
+/// the binary callback before any allocation.
+const int _kMaxBinaryFrame = 8 * 1024 * 1024;
+
 class _PendingRequest {
   final Completer<Object?> completer; // body may be Map, List, primitive, null
   final Timer timeout;
-  _PendingRequest(this.completer, this.timeout);
+  // (#4 instability fix) the librats peer this request was actually sent to
+  // — for a relayed RPC that's the relay mini-node, not the ultimate target.
+  // _handlePeerDisconnected uses it to fail-fast every in-flight request
+  // whose relay/peer just died instead of waiting out the 15s/8s timeout.
+  final String destPeer;
+  _PendingRequest(this.completer, this.timeout, this.destPeer);
 }
 
 class RatsClient {
@@ -121,6 +133,22 @@ class RatsClient {
 
   /// Tracks stream_id → stream sink so binary chunks can be reassembled.
   final Map<int, _AudioReceiver> _streams = {};
+
+  // (#17 instability fix) Receiver-allocated stream ids. We propose a unique
+  // id per fetch (client_stream_id) to the serving peer so two serving peers
+  // can't independently pick the same random 32-bit id and collide in our
+  // _streams map (which would misroute audio chunks). Monotonic, wrapped to
+  // 32 bits, and skipping any id currently active in _streams.
+  int _clientStreamSeq = 0;
+  int _allocClientStreamId() {
+    for (int i = 0; i < 1 << 16; ++i) {
+      _clientStreamSeq = (_clientStreamSeq + 1) & 0xFFFFFFFF;
+      if (_clientStreamSeq != 0 && !_streams.containsKey(_clientStreamSeq)) {
+        return _clientStreamSeq;
+      }
+    }
+    return _clientStreamSeq;   // pathological fallback (≥65k live streams)
+  }
 
   /// Peer ids that self-identified as a mini-node by sending us a
   /// `mini.hello`. The post-pivot full node dropped the routes.get /
@@ -205,6 +233,13 @@ class RatsClient {
   /// associated relay peer (the mini-node) instead of being sent direct.
   final Map<String, String> _relayVia = {};
 
+  /// #10: the loaded wallet, injected from main(), used to sign
+  /// relay.receipt. WalletService is not a singleton, so a bare
+  /// WalletService() would have no loaded key — main() must set this to the
+  /// same instance that holds the player's wallet.
+  WalletService? _wallet;
+  set wallet(WalletService w) => _wallet = w;
+
   /// Tell RatsClient that traffic for [targetPeerId] must go via the relay
   /// at [relayPeerId]. Pass `null` to remove a previous mapping.
   void setRelayVia(String targetPeerId, String? relayPeerId) {
@@ -240,7 +275,10 @@ class RatsClient {
       final arr = _b.getValidatedPeerIds(_handle, countPtr);
       final n = countPtr.value;
       final out = <String>[];
-      if (arr.address == 0 || n <= 0) return out;
+      // Treat the native count as untrusted: a garbage/huge n would walk
+      // arr.elementAt(i) past the allocation (SIGSEGV) and free junk pointers.
+      // A real client has at most a few hundred peers.
+      if (arr.address == 0 || n <= 0 || n > 100000) return out;
       for (int i = 0; i < n; ++i) {
         final p = arr.elementAt(i).value;
         if (p.address != 0) {
@@ -268,6 +306,39 @@ class RatsClient {
       return _b.connect(_handle, hostPtr, port);
     } finally {
       malloc.free(hostPtr);
+    }
+  }
+
+  // (DHT un-nerf P0b) serializes connectAndResolve so concurrent dials can't
+  // misattribute which newly-validated peer_id belongs to which dial.
+  Future<void> _dialResolveChain = Future<void>.value();
+
+  /// Dial a raw host:port that carries no librats peer_id (e.g. a
+  /// DHT-discovered seeder) and return the peer_id that validates as a result.
+  /// librats exposes no address→peer_id lookup, so we snapshot the validated
+  /// set, dial, and return the newly-appeared id. Serialized via a chained
+  /// future (Dart is single-isolate, so the synchronous prefix that swaps the
+  /// chain is atomic) so two concurrent dials don't both claim the same fresh
+  /// id. Returns null if nothing new validates within [timeout].
+  Future<String?> connectAndResolve(String host, int port,
+      {Duration timeout = const Duration(seconds: 6)}) async {
+    if (!_started || host.isEmpty || port <= 0) return null;
+    final prev = _dialResolveChain;
+    final gate = Completer<void>();
+    _dialResolveChain = gate.future;
+    await prev;
+    try {
+      final before = validatedPeerIds.toSet();
+      connect(host, port);
+      final deadline = DateTime.now().add(timeout);
+      while (DateTime.now().isBefore(deadline)) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        final fresh = validatedPeerIds.toSet().difference(before);
+        if (fresh.isNotEmpty) return fresh.first;
+      }
+      return null;
+    } finally {
+      gate.complete();
     }
   }
 
@@ -542,6 +613,13 @@ class RatsClient {
 
   Timer? _reconnectTimer;
   bool   _vpsWasUp = false;
+  // (#6 instability fix) hysteresis + rate-limit for the heavy reconnect
+  // recovery (full library re-announce + onVpsReconnected). A flapping
+  // wifi↔cellular link would otherwise re-fire that storm on every up-edge.
+  DateTime? _upSince;            // when the link most recently came up
+  DateTime? _lastReconnectFired; // last time we ran the heavy recovery
+  static const Duration _kStableUp          = Duration(seconds: 3);
+  static const Duration _kReconnectCooldown = Duration(seconds: 20);
 
   void _vpsWatchdog() {
     final up = validatedPeerIds.isNotEmpty;
@@ -563,16 +641,28 @@ class RatsClient {
       _miniNodePeerIds.clear();
       _relayVia.clear();
       _vpsWasUp = false;
+      _upSince  = null;
       return;
     }
-    if (!_vpsWasUp) {
-      _vpsWasUp = true;
-      // Re-announce ourselves + retry the public-address probe so other
-      // peers can locate us, and tell upper layers to re-join swarms.
-      unawaited(_announceToVps());
-      unawaited(_observePublicAddressViaVps());
-      try { onVpsReconnected?.call(); } catch (_) {}
+    // Link is up. Only run the heavy recovery once per up-period, AND only
+    // after it has been stably up for _kStableUp (so a momentary flap
+    // doesn't trigger it), AND at most once per _kReconnectCooldown.
+    if (_vpsWasUp) return;
+    final now = DateTime.now();
+    _upSince ??= now;
+    if (now.difference(_upSince!) < _kStableUp) return;   // not stable yet
+    if (_lastReconnectFired != null &&
+        now.difference(_lastReconnectFired!) < _kReconnectCooldown) {
+      _vpsWasUp = true;   // within cooldown — mark handled, skip the storm
+      return;
     }
+    _vpsWasUp = true;
+    _lastReconnectFired = now;
+    // Re-announce ourselves + retry the public-address probe so other
+    // peers can locate us, and tell upper layers to re-join swarms.
+    unawaited(_announceToVps());
+    unawaited(_observePublicAddressViaVps());
+    try { onVpsReconnected?.call(); } catch (_) {}
   }
 
   Timer? _announceTimer;
@@ -815,6 +905,15 @@ class RatsClient {
     }
     _pending.clear();
     _streams.clear();
+    // (#crash) Detach the static callback slot + flip _started BEFORE we
+    // stop/destroy the native client. `_b.stop`/`_b.destroy` can fire
+    // disconnect callbacks synchronously while tearing peers down; with the
+    // slot already null those trampolines bail immediately instead of
+    // re-entering Dart state (or, worse, the native handle) during teardown.
+    if (identical(_activeForCallback, this)) {
+      _activeForCallback = null;
+    }
+    _started = false;
     // Close every persistent DHT NativeCallable. Closing forfeits the
     // safety invariant librats relies on (the trampoline outlives any
     // late-arriving peer batch), so we tear the rats client down FIRST
@@ -831,10 +930,6 @@ class RatsClient {
     _requestCallable.close();
     _binaryCallable.close();
     _disconnectCallable.close();
-    if (identical(_activeForCallback, this)) {
-      _activeForCallback = null;
-    }
-    _started = false;
   }
 
   // -- Request/response over librats typed messages ----------------------
@@ -940,7 +1035,7 @@ class RatsClient {
             RatsRpcException('timeout', 'no reply within ${timeout.inMilliseconds}ms'));
       }
     });
-    _pending[reqId] = _PendingRequest(completer, t);
+    _pending[reqId] = _PendingRequest(completer, t, peerId);
 
     // The librats wire-level message type is always "musicchain.request" —
     // the verb name lives inside the JSON envelope. The full node listens for
@@ -1005,6 +1100,10 @@ class RatsClient {
         try { peerId = peerIdPtr.toDartString(); } catch (_) {}
       }
       self._dispatchReply(peerId, body);
+    } catch (_) {
+      // We're inside a native librats callback — a Dart exception escaping
+      // here crosses the C boundary and ABORTS the process. Swallow anything
+      // _dispatchReply throws (e.g. a bad `as Map` cast on a hostile reply).
     } finally {
       if (peerIdPtr.address != 0) b.stringFree(peerIdPtr);
       if (dataPtr.address   != 0) b.stringFree(dataPtr);
@@ -1205,10 +1304,17 @@ class RatsClient {
     }
     final b = self._b;
     try {
-      if (size < 9 || dataPtr.address == 0) return;
+      // Bound `size` BOTH ways before touching the buffer: < 9 has no header,
+      // and an absurdly large frame (untrusted peer) would double via fromList
+      // and OOM-kill the app on Android. Legit chunks are ~16 KB (audio) /
+      // ≤256 KB (piece); 8 MB is a generous ceiling. Drop oversized frames.
+      if (size < 9 || size > _kMaxBinaryFrame || dataPtr.address == 0) return;
       final bytes = dataPtr.cast<Uint8>().asTypedList(size);
       final copy  = Uint8List.fromList(bytes);
       self._dispatchBinary(copy);
+    } catch (_) {
+      // Native callback boundary — never let a Dart throw (e.g. feed() racing
+      // a closed StreamController) cross into C and abort the process.
     } finally {
       if (peerIdPtr.address != 0) b.stringFree(peerIdPtr);
       // librats malloc()s the binary buffer — free with the same allocator.
@@ -1242,7 +1348,12 @@ class RatsClient {
     } catch (_) {
       return;
     }
-    self._handlePeerDisconnected(peerId);
+    // This runs inside a native librats callback — an exception escaping it
+    // crosses the C boundary and ABORTS the process (SIGABRT). Never let one
+    // out.
+    try {
+      self._handlePeerDisconnected(peerId);
+    } catch (_) {/* swallow — a disconnect cleanup throw must not crash */}
   }
 
   void _registerDisconnectHandler() {
@@ -1269,6 +1380,27 @@ class RatsClient {
     try {
       PlayerServer.instance.cancelStreamsForPeer(peerId);
     } catch (_) {/* PlayerServer not initialized yet, or cancel threw */}
+
+    // (#4 instability fix) Fail-fast every in-flight request whose
+    // destination (a relay mini-node or a direct peer) just died. Without
+    // this, a mini-node drop / cellular-flip leaves each orphaned request
+    // blocked on its 15s/8s timer (an album batch stacks these into
+    // multi-minute UI stalls). We surface 'send_failed' — the status the
+    // catalog retry (LibraryProvider._withRediscoverRetry) and the audio
+    // swarm-member loop already treat as retryable — so recovery starts
+    // immediately on a surviving mini-node instead of after the timeout.
+    final dead = <String>[];
+    _pending.forEach((reqId, p) {
+      if (p.destPeer == peerId) dead.add(reqId);
+    });
+    for (final reqId in dead) {
+      final p = _pending.remove(reqId);
+      p?.timeout.cancel();
+      if (p != null && !p.completer.isCompleted) {
+        p.completer.completeError(
+            RatsRpcException('send_failed', 'relay/peer $peerId disconnected'));
+      }
+    }
   }
 
   /// Buffer for chunks that arrive BEFORE the requester has registered its
@@ -1424,15 +1556,30 @@ class RatsClient {
     /// timing out the rest.
     Duration chunkStall = const Duration(seconds: 30),
   }) async {
-    // 1. Ask the full node who has the file.
-    final probe = await request(nodePeerId, 'stream.open',
+    // 1. Ask the full node who has the file. (#crash) Cast defensively — a
+    // null/non-map reply would TypeError here, and fetchAudioToCache's
+    // `on RatsRpcException` would NOT catch it, so it'd escape as an
+    // unhandled async error. Empty map → no peers → handled as no_swarm.
+    final probeRaw = await request(nodePeerId, 'stream.open',
         {'content_hash': contentHash},
-        timeout: const Duration(seconds: 8)) as Map<String, dynamic>;
-    if (probe['source'] == 'local' || probe['stream_id'] != null) {
+        timeout: const Duration(seconds: 8));
+    final probe = probeRaw is Map
+        ? probeRaw.cast<String, dynamic>() : <String, dynamic>{};
+    // #10: the full node (broker) mints a delivery_id and returns it on
+    // both the no_swarm and swarm reply bodies. Thread it into the
+    // per-peer stream.open so any relaying mini-node stamps it into the
+    // F-frame, then the receipt goes back to nodePeerId (the broker).
+    final deliveryId = probe['delivery_id'] as String?;
+    // (#12) defensive parse; only take the legacy local fast-path when both
+    // fields are well-formed, else fall through to the swarm path.
+    final localSid = (probe['stream_id']   as num?)?.toInt();
+    final localTot = (probe['total_bytes'] as num?)?.toInt();
+    if ((probe['source'] == 'local' || probe['stream_id'] != null) &&
+        localSid != null && localTot != null) {
       // Full node has the bytes (legacy path; new arch should never hit
       // this but keep it as a fallback). Bytes are already coming.
-      final streamId   = probe['stream_id']   as int;
-      final totalBytes = probe['total_bytes'] as int;
+      final streamId   = localSid;
+      final totalBytes = localTot;
       final receiver = _AudioReceiver(totalBytes);
       _streams[streamId] = receiver;
       // Single try/finally around setup AND wait: a throw in
@@ -1470,6 +1617,8 @@ class RatsClient {
             openTimeout:  const Duration(seconds: 10),
             totalTimeout: totalTimeout,
             chunkStall:   chunkStall,
+            deliveryId:   deliveryId,
+            brokerPeerId: nodePeerId,
             onProgress:   onProgress);
         return bytes;
       } catch (e) {
@@ -1536,7 +1685,7 @@ class RatsClient {
         out.add(SwarmVariant(
           peerId:      m['peer_id']      as String? ?? '',
           contentHash: m['content_hash'] as String? ?? '',
-          bitrate:     m['bitrate']      as int?    ?? 0,
+          bitrate:     (m['bitrate'] as num?)?.toInt() ?? 0,  // (#crash) JSON may send double
           audioFormat: m['audio_format'] as String? ?? 'mp3',
         ));
       }
@@ -1639,12 +1788,19 @@ class RatsClient {
     String? vpsPeerId,
     int? preferredBitrate,
   }) async {
-    final probe = await request(nodePeerId, 'stream.open',
+    final probeRaw = await request(nodePeerId, 'stream.open',
         {'content_hash': contentHash},
-        timeout: const Duration(seconds: 8)) as Map<String, dynamic>;
-    if (probe['source'] == 'local' || probe['stream_id'] != null) {
-      final streamId   = probe['stream_id']   as int;
-      final totalBytes = probe['total_bytes'] as int;
+        timeout: const Duration(seconds: 8));
+    final probe = probeRaw is Map           // (#crash) defensive; see download path
+        ? probeRaw.cast<String, dynamic>() : <String, dynamic>{};
+    final deliveryId = probe['delivery_id'] as String?;  // #10 broker id
+    // (#12) defensive parse; only take the local fast-path when well-formed.
+    final localSid = (probe['stream_id']   as num?)?.toInt();
+    final localTot = (probe['total_bytes'] as num?)?.toInt();
+    if ((probe['source'] == 'local' || probe['stream_id'] != null) &&
+        localSid != null && localTot != null) {
+      final streamId   = localSid;
+      final totalBytes = localTot;
       final receiver = _AudioReceiver(totalBytes);
       _streams[streamId] = receiver;
       _drainEarlyChunks(streamId, receiver);
@@ -1675,7 +1831,9 @@ class RatsClient {
       for (int attempt = 0; attempt < 2; ++attempt) {
         try {
           reply = await request(v.peerId, 'stream.open',
-              {'content_hash': fetchHash(v)},
+              {'content_hash': fetchHash(v),
+               'client_stream_id': _allocClientStreamId(),   // #17
+               if (deliveryId != null) 'delivery_id': deliveryId},
               timeout: const Duration(seconds: 8))
               as Map<String, dynamic>;
           break;
@@ -1693,11 +1851,36 @@ class RatsClient {
             'peer ${v.peerId} no longer has ${fetchHash(v)}');
         continue;
       }
-      final streamId   = reply['stream_id']   as int;
-      final totalBytes = reply['total_bytes'] as int;
+      // (#12 instability fix) defensive parse — a malformed/hostile serving
+      // peer could send a non-int/absent stream_id|total_bytes; a raw
+      // `as int` here is OUTSIDE the per-attempt try and would abort the
+      // whole playback instead of just skipping this member.
+      final streamId   = (reply['stream_id']   as num?)?.toInt();
+      final totalBytes = (reply['total_bytes'] as num?)?.toInt();
+      if (streamId == null || totalBytes == null) {
+        lastError = RatsRpcException('not_matched',
+            'peer ${v.peerId} sent malformed stream.open reply');
+        continue;
+      }
       final receiver = _AudioReceiver(totalBytes);
       _streams[streamId] = receiver;
       _drainEarlyChunks(streamId, receiver);
+      // #10: when the stream finishes (EOF), send a signed relay.receipt to
+      // the broker. Best-effort: a never-completing stream just never
+      // corroborates (the mini's report alone earns nothing).
+      if (deliveryId != null) {
+        final servingPeer = v.peerId;
+        final fh = fetchHash(v);
+        receiver.future.then((_) {
+          _sendRelayReceipt(
+            brokerPeerId:  nodePeerId,
+            deliveryId:    deliveryId,
+            contentHash:   fh,
+            miniPeerId:    _relayVia[servingPeer] ?? '',
+            bytesReceived: receiver.received,
+          );
+        }).catchError((_) {});
+      }
       return AudioStream._(streamId, totalBytes, receiver, _streams);
     }
     throw RatsRpcException('swarm_exhausted',
@@ -1732,10 +1915,20 @@ class RatsClient {
       {Duration openTimeout  = const Duration(seconds: 8),
        Duration totalTimeout = const Duration(minutes: 5),
        Duration chunkStall   = const Duration(seconds: 30),
+       String? deliveryId,    // #10: broker-minted id, threaded into stream.open
+       String? brokerPeerId,  // #10: full node that minted it (gets the receipt)
        void Function(int received, int total)? onProgress}) async {
     final reply = await request(peerId, 'stream.open',
-        {'content_hash': contentHash}, timeout: openTimeout);
-    final meta = reply as Map<String, dynamic>;
+        {'content_hash': contentHash,
+         'client_stream_id': _allocClientStreamId(),   // #17
+         if (deliveryId != null) 'delivery_id': deliveryId},
+        timeout: openTimeout);
+    // (#crash) defensive — a non-map reply would TypeError; treat as not_matched.
+    if (reply is! Map) {
+      throw RatsRpcException('not_matched',
+          'peer $peerId sent a non-map stream.open reply');
+    }
+    final meta = reply.cast<String, dynamic>();
     if (meta['matched'] == false) {
       // Peer no longer has the bytes (entry was removed locally between
       // the full node's swarm reply and our follow-up). Bail so the
@@ -1743,9 +1936,13 @@ class RatsClient {
       throw RatsRpcException('not_matched',
           'peer $peerId no longer has $contentHash');
     }
-    final streamId   = meta['stream_id']   as int;
-    final totalBytes = meta['total_bytes'] as int;
-
+    // (#12 instability fix) defensive parse against a malformed serving peer.
+    final streamId   = (meta['stream_id']   as num?)?.toInt();
+    final totalBytes = (meta['total_bytes'] as num?)?.toInt();
+    if (streamId == null || totalBytes == null) {
+      throw RatsRpcException('not_matched',
+          'peer $peerId sent malformed stream.open reply');
+    }
     final receiver = _AudioReceiver(totalBytes);
     _streams[streamId] = receiver;
     if (onProgress != null) receiver.onProgress(onProgress);
@@ -1753,10 +1950,86 @@ class RatsClient {
     // server returning the reply and us reaching this line.
     _drainEarlyChunks(streamId, receiver);
     try {
-      return await _awaitWithStallGuard(receiver, totalTimeout, chunkStall);
+      final bytes =
+          await _awaitWithStallGuard(receiver, totalTimeout, chunkStall);
+      // #10: send a signed relay.receipt to the BROKER (the full node that
+      // minted the delivery_id and holds the pending-delivery row). Safe to
+      // send unconditionally — the broker only credits when a mini-node's
+      // signed byte-report ALSO arrives for the same delivery_id, so a
+      // direct (non-relayed) fetch simply never corroborates.
+      if (deliveryId != null && brokerPeerId != null) {
+        unawaited(_sendRelayReceipt(
+          brokerPeerId:  brokerPeerId,
+          deliveryId:    deliveryId,
+          contentHash:   contentHash,
+          miniPeerId:    _relayVia[peerId] ?? '',
+          bytesReceived: receiver.received,
+        ));
+      }
+      return bytes;
     } finally {
       _streams.remove(streamId);
     }
+  }
+
+  /// #10: send a signed relay.receipt to the broker full node. Preimage:
+  /// "relay.receipt" || delivery_id(16) || content_hash(32) || bytes(u64 LE).
+  /// wallet.sign hashes internally (sha256), so we pass the raw bytes; the
+  /// server verifies with verify_data. Best-effort — reward credit is not
+  /// critical to playback.
+  Future<void> _sendRelayReceipt({
+    required String brokerPeerId,
+    required String deliveryId,    // 32-hex (16 bytes)
+    required String contentHash,   // 64-hex (32 bytes)
+    required String miniPeerId,
+    required int    bytesReceived,
+  }) async {
+    final wallet = _wallet;
+    final info   = wallet?.info;
+    if (wallet == null || info == null) return;
+    final did = _hexToBytes(deliveryId);
+    final ch  = _hexToBytes(contentHash);
+    if (did.length != 16 || ch.length != 32) return;
+    final msg = BytesBuilder();
+    msg.add(utf8.encode('relay.receipt'));
+    msg.add(did);
+    msg.add(ch);
+    final u64 = ByteData(8)..setUint64(0, bytesReceived, Endian.little);
+    msg.add(u64.buffer.asUint8List());
+    final String sig;
+    try {
+      sig = wallet.sign(Uint8List.fromList(msg.toBytes()));
+    } catch (_) {
+      return;   // wallet not loaded / sign failed — skip
+    }
+    try {
+      await request(brokerPeerId, 'relay.receipt', {
+        'delivery_id':    deliveryId,
+        'content_hash':   contentHash,
+        'mini_peer_id':   miniPeerId,
+        'bytes_received': bytesReceived,
+        'player_address': info.address,
+        'player_pubkey':  info.publicKey,
+        'sig':            sig,
+      }, timeout: const Duration(seconds: 6));
+    } catch (_) { /* best-effort */ }
+  }
+
+  Uint8List _hexToBytes(String hex) {
+    final n = hex.length ~/ 2;
+    final out = Uint8List(n);
+    for (int i = 0; i < n; i++) {
+      out[i] = (_rcHexNibble(hex.codeUnitAt(i * 2)) << 4) |
+                _rcHexNibble(hex.codeUnitAt(i * 2 + 1));
+    }
+    return out;
+  }
+
+  int _rcHexNibble(int c) {
+    if (c >= 0x30 && c <= 0x39) return c - 0x30;
+    if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10;
+    if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10;
+    return 0;
   }
 
   void _dispatchReply(String peerId, String raw) {
@@ -1881,12 +2154,26 @@ class _AudioReceiver {
 
   Future<List<int>>     get future => _done.future;
   Stream<Uint8List>     get stream => _stream.stream;
+  bool                  get isDone => _done.isCompleted;  // (#5) stall watchdog
+
+  static const int _kMaxPendingChunks = 200000;  // flood guard (~3 GB @ 16 KB)
 
   void feed(int seq, Uint8List payload, bool eof) {
+    // (#crash) Never touch a torn-down receiver. Once the future completed or
+    // the byte stream closed (cancel / EOF), a late chunk arriving via the FFI
+    // binary callback must not _stream.add — that throws "Cannot add event
+    // after closing", and inside a native callback an escaping throw aborts
+    // the process.
+    if (_done.isCompleted || _stream.isClosed) return;
+    // (#crash) seq is peer-controlled. An absurd value would blow up _maxSeq
+    // and the assembly loop; a 1-byte-payload flood would grow _chunks
+    // without bound (OOM). Reject out-of-range seq and cap pending chunks.
+    if (seq < 0 || seq > totalBytes + 16) return;
     // Only count bytes the first time a seq lands — duplicate chunks
     // (rare, but possible if a retransmit races the first arrival)
     // shouldn't inflate progress.
     if (!_chunks.containsKey(seq)) {
+      if (_chunks.length >= _kMaxPendingChunks) return;  // flood guard
       _received += payload.length;
     }
     _chunks[seq] = payload;
@@ -1906,12 +2193,13 @@ class _AudioReceiver {
     }
 
     // Only complete the all-bytes future once eof has fired and every
-    // seq 0.._maxSeq is present (a defensive check — in practice TCP
-    // delivers in order so _nextEmit catches up to _maxSeq+1).
+    // seq 0.._maxSeq is present. (#crash) `_nextEmit` is the first not-yet-
+    // contiguous seq (advanced by the emit loop above), so "all present" is
+    // exactly `_nextEmit > _maxSeq` — O(1), instead of the old O(_maxSeq)
+    // scan that a malicious large seq could turn into a billions-iteration
+    // ANR.
     if (!_gotEof) return;
-    for (int i = 0; i <= _maxSeq; ++i) {
-      if (!_chunks.containsKey(i)) return;
-    }
+    if (_nextEmit <= _maxSeq) return;
     final out = BytesBuilder(copy: false);
     for (int i = 0; i <= _maxSeq; ++i) {
       out.add(_chunks[i]!);
@@ -1936,17 +2224,39 @@ class _AudioReceiver {
 /// libmpv computes track duration up front), an in-order chunk stream,
 /// and a `cancel` to tear the swarm fetch down if the consumer abandons.
 class AudioStream {
-  AudioStream._(this._streamId, this.totalBytes, this._receiver, this._owner);
+  AudioStream._(this._streamId, this.totalBytes, this._receiver, this._owner,
+      {Duration chunkStall = const Duration(seconds: 30)}) {
+    // (#5/#15 instability fix) streamFromSwarm returns this AudioStream
+    // immediately and nothing else aborts a receiver that simply stops
+    // getting chunks (relay/peer death mid-track, no EOF). Without a guard
+    // the receiver + its buffered bytes leak in _streams forever and the
+    // loopback HTTP handler reading `bytes` hangs. Watchdog: if idle past
+    // chunkStall before completion, cancel — errors the stream so the proxy
+    // unblocks and the caller can retry, and frees the _streams entry.
+    final stall = chunkStall;
+    _stallTimer = Timer.periodic(stall ~/ 2, (_) {
+      if (_receiver.isDone) { _stopWatch(); return; }
+      if (DateTime.now().difference(_receiver.lastChunkAt) > stall) {
+        cancel();
+      }
+    });
+    // Also stop the watchdog the moment the stream finishes normally/errors.
+    _receiver.future.whenComplete(_stopWatch).catchError((_) {});
+  }
 
   final int                          _streamId;
   final int                          totalBytes;
   final _AudioReceiver               _receiver;
   final Map<int, _AudioReceiver>     _owner;
+  Timer?                             _stallTimer;
 
   Stream<Uint8List> get bytes => _receiver.stream;
   Future<void>      get done  => _receiver.future.then((_) => null);
 
+  void _stopWatch() { _stallTimer?.cancel(); _stallTimer = null; }
+
   void cancel() {
+    _stopWatch();
     _receiver.cancel();
     _owner.remove(_streamId);
   }

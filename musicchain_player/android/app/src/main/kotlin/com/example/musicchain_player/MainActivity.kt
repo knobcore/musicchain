@@ -10,10 +10,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import java.security.MessageDigest
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -86,6 +88,11 @@ class MainActivity : FlutterActivity() {
                 // The new path is much faster: zero PCM round-trip
                 // through Dart, one allocation = one ShortArray reused
                 // chunk-by-chunk.
+                // (#crash) execute() throws RejectedExecutionException if the
+                // pool was shut down by a prior onDestroy — and that throw is
+                // on the Flutter platform thread, OUTSIDE the runnable's own
+                // try below, so it would crash uncaught. Guard the submit.
+                try {
                 decodeExecutor.execute {
                     try {
                         when (call.method) {
@@ -122,7 +129,64 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                } catch (e: java.util.concurrent.RejectedExecutionException) {
+                    result.error("decode_unavailable",
+                                 "decode executor shut down", null)
+                }
             }
+
+        // #5 structural device attestation: hardware-derived fingerprint
+        // the NDK can't read on Android (ANDROID_ID + Build.* identifiers).
+        // SHA-256'd here so the raw identifiers never leave the device and
+        // the wire shape matches the desktop FFI (mc_device_fingerprint):
+        // lowercase hex of a digest. Stable across app reinstalls (ANDROID_ID
+        // is per-app-signing-key + per-user, persisted by the OS), so the
+        // full node's per-device limiter buckets real hardware.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger,
+                      "musicchain/device")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "fingerprint" -> {
+                        try {
+                            result.success(deviceFingerprintHex())
+                        } catch (e: Throwable) {
+                            result.error("fp_failed", e.message ?: e.toString(), null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    @Suppress("HardwareIds")
+    private fun deviceFingerprintHex(): String {
+        val androidId = Settings.Secure.getString(
+            contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+        // Concatenate stable hardware/build identifiers. ANDROID_ID carries
+        // most of the entropy; the Build.* fields disambiguate two devices
+        // that (rarely) collide on ANDROID_ID and bind the fingerprint to
+        // the physical model. Deliberately NOT the wallet — device_id must
+        // be per-device across wallets (the wallet binds one layer up, in
+        // the signed bundle / session.start).
+        val material = buildString {
+            append("android_id=").append(androidId).append('\n')
+            append("manufacturer=").append(Build.MANUFACTURER).append('\n')
+            append("brand=").append(Build.BRAND).append('\n')
+            append("model=").append(Build.MODEL).append('\n')
+            append("device=").append(Build.DEVICE).append('\n')
+            append("board=").append(Build.BOARD).append('\n')
+            append("hardware=").append(Build.HARDWARE).append('\n')
+            append("fingerprint=").append(Build.FINGERPRINT).append('\n')
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(material.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            val v = b.toInt() and 0xFF
+            sb.append("0123456789abcdef"[v ushr 4])
+            sb.append("0123456789abcdef"[v and 0x0F])
+        }
+        return sb.toString()
     }
 
     override fun onDestroy() {

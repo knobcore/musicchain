@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/song.dart';
 import '../models/session.dart';
 import 'audio_stream_proxy.dart';
+import 'device_fingerprint_service.dart';
 import 'library_service.dart';
 import 'piece_downloader.dart';
 import 'rats_client.dart';
@@ -168,7 +169,11 @@ class NodeClient {
 
   Future<int> getWalletNonce(String address) async {
     final r = await _rpc('wallet.nonce', {'address': address});
-    return (r as Map)['nonce'] as int;
+    // (#crash) coerce defensively — a non-map reply or a JSON double would
+    // TypeError and abort the wallet action otherwise.
+    final n = r is Map ? (r['nonce'] as num?)?.toInt() : null;
+    if (n == null) throw RatsRpcException('bad_reply', 'wallet.nonce missing nonce');
+    return n;
   }
 
   Future<String> submitTransfer({
@@ -185,12 +190,17 @@ class NodeClient {
       'nonce':        nonce,
       'signature':    signature,
     });
-    return (r as Map)['tx_hash'] as String;
+    final tx = r is Map ? r['tx_hash'] as String? : null;
+    if (tx == null) throw RatsRpcException('bad_reply', 'wallet.transfer missing tx_hash');
+    return tx;
   }
 
   Future<String> getBalance(String address) async {
     final r = await _rpc('wallet.balance', {'address': address});
-    return (r as Map)['balance'] as String;
+    // Accept string or numeric balance; never hard-cast.
+    final b = r is Map ? r['balance'] : null;
+    if (b == null) throw RatsRpcException('bad_reply', 'wallet.balance missing balance');
+    return b.toString();
   }
 
   // ---- Audio streaming ------------------------------------------------
@@ -233,14 +243,52 @@ class NodeClient {
     // proxy is ready and starts decoding as the first KB lands instead
     // of waiting for the whole file to finish downloading first. On
     // cellular this is the difference between ~10 s wait and ~300 ms.
-    final stream = await rats.streamFromSwarm(
-      nodePeerId:  ratsPeerId!,
-      contentHash: contentHash,
-      vpsPeerId:   vpsPid,
-    );
-    await AudioStreamProxy.instance.ensureStarted();
-    final url = AudioStreamProxy.instance.serve(stream);
-    return Uri.parse(url);
+    try {
+      final stream = await rats.streamFromSwarm(
+        nodePeerId:  ratsPeerId!,
+        contentHash: contentHash,
+        vpsPeerId:   vpsPid,
+      );
+      await AudioStreamProxy.instance.ensureStarted();
+      final url = AudioStreamProxy.instance.serve(stream);
+      return Uri.parse(url);
+    } on RatsRpcException catch (e) {
+      // (DHT un-nerf P1) Streaming discovers sources ONLY via the full
+      // node's VPS-mediated swarm. When that's empty/offline the stream
+      // throws no_swarm / swarm_exhausted — fall back to the piece
+      // downloader, which now discovers AND dials DHT seeders (P0a/P0b), to
+      // fetch the bytes to a cache file and play from disk. Slower first
+      // byte than streaming, but it's the difference between "plays from
+      // another player over the DHT" and "unplayable because the VPS swarm
+      // was empty".
+      if (e.status == 'no_swarm' || e.status == 'swarm_exhausted') {
+        final cached = await _dhtFallbackToCache(contentHash);
+        if (cached != null) return cached;
+      }
+      rethrow;
+    }
+  }
+
+  /// (DHT un-nerf P1) Fetch [contentHash] via the DHT-enabled piece
+  /// downloader to a cache file and return its file Uri, or null if neither
+  /// the VPS swarm nor the DHT yields a usable seeder.
+  Future<Uri?> _dhtFallbackToCache(String contentHash) async {
+    try {
+      final dir    = await _downloadsDir();
+      final target = File('${dir.path}/$contentHash.audio');
+      if (await target.exists() && await target.length() > 0) {
+        return Uri.file(target.path);   // already cached from a prior fetch
+      }
+      final res = await _tryPieceDownload(
+        expectedHash:   contentHash,
+        canonicalHash:  contentHash,
+        finalCachePath: target.path,
+      );
+      if (res != null && await target.exists() && await target.length() > 0) {
+        return Uri.file(target.path);
+      }
+    } catch (_) { /* fall through — caller rethrows the streaming error */ }
+    return null;
   }
 
   /// Look up every variant (peer × bitrate × format) the full node knows
@@ -486,8 +534,15 @@ class NodeClient {
       }
     } catch (_) { /* fall through; PieceDownloader can still try DHT */ }
 
-    if (seeded.isEmpty) return null;
-
+    // (DHT un-nerf P0a) DO NOT early-return when the full node's swarm list
+    // is empty. The DHT seeder lookup lives INSIDE PieceDownloader.run()
+    // (SwarmRegistry.findSources), so returning here would skip the DHT in
+    // exactly the scenario it exists for — VPS swarm map empty / full node
+    // offline. Always construct the downloader; it throws NoPeerAvailable
+    // only when BOTH the VPS-seeded list AND the DHT yield nothing, which we
+    // catch below and fall through to the legacy path. (Paired with the P0b
+    // dial fix in piece_downloader.dart — DHT sources are now actually
+    // connected to; together they restore VPS-independent transfer.)
     try {
       final downloader = PieceDownloader(
         contentHash:    expectedHash,
@@ -536,9 +591,15 @@ class NodeClient {
       throw ArgumentError.value(playerAddress, 'playerAddress',
           'must be 40-char hex address (optionally 0x-prefixed)');
     }
+    // #5: attach the structural device attestation so the full node can key
+    // its per-device mint limiter on hardware rather than a wallet. The
+    // AcceptAllVerifier records device_id + level and accepts; a real
+    // verifier would gate here without any client change.
+    final attest = await DeviceFingerprintService.instance.get();
     final r = await _rpc('session.start', {
       'content_hash':   ch,
       'player_address': pa,
+      'attestation':    attest.toJson(),
     });
     // Chain reply is {session_id, block_hash} — it does not echo back
     // content_hash. Inject the caller's value so the resulting

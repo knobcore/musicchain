@@ -1,8 +1,10 @@
 #include "relay_credit_tracker.h"
 #include "../crypto/hash.h"
 
+#include <nlohmann/json.hpp>   // pd: row parse for the TTL prune (#10)
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 namespace mc::net {
 
@@ -84,15 +86,40 @@ void RelayCreditTracker::loop() {
             std::lock_guard<std::mutex> lk(mu_);
             snapshot.swap(credits_);
         }
+
+        // (#10) Prune stale pending-delivery rows (pd:) — brokered deliveries
+        // that never fully corroborated within the TTL (player left / mini
+        // crashed). Runs every sweep regardless of credits, bounding the table.
+        {
+            const uint64_t now = (uint64_t)std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            constexpr uint64_t kPdTtlMs = 10 * 60 * 1000;
+            std::vector<std::string> stale;
+            db_.for_each_with_prefix("pd:",
+                [&](const std::string& k, const std::string& v){
+                    auto row = nlohmann::json::parse(v, nullptr, false);
+                    uint64_t created = row.is_object()
+                        ? row.value("created", (uint64_t)0) : 0;
+                    if (created == 0 || (now > created && now - created > kPdTtlMs))
+                        stale.push_back(k);
+                    return true;
+                });
+            for (const auto& k : stale) db_.del(k);
+            if (!stale.empty())
+                std::cout << "[relay] pruned " << stale.size()
+                          << " stale pending-delivery rows\n";
+        }
+
         if (snapshot.empty()) continue;
 
-        // Chain-side cap (see apply_relay_reward / transaction.cpp:491+):
-        // RelayRewardTx with count > 1,000,000 is rejected at validation.
-        // Pre-clamp here so a runaway/malicious accumulator doesn't trip
-        // us into emitting an unmineable tx and silently dropping the
-        // credit. If we exceed the cap we mint the maximum allowed and
-        // carry the remainder forward to the next sweep.
-        constexpr uint64_t kMaxCountPerTx = 1'000'000ull;
+        // Chain-side cap (mirrors apply_relay_reward): a RelayRewardTx whose
+        // count (now INTERNAL UNITS, #10) exceeds this is rejected. Sized to
+        // cover a heavy 5-min sweep (~333 GB @ 10 units/byte = 1e12 units =
+        // 10,000 MC) with room to spare. Pre-clamp here so a runaway/malicious
+        // accumulator never emits an unmineable tx; the remainder carries
+        // forward to the next sweep.
+        constexpr uint64_t kMaxCountPerTx = 1'000'000'000'000ull;
         for (auto& [addr_hex, count] : snapshot) {
             if (count == 0) continue;
             uint64_t to_mint   = count;
@@ -100,7 +127,7 @@ void RelayCreditTracker::loop() {
             if (to_mint > kMaxCountPerTx) {
                 carryover = to_mint - kMaxCountPerTx;
                 to_mint   = kMaxCountPerTx;
-                std::cerr << "[relay] count " << count
+                std::cerr << "[relay] units " << count
                           << " > cap " << kMaxCountPerTx
                           << " for mini " << addr_hex.substr(0, 12)
                           << "… — minting cap, carrying over "

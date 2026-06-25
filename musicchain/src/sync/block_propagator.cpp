@@ -1,9 +1,7 @@
 #include "block_propagator.h"
 
 #include "../audio/fingerprint.h"      // base64
-#include "../consensus/candidate.h"    // MAX_CONFIRMATIONS, dynamic_quorum
 #include "../crypto/hash.h"            // to_hex / parse_hash256
-#include "../crypto/signature.h"
 #include "../network/rats_link.h"
 
 #include "../../deps/librats/src/librats_c.h"
@@ -16,7 +14,6 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
-#include <set>
 #include <sstream>
 
 namespace mc {
@@ -187,6 +184,20 @@ void BlockPropagator::on_peer_connected(const std::string& peer_id) {
     {
         std::lock_guard<std::mutex> lk(peers_mu_);
         peers_.try_emplace(peer_id);
+        // (#11 instability fix) per-peer block.hello cooldown. A flapping
+        // peer reconnecting would otherwise re-trigger block.hello →
+        // getblocks catch-up on every connect. Prune stale entries while
+        // here so last_hello_at_ stays bounded by recently-active peers.
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = last_hello_at_.begin(); it != last_hello_at_.end(); ) {
+            if (now - it->second > kHelloCooldown) it = last_hello_at_.erase(it);
+            else ++it;
+        }
+        auto it = last_hello_at_.find(peer_id);
+        if (it != last_hello_at_.end() && now - it->second < kHelloCooldown) {
+            return;   // said hello to this peer too recently — skip
+        }
+        last_hello_at_[peer_id] = now;
     }
     // Fire block.hello with our tip. Reply body will be peer's tip;
     // handle_request("block.hello") on the wire path records it and
@@ -196,13 +207,30 @@ void BlockPropagator::on_peer_connected(const std::string& peer_id) {
         {"tip_height",   t.height},
         {"tip_hash",     crypto::to_hex(t.hash)},
         {"timestamp_ms", t.timestamp_ms},
+        {"tip_weight",   t.weight},   // #8: cumulative audited plays
     };
     send_request(peer_id, "block.hello", body);
 }
 
 void BlockPropagator::on_peer_disconnected(const std::string& peer_id) {
-    std::lock_guard<std::mutex> lk(peers_mu_);
-    peers_.erase(peer_id);
+    // (#9 instability fix) re-dispatch the dropped peer's in-flight getdata
+    // hashes to a surviving peer. Without this, blocks we'd asked the dead
+    // peer for stall until an unrelated re-INV happens to re-trigger them,
+    // wedging block sync. Collect under the lock, erase, then re-schedule
+    // OUTSIDE the lock (schedule_getdata takes peers_mu_ itself — calling it
+    // while held would deadlock), mirroring stall_loop's pattern.
+    std::vector<Hash256> orphaned;
+    {
+        std::lock_guard<std::mutex> lk(peers_mu_);
+        auto it = peers_.find(peer_id);
+        if (it != peers_.end()) {
+            orphaned.assign(it->second.in_flight.begin(),
+                            it->second.in_flight.end());
+            peers_.erase(it);
+        }
+        last_hello_at_.erase(peer_id);
+    }
+    for (const auto& h : orphaned) schedule_getdata(h);
 }
 
 // =====================================================================
@@ -232,18 +260,30 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
     if (type == "block.hello") {
         // Record peer tip. If we're behind, kick getblocks. If they're
         // behind, our reply body lets them do the same.
-        PeerState* ps_ptr = nullptr;
+        uint64_t peer_weight = 0;
+        uint32_t peer_height = 0;
         {
             std::lock_guard<std::mutex> lk(peers_mu_);
             auto& ps = peers_[peer_id];
             ps.tip_height = static_cast<uint32_t>(body.value("tip_height", 0));
+            ps.tip_weight = body.value("tip_weight", static_cast<uint64_t>(0));
             const std::string hh = body.value("tip_hash", std::string{});
             crypto::parse_hash256(hh, ps.tip_hash);
             ps.hello_received = true;
-            ps_ptr = &ps;
+            // Snapshot under the lock — do NOT hold a pointer into peers_
+            // past the unlock (on_peer_disconnected may erase this entry on
+            // another thread, dangling the pointer).
+            peer_weight = ps.tip_weight;
+            peer_height = ps.tip_height;
         }
         const auto local = chain_.tip();
-        if (ps_ptr->tip_height > local.height) {
+        // #8: sync toward a peer with a *better* tip by the fork-choice
+        // rule (heavier wins; height is only the tiebreak), not just a
+        // taller one — a heavier-but-shorter chain must still pull us.
+        const bool peer_ahead =
+            peer_weight > local.weight ||
+            (peer_weight == local.weight && peer_height > local.height);
+        if (peer_ahead) {
             json gb_body = {{"locator", json::array()}};
             for (const auto& h : build_locator())
                 gb_body["locator"].push_back(crypto::to_hex(h));
@@ -256,6 +296,7 @@ nlohmann::json BlockPropagator::handle_request(const std::string& peer_id,
             {"tip_height",   local.height},
             {"tip_hash",     crypto::to_hex(local.hash)},
             {"timestamp_ms", local.timestamp_ms},
+            {"tip_weight",   local.weight},
         };
     }
 
@@ -470,32 +511,14 @@ bool BlockPropagator::ingest_block_bytes(const std::vector<uint8_t>& bytes,
         return false;
     }
 
-    // Confirmation quorum — same rule Chain::rebuild_derived_state uses:
-    // genesis (prev_hash==zero) is solo-self-signed and exempt;
-    // everything past it needs at least one valid signature. The
-    // network-appropriate quorum (dynamic_quorum based on peer count
-    // at mint time) is enforced by the producer when assembling the
-    // block; receivers can't reconstruct the peer count the producer
-    // saw, so we only verify authenticity here.
-    const bool is_genesis = (block.header.prev_hash == Hash256{});
-    if (!is_genesis) {
-        // Producer signed block.signing_hash() (header with the
-        // confirmations field cleared); verifier must use the same so
-        // signature verification doesn't fail because the header now
-        // carries the very sigs it's being verified against.
-        const Hash256 sh = block.signing_hash();
-        std::set<Hash256> seen;
-        uint32_t valid_sigs = 0;
-        for (const auto& c : block.header.confirmations) {
-            if (!seen.insert(c.validator_id).second) continue;
-            if (crypto::verify_ecdsa(sh, c.signature, c.pubkey))
-                ++valid_sigs;
-        }
-        if (valid_sigs < 1) {
-            std::cerr << "[bp] block has no valid signatures — discarding\n";
-            return false;
-        }
-    }
+    // Model 1 (vote-free deterministic consensus): there are no block-
+    // level confirmations to verify here. Validity is purely the
+    // deterministic content check — block.validate() above (fingerprint/
+    // merkle commitment) plus the prev_hash chain link and
+    // apply_transactions, both enforced when apply_loop hands the block
+    // to chain.connect_block. Every node re-derives the same verdict, so
+    // a forged block dies at the first honest hop. (Transactions keep
+    // their own signatures; only block-level voting was removed.)
 
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
@@ -531,25 +554,66 @@ void BlockPropagator::apply_loop() {
             expected_sequence_.pop_front();
             lk.unlock();
 
-            // prev_hash chain check — if it doesn't match our current
-            // tip the block is from a fork or out of order. Drop and
-            // retry sync (the next getblocks-driven catch-up will
-            // re-queue what's needed).
+            // prev_hash chain check. If blk extends our tip, connect it.
+            // If it forks (prev_hash != tip), try to assemble the branch
+            // and adopt it iff it's heavier (#8 fork choice).
             const auto local = chain_.tip();
-            if (blk.header.prev_hash != local.hash) {
-                std::cerr << "[bp] prev_hash break at height "
-                          << (local.height + 1)
-                          << " — dropping\n";
-            } else if (chain_.connect_block(blk)) {
-                did_apply = true;
-                std::cout << "[bp] connected block at height "
-                          << chain_.tip().height
-                          << " hash="
-                          << crypto::to_hex(blk.hash()).substr(0, 12)
-                          << "…\n";
-                announce_new_block(blk.hash());   // gossip onward
+            if (blk.header.prev_hash == local.hash) {
+                if (chain_.connect_block(blk)) {
+                    did_apply = true;
+                    std::cout << "[bp] connected block at height "
+                              << chain_.tip().height
+                              << " hash="
+                              << crypto::to_hex(blk.hash()).substr(0, 12)
+                              << "…\n";
+                    announce_new_block(blk.hash());   // gossip onward
+                } else {
+                    std::cerr << "[bp] connect_block rejected\n";
+                }
             } else {
-                std::cerr << "[bp] connect_block rejected\n";
+                // FORK. Walk back from blk toward a block already on our
+                // chain, pulling intermediate fork blocks from the pending
+                // buffer, to build a contiguous branch from the fork point.
+                std::vector<Block> rev;            // newest-first
+                rev.push_back(blk);
+                Hash256  want = blk.header.prev_hash;
+                bool     found_fork = false;
+                Hash256  fork_hash{};
+                uint32_t fork_height = 0;
+                for (int guard = 0; guard < 100000; ++guard) {
+                    if (auto fh = chain_.get_block_height(want)) {
+                        fork_hash = want; fork_height = *fh; found_fork = true;
+                        break;
+                    }
+                    std::lock_guard<std::mutex> pk(pending_mu_);
+                    auto pit = pending_blocks_.find(want);
+                    if (pit == pending_blocks_.end()) break;  // ancestor missing
+                    rev.push_back(pit->second);
+                    want = pit->second.header.prev_hash;
+                }
+                if (found_fork) {
+                    std::vector<Block> branch(rev.rbegin(), rev.rend());
+                    std::string rerr;
+                    if (chain_.reorg_to_branch(fork_hash, fork_height,
+                                               branch, rerr)) {
+                        did_apply = true;
+                        {   // drop the consumed fork blocks from the buffer
+                            std::lock_guard<std::mutex> pk(pending_mu_);
+                            for (const auto& b : branch)
+                                pending_blocks_.erase(b.hash());
+                        }
+                        announce_new_block(chain_.tip().hash);
+                        std::cout << "[bp] reorged to height "
+                                  << chain_.tip().height << "\n";
+                    } else {
+                        // Not heavier (or failed) — leave our chain as is.
+                        std::cerr << "[bp] fork not adopted: " << rerr << "\n";
+                    }
+                } else {
+                    std::cerr << "[bp] fork at height "
+                              << (local.height + 1)
+                              << " — branch incomplete, dropping for now\n";
+                }
             }
             lk.lock();
         }
@@ -563,12 +627,13 @@ void BlockPropagator::apply_loop() {
             {
                 std::lock_guard<std::mutex> pk(peers_mu_);
                 for (auto& [pid, ps] : peers_) {
-                    if (ps.hello_received &&
-                        ps.tip_height > local.height &&
-                        ps.in_flight.empty())
-                    {
+                    // #8: "ahead" = better by fork weight, height as tiebreak.
+                    const bool ahead =
+                        ps.tip_weight > local.weight ||
+                        (ps.tip_weight == local.weight &&
+                         ps.tip_height  > local.height);
+                    if (ps.hello_received && ahead && ps.in_flight.empty())
                         followups.push_back(pid);
-                    }
                 }
             }
             lk.unlock();
@@ -740,6 +805,33 @@ void BlockPropagator::dht_announce_loop() {
         for (int i = 0; i < 30 && running_; ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!running_) return;
+
+        // (#8 + #14 instability fix) bounded-growth maintenance, every ~30s
+        // (BEFORE the 30-min re-announce gate below, or it would barely run):
+        //  - clear any peer `known` set grown past kKnownCap — the trim this
+        //    map's header comment always promised but never had; a peer
+        //    re-learning a hash just gets a re-INV that is deduped;
+        //  - drop dht_searched_at_ entries older than a few search gaps, which
+        //    no longer suppress anything and would otherwise leave one
+        //    permanent entry per distinct block hash ever fetched.
+        {
+            std::lock_guard<std::mutex> lk(peers_mu_);
+            for (auto& [pid, ps] : peers_) {
+                (void)pid;
+                if (ps.known.size() > kKnownCap) ps.known.clear();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_mu_);
+            const auto cutoff = std::chrono::steady_clock::now();
+            for (auto it = dht_searched_at_.begin();
+                 it != dht_searched_at_.end(); ) {
+                if (cutoff - it->second > kDhtSearchMinGap * 4)
+                    it = dht_searched_at_.erase(it);
+                else ++it;
+            }
+        }
+
         const auto now = std::chrono::steady_clock::now();
         if (now - last_full_announce_ < kReannounceMin) continue;
 

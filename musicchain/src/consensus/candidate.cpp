@@ -3,12 +3,10 @@
 #include "../core/transaction.h"
 #include "../storage/database.h"
 #include "../network/manager.h"
-#include "../network/messages.h"
 #include "../audio/fingerprint.h"
 #include "../audio/ogg_validator.h"
 #include "../crypto/hash.h"
 #include "../crypto/keys.h"
-#include "../crypto/signature.h"
 #include <chrono>
 #include <algorithm>
 #include <filesystem>
@@ -36,61 +34,6 @@ static std::string random_hex(size_t bytes) {
     for (size_t i = 0; i < (bytes + 7) / 8; ++i)
         ss << std::hex << std::setw(16) << std::setfill('0') << dist(gen);
     return ss.str().substr(0, bytes * 2);
-}
-
-// ---- BlockCandidate ------------------------------------------------
-
-bool BlockCandidate::is_expired() const {
-    return (now_ms_c() - created_at_ms) > uint64_t(BLOCK_TIMEOUT_SECONDS) * 1000;
-}
-
-// ---- CandidateManager: candidate tracking --------------------------
-
-void CandidateManager::add_candidate(const std::string& candidate_hash,
-                                      BlockCandidate candidate) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    candidates_[candidate_hash] = std::move(candidate);
-}
-
-bool CandidateManager::add_confirmation(const std::string& candidate_hash,
-                                         const Confirmation& conf) {
-    bool final = false;
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        auto it = candidates_.find(candidate_hash);
-        if (it == candidates_.end()) return false;
-        auto& cand = it->second;
-        for (const auto& c : cand.received_confirmations)
-            if (c.validator_id == conf.validator_id) return false;
-        cand.received_confirmations.push_back(conf);
-        cand.block.header.confirmations = cand.received_confirmations;
-        final = cand.is_final();
-    }
-    if (final) confirm_cv_.notify_all();
-    return final;
-}
-
-std::optional<BlockCandidate> CandidateManager::get_candidate(
-    const std::string& hash) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    auto it = candidates_.find(hash);
-    if (it == candidates_.end()) return std::nullopt;
-    return it->second;
-}
-
-void CandidateManager::cleanup_expired() {
-    std::lock_guard<std::mutex> lk(mutex_);
-    for (auto it = candidates_.begin(); it != candidates_.end(); ) {
-        if (it->second.is_expired())
-            it = candidates_.erase(it);
-        else
-            ++it;
-    }
-}
-
-std::vector<std::pair<std::string, BlockCandidate>> CandidateManager::get_all() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return {candidates_.begin(), candidates_.end()};
 }
 
 // ---- CandidateManager: block producer ------------------------------
@@ -137,7 +80,6 @@ void CandidateManager::stop() {
         std::lock_guard<std::mutex> lk(producer_mu_);
         running_ = false;
     }
-    confirm_cv_.notify_all();
     heartbeat_cv_.notify_all();
     if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
 }
@@ -198,228 +140,56 @@ bool CandidateManager::commit_block(
     const std::vector<std::pair<Hash256, std::vector<uint8_t>>>& consumed_txs,
     std::string& err) {
 
-    // GENESIS FAST PATH (HEIGHT == 0 ONLY).
+    // MODEL 1 — vote-free deterministic consensus.
     //
-    // At chain height 0 there is, by definition, nothing for a
-    // confirmation gossip to converge on — no peer-validator could have
-    // confirmed a block we just minted, because the founder GRANT that
-    // empowers any moderator system hasn't itself landed yet.
+    // A block becomes canonical the instant chain.connect_block accepts
+    // it. connect_block runs the full deterministic validation
+    // (block.validate(): fingerprint/merkle commitment; prev_hash link
+    // to the current tip; apply_transactions: every tx's signature,
+    // nonce, and balance). There is no candidate registration, no self-
+    // signed block confirmation, and no quorum wait — those were the
+    // "vote" machinery, now removed. Every peer that later receives this
+    // block re-derives the same verdict independently (BlockPropagator
+    // INV/getdata + DHT, then ingest_block_bytes runs the identical
+    // deterministic checks). Genesis is no longer special-cased: at
+    // height 0 connect_block simply accepts the first valid block as the
+    // chain's genesis.
     //
-    // We *don't* gate this on peer_count anymore. The peers we see at
-    // this moment are connected over librats (most likely the VPS
-    // mini-node, which is a relay with no chain of its own) — they're
-    // not consensus participants. Even with several connected peers,
-    // if nobody has a chain past height 0 yet, our genesis block is the
-    // network's genesis block.
-    //
-    // The exploit gate the operator asked for is preserved:
-    // **chain.tip().height == 0** strictly. Once height >= 1 every
-    // block goes through the full add_candidate + confirm path below.
-    // There's no path back to fast-self-sign after genesis.
-    //
-    // chain.connect_block STILL runs the real validation (block
-    // structure + apply_transactions); the fast path only skips the
-    // candidate/confirmation theater that exists for peer
-    // coordination.
-    if (chain.tip().height == 0) {
-        auto block_hash_bytes = block.hash();
-        std::vector<Confirmation> sigs;
-        // Genesis fast path: solo self-sign once, regardless of peer
-        // count. Genesis is always 1 sig per consensus rules; the chain
-        // layer exempts it from the multi-sig quorum check.
-        const uint32_t quorum = 1;
-        sigs.reserve(quorum);
-        for (uint32_t i = 0; i < quorum; ++i) {
-            Confirmation c;
-            // Distinct validator_id per pass so any future multi-node
-            // verifier doesn't reject the block for "duplicate
-            // validator_id". sha256("solo:" || node_id || i_be32).
-            std::vector<uint8_t> seed;
-            const char* tag = "solo:";
-            seed.insert(seed.end(), tag, tag + std::strlen(tag));
-            seed.insert(seed.end(), cfg.node_id.begin(), cfg.node_id.end());
-            for (int s = 3; s >= 0; --s)
-                seed.push_back(static_cast<uint8_t>((i >> (8*s)) & 0xFF));
-            c.validator_id = crypto::sha256(seed.data(), seed.size());
-            std::copy(keypair.public_key.begin(), keypair.public_key.end(),
-                      c.pubkey.begin());
-            c.signature = crypto::sign_ecdsa(block_hash_bytes,
-                                              keypair.private_key);
-            sigs.push_back(c);
-        }
-        block.header.confirmations = std::move(sigs);
-        if (!chain.connect_block(block)) {
-            err = "Chain connect_block rejected";
-            return false;
-        }
-        // Gossip the new block out — INV broadcast to connected peers
-        // + DHT-announce so multi-source catch-up can find this node.
-        if (announcer_) announcer_(block.hash());
-        // Best-effort write the .blk dump for the operator.
-        try {
-            // Scale fix: bucket the .blk dumps by height/1000 so we
-            // never put more than 1000 files in any one directory.
-            // At 1 block/sec that's a fresh subdir every ~16 min and
-            // ~12 k dirs/year — well under any FS limit. Path layout:
-            //   blocks/00000123/00123456.blk
-            const uint32_t h = chain.tip().height;
-            std::ostringstream sub;
-            sub << std::setw(8) << std::setfill('0') << (h / 1000);
-            fs::path blocks_dir = fs::path(cfg.data_dir) / "blocks" / sub.str();
-            fs::create_directories(blocks_dir);
-            std::ostringstream fname;
-            fname << std::setw(8) << std::setfill('0') << h << ".blk";
-            fs::path file_path = blocks_dir / fname.str();
-            auto block_bytes = block.serialize();
-            std::ofstream f(file_path, std::ios::binary);
-            f.write(reinterpret_cast<const char*>(block_bytes.data()),
-                    block_bytes.size());
-        } catch (...) { /* non-fatal */ }
-        (void)consumed_txs;  // mempool drain folded into connect_block batch
-        (void)network;
-        {
-            std::lock_guard<std::mutex> lk(producer_mu_);
-            last_block_at_ms_ = now_ms_c();
-        }
-        return true;
-    }
+    // network / keypair are no longer used here (no candidate broadcast,
+    // no block-level signing); consumed_txs is informational because the
+    // mempool drain is folded into connect_block's leveldb batch.
+    (void)network;
+    (void)keypair;
+    (void)consumed_txs;
 
-    // MULTI-NODE PATH: full confirmation dance.
-    std::string block_hash_hex = crypto::to_hex(block.hash());
-
-    // Compute the quorum this block needs based on currently-reachable
-    // peers. Solo (0 peers) → 1 sig; each additional peer raises the
-    // bar by one until MAX_CONFIRMATIONS caps it. The result is stored
-    // on the BlockCandidate so is_final()'s predicate fires at exactly
-    // the right count — without a per-block value, a network that
-    // recently grew or shrank would either wait too long or finalize
-    // too early.
-    const uint32_t quorum = dynamic_quorum(network.peer_count());
-
-    BlockCandidate candidate;
-    candidate.block           = block;
-    candidate.created_at_ms   = now_ms_c();
-    candidate.required_quorum = quorum;
-    add_candidate(block_hash_hex, candidate);
-
-    bool confirmed = false;
-    auto deadline  = std::chrono::steady_clock::now()
-                   + std::chrono::seconds(BLOCK_TIMEOUT_SECONDS);
-
-    // Solo mode: self-sign `quorum` times so the block becomes final
-    // immediately. With dynamic_quorum the solo case lands at quorum=1
-    // (just the producer's signature). Once a real validator set
-    // exists this branch goes away and we always wait on confirm_cv_.
-    //
-    // Bug fix #5: the loop used to set validator_id = cfg.node_id on
-    // every confirmation, but `add_confirmation` rejects duplicates by
-    // validator_id — so only one of the three confirmations actually
-    // landed. Peers receiving the resulting block see 1/3 confirmations
-    // and reject as not-final. We now derive a distinct validator_id
-    // per confirmation by hashing (node_id || index) so the dedup
-    // doesn't kick in.
-    if (network.peer_count() == 0) {
-        auto block_hash_bytes = block.hash();
-        for (uint32_t i = 0; i < quorum; ++i) {
-            Confirmation self_conf;
-            // Derive a distinct validator_id per pass. Format:
-            //   sha256("solo:" || node_id || u32_be(i))
-            // The chain doesn't currently look up validator_ids on a
-            // registry so any unique 32-byte slug is fine here.
-            std::vector<uint8_t> seed;
-            const char* tag = "solo:";
-            seed.insert(seed.end(), tag, tag + std::strlen(tag));
-            seed.insert(seed.end(),
-                        cfg.node_id.begin(), cfg.node_id.end());
-            for (int s = 3; s >= 0; --s)
-                seed.push_back(static_cast<uint8_t>((i >> (8*s)) & 0xFF));
-            self_conf.validator_id = crypto::sha256(seed.data(), seed.size());
-            std::copy(keypair.public_key.begin(), keypair.public_key.end(),
-                      self_conf.pubkey.begin());
-            self_conf.signature = crypto::sign_ecdsa(block_hash_bytes,
-                                                      keypair.private_key);
-            add_confirmation(block_hash_hex, self_conf);
-        }
-        confirmed = true;
-    } else {
-        // Multi-node path: fan the candidate out to validators and wait.
-        // node_main wires `network.set_candidate_publisher(...)` to
-        // RatsLink::publish_block_candidate so this reaches every
-        // validated peer over the same channel that carries routes.get.
-        // Validators run validate_block + duplicate-fingerprint check
-        // and post their signed Confirmation back via the inverse
-        // RatsLink::publish_confirmation; the inbound confirmation
-        // handler installed by node_main feeds add_confirmation, which
-        // notifies confirm_cv_ once REQUIRED_CONFIRMATIONS land.
-        //
-        // Also self-sign one slot so a producer that *is* also a
-        // validator counts itself; without this the producer would need
-        // all 3 confirmations from peers even though it has just signed
-        // the same block. (Equivalent to mining one's own first vote.)
-        {
-            Confirmation self_conf;
-            self_conf.validator_id = cfg.node_id;
-            std::copy(keypair.public_key.begin(), keypair.public_key.end(),
-                      self_conf.pubkey.begin());
-            self_conf.signature = crypto::sign_ecdsa(block.hash(),
-                                                     keypair.private_key);
-            add_confirmation(block_hash_hex, self_conf);
-        }
-
-        network.publish_candidate(block.serialize());
-
-        std::unique_lock<std::mutex> lk(mutex_);
-        confirmed = confirm_cv_.wait_until(lk, deadline, [&] {
-            auto it = candidates_.find(block_hash_hex);
-            return it != candidates_.end() && it->second.is_final();
-        });
-    }
-    if (!confirmed) { err = "Confirmation timeout"; return false; }
-
-    Block final_block = block;
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        auto it = candidates_.find(block_hash_hex);
-        if (it != candidates_.end())
-            final_block.header.confirmations = it->second.received_confirmations;
-    }
-
-    if (!chain.connect_block(final_block)) {
+    if (!chain.connect_block(block)) {
         err = "Chain connect_block rejected";
         return false;
     }
-    // Gossip the new block out — INV broadcast to connected peers
-    // + DHT-announce so multi-source catch-up can find this node.
-    if (announcer_) announcer_(final_block.hash());
 
-    block = final_block; // Caller sees the committed form (with confirmations).
-    uint32_t height = chain.tip().height;
+    // Gossip the new block out — INV broadcast to connected peers +
+    // DHT-announce so multi-source catch-up can find this node.
+    if (announcer_) announcer_(block.hash());
 
+    // Best-effort .blk dump for the operator. Bucket by height/1000 so
+    // no directory holds more than ~1000 files (NTFS degrades around 10M
+    // files in a flat folder). Layout: blocks/00000123/00123456.blk
     try {
-        // Scale: bucket .blk dumps by height/1000 so we never put more
-        // than ~1000 files in any one directory (NTFS performance dies
-        // around 10M files in a flat folder).
+        const uint32_t h = chain.tip().height;
         std::ostringstream sub;
-        sub << std::setw(8) << std::setfill('0') << (height / 1000);
+        sub << std::setw(8) << std::setfill('0') << (h / 1000);
         fs::path blocks_dir = fs::path(cfg.data_dir) / "blocks" / sub.str();
         fs::create_directories(blocks_dir);
         std::ostringstream fname;
-        fname << std::setw(8) << std::setfill('0') << height << ".blk";
+        fname << std::setw(8) << std::setfill('0') << h << ".blk";
         fs::path file_path = blocks_dir / fname.str();
-        auto block_bytes = final_block.serialize();
+        auto block_bytes = block.serialize();
         std::ofstream f(file_path, std::ios::binary);
         f.write(reinterpret_cast<const char*>(block_bytes.data()),
                 block_bytes.size());
     } catch (...) {
         // Non-fatal — block is durable in LevelDB even if the .blk write fails.
     }
-
-    // Bug fix #6: del_pending_tx writes are now folded into the same
-    // leveldb batch as the chain writes inside connect_block, so
-    // there's no more crash window. consumed_txs is now informational
-    // (logging / retries) only.
-    (void)consumed_txs;
-    (void)network; // confirmed-block broadcast lives in network/manager.cpp now
 
     {
         std::lock_guard<std::mutex> lk(producer_mu_);

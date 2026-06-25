@@ -20,32 +20,16 @@ namespace mc::crypto{ struct KeyPair; }
 
 namespace mc {
 
-/// Maximum confirmation quorum the network ever demands. A healthy
-/// network (>=4 reachable validators in addition to self) holds blocks
-/// to MAX_CONFIRMATIONS distinct signatures before final.
-static constexpr uint32_t MAX_CONFIRMATIONS       = 5;
-
-/// Compute the quorum required for a block given the current peer
-/// count seen by the producer. Solo mode (peer_count==0) lands at 1
-/// (just the producer's own signature). With any peer connected we
-/// require 2 sigs (producer + one confirmation) — peer_count here is
-/// the librats validated peer set, which includes DHT-discovered peers
-/// that aren't musicchain validators and won't co-sign. Without the
-/// cap the quorum scaled past the number of actual signing validators
-/// and the producer hung on every block waiting for confirmations
-/// nobody could give. Proper validator-set-driven quorum (count only
-/// peers registered as validators on chain) layers on top later.
-inline uint32_t dynamic_quorum(size_t peer_count) {
-    if (peer_count == 0) return 1;
-    return 2;
-}
-
-static constexpr uint32_t BLOCK_TIMEOUT_SECONDS   = 300;
+// Model 1 (vote-free deterministic consensus): there is NO confirmation
+// quorum. Blocks are not voted on — every node re-derives validity from
+// content + history and the network converges on the heaviest valid
+// chain (see docs/BLOCKCHAIN_AND_NETWORK_INTERNALS.md §22). The old
+// MAX_CONFIRMATIONS / dynamic_quorum(peer_count) / BLOCK_TIMEOUT_SECONDS
+// machinery and the BlockCandidate confirmation tracker were removed.
 
 // If no song-bearing block lands within this window, the chain produces
 // a heartbeat block carrying only the pending tx mempool — the empty-
-// fingerprint case from the whitepaper §11.2. 5 min matches the user's
-// spec.
+// fingerprint case. 5 min matches the spec.
 static constexpr uint32_t HEARTBEAT_INTERVAL_MS   = 5 * 60 * 1000;
 
 // PendingUpload + the upload pipeline were removed when the full node
@@ -77,33 +61,10 @@ struct PendingRegistration {
     uint8_t                   retries          = 0;
 };
 
-struct BlockCandidate {
-    Block                       block;
-    std::vector<Confirmation>   received_confirmations;
-    uint64_t                    created_at_ms;
-    /// Confirmation quorum required for is_final(). Producer sets this
-    /// from `dynamic_quorum(network.peer_count())` at mint time so the
-    /// wait predicate fires the moment the smallest network-appropriate
-    /// quorum lands. Defaults to MAX_CONFIRMATIONS so a candidate
-    /// missing this field (deserialized from an older format) never
-    /// becomes prematurely final.
-    uint32_t                    required_quorum = MAX_CONFIRMATIONS;
-
-    bool is_expired() const;
-    bool is_final()   const { return received_confirmations.size() >= required_quorum; }
-};
-
 class CandidateManager {
 public:
     CandidateManager()  = default;
     ~CandidateManager() { stop(); }
-
-    // ---- Candidate tracking ----
-    void add_candidate(const std::string& candidate_hash, BlockCandidate candidate);
-    bool add_confirmation(const std::string& candidate_hash, const Confirmation& conf);
-    std::optional<BlockCandidate> get_candidate(const std::string& hash) const;
-    void cleanup_expired();
-    std::vector<std::pair<std::string, BlockCandidate>> get_all() const;
 
     // ---- Block producer lifecycle ----
     void start(Chain& chain, Database& db,
@@ -138,10 +99,6 @@ public:
 private:
     BlockAnnouncer announcer_;
 
-    mutable std::mutex                               mutex_;
-    std::unordered_map<std::string, BlockCandidate>  candidates_;
-    std::condition_variable                          confirm_cv_;
-
     // Heartbeat producer state. last_block_at_ms_ guarded by producer_mu_.
     mutable std::mutex                               producer_mu_;
     std::condition_variable                          heartbeat_cv_;
@@ -160,10 +117,12 @@ private:
     mutable std::mutex                               regs_mutex_;
     std::queue<PendingRegistration>                  pending_regs_;
 
-    /// Finalize `block`: register as candidate, gather confirmations
-    /// (self-sign in solo mode), connect to chain, write the .blk file,
-    /// drain `consumed_txs` from the mempool. Returns true on success,
-    /// populates `err` on failure.
+    /// Finalize `block` (Model 1, vote-free): validate + connect to the
+    /// chain, announce it to the mesh, write the .blk file. No
+    /// confirmation gathering — connect_block is the deterministic
+    /// authority and every peer re-derives validity independently.
+    /// `consumed_txs` is informational (the mempool drain is folded into
+    /// connect_block's batch). Returns true on success, populates `err`.
     bool commit_block(Block& block,
                       Chain& chain, Database& db,
                       net::NetworkManager& network,

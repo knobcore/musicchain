@@ -141,3 +141,9 @@ musicchain_player/android/.kotlin/
 # --------------------------------------------------------------------
 musicchain/scripts/_visible-vps-*.sh
 musicchain/scripts/deploy-vps.sh
+
+# Root-level runtime/node state (never commit)
+/config.json
+/dht_routing_*.json
+/peers.rats
+/peers_ever.rats

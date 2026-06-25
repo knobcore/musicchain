@@ -130,6 +130,9 @@ class WalletService {
   // Sign data, returns hex signature
   String sign(Uint8List data) {
     if (_walletHandle == null) throw Exception('No wallet loaded');
+    // Never hand the native signer a zero-length buffer — some signers
+    // touch data[0] and would over-read a 0-byte allocation (native SIGSEGV).
+    if (data.isEmpty) throw Exception('sign: empty data');
     final dataPtr = malloc.allocate<Uint8>(data.length);
     dataPtr.asTypedList(data.length).setAll(0, data);
     final sigPtr = NativeLibrary.bindings
@@ -155,6 +158,16 @@ class WalletService {
     if (_walletHandle == null) return;
     final addrPtr   = NativeLibrary.bindings.mc_wallet_get_address(_walletHandle!);
     final pubkeyPtr = NativeLibrary.bindings.mc_wallet_get_public_key(_walletHandle!);
+
+    // NULL-check BEFORE toDartString — on a null return toDartString() walks
+    // memory from address 0 hunting a NUL terminator → native SIGSEGV (a
+    // frequent Android crash). Free whichever pointer is non-null and bail
+    // (leave _cachedInfo as-is) rather than dereferencing 0x0. Mirrors sign().
+    if (addrPtr == nullptr || pubkeyPtr == nullptr) {
+      if (addrPtr   != nullptr) NativeLibrary.bindings.mc_free(addrPtr.cast());
+      if (pubkeyPtr != nullptr) NativeLibrary.bindings.mc_free(pubkeyPtr.cast());
+      return;
+    }
 
     final addr   = addrPtr.cast<Utf8>().toDartString();
     final pubkey = pubkeyPtr.cast<Utf8>().toDartString();

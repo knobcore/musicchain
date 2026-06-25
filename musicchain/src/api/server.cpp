@@ -1005,6 +1005,7 @@ std::pair<int, std::string> HttpServer::post_transfer(const std::string& body) {
         std::string amount_str   = j["amount"];
         uint64_t    nonce        = j["nonce"].get<uint64_t>();
         std::string sig_hex      = j["signature"];
+        std::string pub_hex      = j.value("from_pubkey", std::string());
 
         Address from_addr, to_addr;
         if (!crypto::parse_address_checksummed(from_hex_str, from_addr))
@@ -1020,11 +1021,18 @@ std::pair<int, std::string> HttpServer::post_transfer(const std::string& body) {
         if (sig_bytes.size() != 64)
             return {400, R"({"error":"bad signature"})"};
 
+        // from_pubkey is required now that verify_signature cross-checks
+        // the inline pubkey against from_address (no ECDSA recovery).
+        auto pub_bytes = crypto::from_hex(pub_hex);
+        if (pub_bytes.size() != 33)
+            return {400, R"({"error":"bad from_pubkey"})"};
+
         TransferTx tx;
         tx.from_address = from_addr;
         tx.to_address   = to_addr;
         tx.amount       = amount;
         tx.nonce        = nonce;
+        std::copy(pub_bytes.begin(), pub_bytes.end(), tx.from_pubkey.begin());
         std::copy(sig_bytes.begin(), sig_bytes.end(), tx.signature.begin());
 
         leveldb::WriteBatch batch;

@@ -17,6 +17,7 @@ std::vector<uint8_t> TransferTx::sign_message() const {
     msg.insert(msg.end(), to_address.begin(), to_address.end());
     write_u64le(msg, amount);
     write_u64le(msg, nonce);
+    write_bytes(msg, from_pubkey.data(), 33);
     return msg;
 }
 
@@ -27,6 +28,7 @@ std::vector<uint8_t> TransferTx::serialize() const {
     write_bytes(buf, to_address.data(), 20);
     write_u64le(buf, amount);
     write_u64le(buf, nonce);
+    write_bytes(buf, from_pubkey.data(), 33);
     write_bytes(buf, signature.data(), 64);
     return buf;
 }
@@ -40,6 +42,7 @@ bool TransferTx::deserialize(const uint8_t* data, size_t len, TransferTx& out) {
     if (!read_bytes(p, end, out.to_address.data(), 20)) return false;
     if (!read_u64le(p, end, out.amount)) return false;
     if (!read_u64le(p, end, out.nonce)) return false;
+    if (!read_bytes(p, end, out.from_pubkey.data(), 33)) return false;
     if (!read_bytes(p, end, out.signature.data(), 64)) return false;
     return true;
 }
@@ -52,10 +55,16 @@ Hash256 TransferTx::tx_hash() const {
 bool TransferTx::verify_signature() const {
     auto msg  = sign_message();
     auto hash = crypto::sha256(msg.data(), msg.size());
-    // Derive pubkey from from_address for verification
-    // For simplicity the from_address is derived as last 20 bytes of sha256(pubkey)
-    // Full ECDSA verification is in crypto::verify_ecdsa
-    return crypto::verify_ecdsa_from_address(hash, signature, from_address);
+    // Cross-check the inline pubkey actually hashes to from_address —
+    // closes the door on a tx signed against a pubkey unrelated to the
+    // account it debits — then verify the ECDSA signature against it.
+    // This replaces the old verify_ecdsa_from_address path, which was a
+    // stub that always returned false (ECDSA pubkey recovery isn't
+    // available in the OpenSSL-only crypto layer), making every transfer
+    // unmineable. Same inline-pubkey pattern as every other signed tx.
+    Address derived = crypto::address_from_pubkey(from_pubkey);
+    if (std::memcmp(derived.data(), from_address.data(), 20) != 0) return false;
+    return crypto::verify_ecdsa(hash, signature, from_pubkey);
 }
 
 // ---- PlayProof ------------------------------------------------------

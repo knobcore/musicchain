@@ -11,6 +11,7 @@
 #include "../audio/ogg_decoder.h"
 #include "../audio/fingerprint.h"
 #include "../core/block.h"
+#include "../util/hw_fingerprint.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -111,6 +112,22 @@ char* mc_wallet_sign(mc_wallet_t wallet, const uint8_t* data, size_t len) {
         auto* w = static_cast<WalletHandle*>(wallet);
         auto sig = mc::crypto::sign_data(data, len, w->kp.private_key);
         return make_cstring(mc::crypto::to_hex(sig.data(), 64));
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+// ---- Device fingerprint (#5 structural attestation) -----------------
+
+char* mc_device_fingerprint(void) {
+    try {
+        const std::string fp = mc::util::device_fingerprint_hex();
+        if (fp.empty()) {
+            set_error("no hardware identifier readable");
+            return nullptr;
+        }
+        return make_cstring(fp);
     } catch (const std::exception& e) {
         set_error(e.what());
         return nullptr;

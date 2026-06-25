@@ -52,7 +52,9 @@ class Song {
       return 0;
     }
     return Song(
-      contentHash:       json['content_hash']     as String,
+      // (#crash) never hard-cast: one bad/missing field would TypeError and
+      // abort decoding the WHOLE songs list. content_hash empty → caller skips.
+      contentHash:       json['content_hash']     as String? ?? '',
       fingerprintHash:   json['fingerprint_hash'] as String? ?? '',
       title:             json['title']            as String? ?? '',
       artist:            json['artist']           as String? ?? '',
@@ -65,7 +67,7 @@ class Song {
       swarmSize:         _i(json['swarm_size']),
       discovererAddress: json['discoverer'] as String?,
       blockHash:         json['block_hash'] as String?,
-      blockHeight:       json['block_height'] as int?,
+      blockHeight:       json['block_height'] == null ? null : _i(json['block_height']),
     );
   }
 

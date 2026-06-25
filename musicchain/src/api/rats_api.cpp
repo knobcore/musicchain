@@ -1,9 +1,11 @@
 #include "rats_api.h"
 #include "server.h"
+#include "device_attestation.h"   // DeviceAttestationVerifier (#5)
 #include "../audio/fingerprint.h"
 #include "../moderation/mod_action.h"
 #include "../util/traffic.h"
 #include "../sync/block_propagator.h"
+#include "../sync/deep_audit.h"   // audit_content + AuditResult for forgery re-audit (#4)
 #include "../net/relay_credit_tracker.h"
 #include "../core/transaction.h"
 
@@ -21,6 +23,7 @@
 
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
+#include <openssl/rand.h>   // RAND_bytes for delivery_id (#10)
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -174,12 +177,13 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
 
 namespace {
 
-// 20-byte SHA-1 over arbitrary bytes, hex-encoded — used to derive a
-// BEP-5 DHT key from a 32-byte canonical content_hash so the full node
-// can `rats_announce_for_hash` itself as a seeder/tracker for the song.
-// Players locate seeders with `rats_find_peers` over the same 20-byte
-// key on their side.
-std::string dht_key_for_content_hash(const Hash256& content_hash) {
+// 20-byte SHA-1 over arbitrary bytes, hex-encoded — BEP-5 DHT key from a
+// 32-byte canonical content_hash. The player derives the same key (via
+// SwarmRegistry.dhtKeyFor) to announce/find content holders. Retained
+// [[maybe_unused]] now that the full node no longer self-announces (DHT
+// un-nerf P1), in case the tracker role is revived behind a real handler.
+[[maybe_unused]] static std::string dht_key_for_content_hash(
+    const Hash256& content_hash) {
     unsigned char out[SHA_DIGEST_LENGTH];
     SHA1(content_hash.data(), content_hash.size(), out);
     std::ostringstream os;
@@ -434,6 +438,18 @@ void RatsApi::handle_request(const std::string& peer_id,
         }
         // ---- session control --------------------------------------------
         else if (type == "session.start") {
+            // #5 attestation (record-only on the realtime path): derive a
+            // device_id from the attested device_key and record its level so
+            // the per-device picture covers live sessions, not just offline
+            // bundles. AcceptAll never rejects; a real verifier would gate
+            // here with no client change. player_address is the fallback key.
+            {
+                static AcceptAllVerifier g_attest_live;
+                AttestationResult att = g_attest_live.verify(
+                    in.value("attestation", json::object()),
+                    std::string(), in.value("player_address", std::string()));
+                record_attestation_level(att.device_id, att.level);
+            }
             reply = wrap_handler_result(req_id,
                 http_.verb_session_start(in.dump()));
         } else if (type == "session.heartbeat") {
@@ -492,6 +508,10 @@ void RatsApi::handle_request(const std::string& peer_id,
                          {"status", "unknown"},
                          {"error",  "song not on chain"}};
             } else {
+                // #10 triangulation: mint a delivery_id + pending-delivery
+                // row (this node is the broker), returned so the player
+                // threads it through the relay and reports receipt.
+                const std::string did_hex = mint_delivery(ch);
                 auto members = swarm_.members(ch);
                 if (members.empty()) {
                     reply = {{"req_id", req_id},
@@ -500,6 +520,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                                  {"content_hash", hash},
                                  {"peers",        nlohmann::json::array()},
                                  {"source",       "no_swarm"},
+                                 {"delivery_id",  did_hex},
                              }}};
                 } else {
                     // Variant-aware peers list. Each entry carries the
@@ -525,9 +546,23 @@ void RatsApi::handle_request(const std::string& peer_id,
                                  {"content_hash", hash},
                                  {"peers",        peers_j},
                                  {"source",       "swarm"},
+                                 {"delivery_id",  did_hex},
                              }}};
                 }
             }
+        }
+        // ---- #10 relay-reward triangulation: mini-node report -----------
+        // Mini → broker. The mini-node reports how many bytes it relayed for
+        // a delivery_id. We credit only on three-way corroboration (broker
+        // brokered it + mini reported + player receipted), per-byte.
+        else if (type == "relay.report") {
+            const std::string ok = handle_relay_report(in) ? "ok" : "ignored";
+            reply = {{"req_id", req_id}, {"status", ok}, {"body", json::object()}};
+        }
+        // ---- #10 relay-reward triangulation: player receipt -------------
+        else if (type == "relay.receipt") {
+            const std::string ok = handle_relay_receipt(in) ? "ok" : "ignored";
+            reply = {{"req_id", req_id}, {"status", ok}, {"body", json::object()}};
         }
         // ---- swarm announcement -----------------------------------------
         // The player computes a fingerprint locally, submits it here.
@@ -679,21 +714,16 @@ void RatsApi::handle_request(const std::string& peer_id,
                     member.audio_format = audio_format_from_string(
                         in.value("audio_format", std::string("ogg")));
                     swarm_.announce(*match, member);
-                    // DHT seeder announce: make this full node
-                    // discoverable as a tracker for the canonical
-                    // content_hash so the player's rats_find_peers
-                    // probe (BEP-5, 20-byte SHA-1 key) returns us as
-                    // a peer for the song. librats dedupes repeated
-                    // announces internally — safe to call on every
-                    // submit.
-                    if (client_) {
-                        const std::string dht_key =
-                            dht_key_for_content_hash(*match);
-                        rats_announce_for_hash(
-                            client_, dht_key.c_str(),
-                            static_cast<int>(config_.rats_port),
-                            nullptr, nullptr);
-                    }
+                    // (DHT un-nerf P1) The full node no longer announces
+                    // ITSELF as a DHT seeder for the content_hash. Post-pivot
+                    // it holds no audio bytes, and the player's DHT-discovery
+                    // path now dials DHT results as audio.piece_get byte
+                    // sources — so a self-announce just lures consumers into
+                    // dialing a node that serves nothing (wasted attempt +
+                    // ban). The full node is already reachable as a swarm
+                    // tracker via the VPS bootstrap + routes.get, so the DHT
+                    // tracker role is redundant. Only players that actually
+                    // hold the bytes announce (SwarmRegistry.announceOnly).
                     reply = {{"req_id", req_id},
                              {"status", "ok"},
                              {"body", {
@@ -779,18 +809,9 @@ void RatsApi::handle_request(const std::string& peer_id,
                         self_member.bitrate      = reg_bitrate;
                         self_member.audio_format = reg_format;
                         swarm_.announce(ch, self_member);
-                        // DHT seeder announce for the new-song path —
-                        // same key derivation as the matched branch so
-                        // future find_peers probes for this canonical
-                        // content_hash land on us.
-                        if (client_) {
-                            const std::string dht_key =
-                                dht_key_for_content_hash(ch);
-                            rats_announce_for_hash(
-                                client_, dht_key.c_str(),
-                                static_cast<int>(config_.rats_port),
-                                nullptr, nullptr);
-                        }
+                        // (DHT un-nerf P1) full node no longer self-announces
+                        // as a DHT seeder — see the matched-branch note above.
+                        // It holds no bytes; only the holding player announces.
                         reply = {{"req_id", req_id},
                                  {"status", "ok"},
                                  {"body", {
@@ -1297,76 +1318,239 @@ void RatsApi::handle_request(const std::string& peer_id,
                 return;
             }
 
-            // ---- 2. replay protection --------------------------------
-            // TODO(offline_play_proof): persist used (player_address,
-            //   bundle_nonce) pairs to leveldb so cross-restart replay
-            //   is rejected. For now keep an in-process set so at least
-            //   same-uptime replays bounce.
+            // ---- 2. replay protection (cross-restart, persisted) ------
+            // A replayed bundle is byte-identical, so its 64-byte
+            // signature is a stable unique key. Persist "obp:<sig_hex>"
+            // to leveldb so the same bundle can't be credited twice,
+            // surviving full-node restarts. (Per-session `u:` markers in
+            // the credit pipeline also defend double-credit; this rejects
+            // the whole bundle up front and closes the old TODO gap.)
+            const std::string replay_key = "obp:" + sig_hex;
+            if (db_.get(replay_key).has_value()) {
+                reply = {{"req_id", req_id}, {"status", "rejected"},
+                         {"error",  "bundle already submitted (replay)"}};
+                send_reply(peer_id, reply.dump());
+                return;
+            }
             (void)nonce_hex;
             (void)created_at_ms;
 
-            // ---- 3. bot-detection heuristics (stubbed) ---------------
-            // Each heuristic returns true when the bundle looks
-            // plausibly real; false adds the rule name to
-            // `flagged_patterns` and (once thresholds land) trips the
-            // bundle into "rejected" status. Currently all return true
-            // so the credit pipeline is exercisable end-to-end.
+            const std::string addr_hex = crypto::to_hex(player_addr.data(), 20);
+
+            // ---- 2b. device attestation (#5, Axis-A) -----------------
+            // Default verifier accepts and derives a stable device_id from
+            // the attested device_key (or the legacy device_id field). A
+            // real hardware verifier (Play Integrity / App Attest / TPM)
+            // swaps in here with NO downstream change — the device_id it
+            // returns is what DeviceIDChurn and the per-device history key
+            // on, automatically tightening from a forgeable id to a
+            // hardware-bound one. See device_attestation.h.
+            static AcceptAllVerifier g_attest;
+            AttestationResult att = g_attest.verify(
+                in.value("attestation", json::object()),
+                in.value("device_id", std::string()), addr_hex);
+            if (!att.ok) {
+                reply = {{"req_id", req_id}, {"status", "rejected"},
+                         {"error", "device attestation failed: " + att.reason}};
+                send_reply(peer_id, reply.dump());
+                return;
+            }
+            record_attestation_level(att.device_id, att.level);  // #5 record
+
+            // ---- 3. bot-detection heuristics -------------------------
+            // Real deterministic checks over the bundle. HARD rules (high
+            // confidence) reject the whole bundle; SOFT rules (noisy /
+            // proxy / client-stubbed signals) only annotate
+            // flagged_patterns. See docs §22.6 and the offline_play_proof
+            // spec. Inputs are parsed defensively — fields absent or
+            // stubbed to a sentinel cause the relevant rule to no-op, so
+            // an honest bundle is never falsely rejected.
             std::vector<std::string> flagged_patterns;
-            auto heuristic = [&](const char* name, bool ok) {
-                if (!ok) flagged_patterns.emplace_back(name);
-            };
+            bool bot_reject = false;
+            auto soft_flag = [&](const char* n){ flagged_patterns.emplace_back(n); };
+            auto hard_flag = [&](const char* n){ flagged_patterns.emplace_back(n); bot_reject = true; };
 
-            // TODO(offline_play_proof): PerfectIntervalHeartbeats —
-            //   σ of inter-heartbeat gaps < 50 ms over 30+ beats means
-            //   the bot used a tight loop instead of real playback.
-            heuristic("PerfectIntervalHeartbeats", /*plausible=*/true);
+            const auto& h_sessions   = in.value("sessions", json::array());
+            const uint64_t wall_base = in.value("wall_base_ms", (uint64_t)0);
+            const std::string device_id_hex = att.device_id;  // attested (or fallback) id
+            constexpr uint64_t k1h = 60ULL*60*1000, k4h = 4*k1h;
 
-            // TODO(offline_play_proof): MonotonicClockJumps — within
-            //   each session, monotonic_ms must be non-decreasing and
-            //   correlate with wall_ms (±2 s slop). Reject any session
-            //   where the delta lies outside that envelope.
-            heuristic("MonotonicClockJumps", true);
+            // Bundle wall span across all sessions (for the span-based rules).
+            uint64_t span_lo = UINT64_MAX, span_hi = 0;
+            for (const auto& s : h_sessions) {
+                if (!s.is_object()) continue;
+                uint64_t sw = s.value("started_wall_ms", (uint64_t)0);
+                uint64_t ew = s.value("ended_wall_ms",   (uint64_t)0);
+                if (sw && sw < span_lo) span_lo = sw;
+                if (ew > span_hi)       span_hi = ew;
+            }
+            if (wall_base && wall_base < span_lo) span_lo = wall_base;
+            const uint64_t bundle_span =
+                (span_hi > span_lo && span_lo != UINT64_MAX) ? span_hi - span_lo : 0;
 
-            // TODO(offline_play_proof): StaticBSSIDLongSession —
-            //   4 h+ "cellular" span with a single cell_id is a strong
-            //   forgery signal. Real cell handoff happens every 10-30
-            //   min when stationary, every 1-2 min in transit.
-            heuristic("StaticBSSIDLongSession", true);
+            // (1) PerfectIntervalHeartbeats, (2) MonotonicClockJumps,
+            // (3) HeartbeatDensityTooHigh — per-session timing.
+            for (const auto& s : h_sessions) {
+                if (!s.is_object()) continue;
+                const auto& beats = s.value("heartbeats", json::array());
+                std::vector<uint64_t> wall, mono;
+                for (const auto& b : beats) {
+                    if (!b.is_object()) continue;
+                    wall.push_back(b.value("wall_ms",      (uint64_t)0));
+                    mono.push_back(b.value("monotonic_ms", (uint64_t)0));
+                }
+                // (2) monotonic non-decreasing AND tracks wall within ±2 s.
+                for (size_t i = 1; i < mono.size(); ++i) {
+                    if (mono[i] < mono[i-1]) { hard_flag("MonotonicClockJumps"); break; }
+                    long long dmono = (long long)mono[i] - (long long)mono[0];
+                    long long dwall = (long long)wall[i] - (long long)wall[0];
+                    long long diff  = dmono - dwall; if (diff < 0) diff = -diff;
+                    if (diff > 2000) { hard_flag("MonotonicClockJumps"); break; }
+                }
+                // (1) perfect intervals: gap variance < 2500 (=50ms σ) over
+                //     >=30 beats, on BOTH clocks (wall is user-controllable).
+                auto gap_var = [](const std::vector<uint64_t>& v)->double{
+                    if (v.size() < 2) return 1e18;
+                    double m = 0; size_t n = v.size()-1;
+                    for (size_t i=1;i<v.size();++i) m += (double)v[i]-(double)v[i-1];
+                    m /= n;
+                    double s2 = 0;
+                    for (size_t i=1;i<v.size();++i){ double g=(double)v[i]-(double)v[i-1]; s2+=(g-m)*(g-m);}
+                    return s2 / n;
+                };
+                if (mono.size() >= 30 && gap_var(mono) < 2500.0 && gap_var(wall) < 2500.0)
+                    hard_flag("PerfectIntervalHeartbeats");
+                // (3) density: heartbeats per song-second > 12.
+                uint64_t dur = s.value("song_duration_ms", (uint64_t)0);
+                if (dur == 0) {
+                    uint64_t sw = s.value("started_wall_ms",(uint64_t)0);
+                    uint64_t ew = s.value("ended_wall_ms",  (uint64_t)0);
+                    dur = (ew > sw) ? ew - sw : 0;
+                }
+                if (dur > 0) {
+                    if ((double)beats.size() / (dur/1000.0) > 12.0)
+                        hard_flag("HeartbeatDensityTooHigh");
+                } else if (beats.size() > 1) {
+                    hard_flag("HeartbeatDensityTooHigh");
+                }
+            }
 
-            // TODO(offline_play_proof): BatteryFlatline — battery_%
-            //   slope of zero across hours of active playback is
-            //   physically implausible for a phone playing audio.
-            heuristic("BatteryFlatline", true);
+            // (4) ImplausibleSessionConcurrency: different content_hashes
+            //     overlapping in monotonic time within one bundle (>2 s).
+            {
+                struct Iv { uint64_t lo, hi; std::string ch; };
+                std::vector<Iv> ivs;
+                for (const auto& s : h_sessions) {
+                    if (!s.is_object()) continue;
+                    uint64_t lo = s.value("started_monotonic_ms",(uint64_t)0);
+                    uint64_t hi = s.value("ended_monotonic_ms",  (uint64_t)0);
+                    if (hi > lo) ivs.push_back({lo, hi, s.value("content_hash",std::string())});
+                }
+                std::sort(ivs.begin(), ivs.end(),
+                          [](const Iv& a, const Iv& b){ return a.lo < b.lo; });
+                // Compare each interval against the running max-hi over ALL
+                // earlier intervals (not just the predecessor), so a long
+                // session containing several shorter ones can't be evaded
+                // by interleaving start times.
+                uint64_t max_hi = 0; std::string max_ch;
+                for (size_t i = 0; i < ivs.size(); ++i) {
+                    if (i > 0 && ivs[i].lo + 2000 < max_hi && ivs[i].ch != max_ch) {
+                        hard_flag("ImplausibleSessionConcurrency"); break;
+                    }
+                    if (ivs[i].hi > max_hi) { max_hi = ivs[i].hi; max_ch = ivs[i].ch; }
+                }
+            }
 
-            // TODO(offline_play_proof): ScreenAlwaysOn — screen on for
-            //   the full bundle window is suspicious; so is screen
-            //   never on. Real listeners lock and unlock.
-            heuristic("ScreenAlwaysOn", true);
+            // (5) NoNetworkTransitions (SOFT): >=4 h span, zero transitions.
+            if (bundle_span >= k4h && in.value("network_transitions", json::array()).empty())
+                soft_flag("NoNetworkTransitions");
 
-            // TODO(offline_play_proof): NoNetworkTransitions — long
-            //   offline span (hours) with zero transitions logged is
-            //   incompatible with a real device's radio behaviour.
-            heuristic("NoNetworkTransitions", true);
+            // (6) ScreenAlwaysOn (SOFT, proxy signal — log only).
+            {
+                uint64_t on_ms = 0;
+                for (const auto& iv : in.value("screen_intervals", json::array())) {
+                    if (!iv.is_object()) continue;
+                    uint64_t on = iv.value("on_wall_ms",(uint64_t)0);
+                    uint64_t off= iv.value("off_wall_ms",(uint64_t)0);
+                    if (off > on) on_ms += off - on;
+                }
+                if (bundle_span >= k4h) {
+                    if (on_ms*100 >= bundle_span*98) soft_flag("ScreenAlwaysOn");
+                    else if (on_ms == 0 && !h_sessions.empty()) soft_flag("ScreenAlwaysOn");
+                }
+            }
 
-            // TODO(offline_play_proof): HeartbeatDensityTooHigh — > 12
-            //   heartbeats per song-second is over-densification meant
-            //   to game the union-of-ranges integration.
-            heuristic("HeartbeatDensityTooHigh", true);
+            // (7) BatteryFlatline (SOFT; skips on the -1 sentinel the client
+            //     ships today — no false positives until real battery lands).
+            {
+                std::vector<int> pcts; bool any_charging = false;
+                for (const auto& b : in.value("battery_samples", json::array())) {
+                    if (!b.is_object()) continue;
+                    int p = b.value("percent", -1);
+                    if (b.value("charging", false)) any_charging = true;
+                    if (p >= 0) pcts.push_back(p);
+                }
+                if (pcts.size() >= 4 && !any_charging && bundle_span >= 2*k1h) {
+                    int lo = pcts[0], hi = pcts[0];
+                    for (int p : pcts) { lo = std::min(lo,p); hi = std::max(hi,p); }
+                    if (hi == lo) soft_flag("BatteryFlatline");
+                }
+            }
 
-            // TODO(offline_play_proof): ImplausibleSessionConcurrency —
-            //   overlapping sessions for different content_hashes on
-            //   the same device. A phone plays one song at a time.
-            heuristic("ImplausibleSessionConcurrency", true);
+            // (8) StaticBSSIDLongSession (SOFT; skips on empty fingerprints
+            //     the client ships today).
+            {
+                bool any_fp = false, any_handoff = false;
+                for (const auto& t : in.value("network_transitions", json::array())) {
+                    if (!t.is_object()) continue;
+                    if (!t.value("fingerprint", std::string()).empty()) any_fp = true;
+                    std::string k = t.value("kind", std::string());
+                    if (k == "cell_handoff" || k == "wifi_roam") any_handoff = true;
+                }
+                if (any_fp && bundle_span >= k4h && !any_handoff)
+                    soft_flag("StaticBSSIDLongSession");
+            }
 
-            // TODO(offline_play_proof): DeviceIDChurn — same
-            //   player_address bundling many distinct device_ids per
-            //   day. Real users have 1-3 devices.
-            heuristic("DeviceIDChurn", true);
+            // (9) DeviceIDChurn + (10) WalletAgeVsPlayVolume — need a rolling
+            //     24 h per-address history persisted under obp:hist:<addr>.
+            {
+                const uint64_t now_ms = (uint64_t)std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                const uint64_t k24h = 24*k1h;
+                json hist = json::array();
+                if (auto raw = db_.get("obp:hist:" + addr_hex)) {
+                    hist = json::parse(std::string(raw->begin(), raw->end()),
+                                       nullptr, /*allow_exceptions=*/false);
+                    if (!hist.is_array()) hist = json::array();
+                }
+                std::unordered_set<std::string> devs;
+                uint64_t sessions_24h = 0;
+                for (const auto& e : hist) {
+                    if (!e.is_object()) continue;
+                    uint64_t ts = e.value("ts",(uint64_t)0);
+                    if (now_ms > ts && now_ms - ts > k24h) continue;  // prune >24 h
+                    devs.insert(e.value("dev", std::string()));
+                    sessions_24h += e.value("n",(uint64_t)0);
+                }
+                if (!device_id_hex.empty()) devs.insert(device_id_hex);
+                sessions_24h += h_sessions.size();
+                if (devs.size() > 3) hard_flag("DeviceIDChurn");
+                const bool fresh_wallet = db_.get_nonce(player_addr) == 0
+                                       && db_.get_balance(player_addr) == 0
+                                       && hist.empty();
+                if (fresh_wallet && sessions_24h > 200) hard_flag("WalletAgeVsPlayVolume");
+            }
 
-            // TODO(offline_play_proof): WalletAgeVsPlayVolume — fresh
-            //   wallet (no on-chain history) submitting hundreds of
-            //   plays/day. Common farming signature.
-            heuristic("WalletAgeVsPlayVolume", true);
+            if (bot_reject) {
+                std::cout << "[rats-api] offline.play_proof.submit REJECTED (bot) from "
+                          << addr_hex.substr(0,12) << " flags=" << flagged_patterns.size() << "\n";
+                reply = {{"req_id", req_id}, {"status", "rejected"},
+                         {"error", "bot heuristics flagged"},
+                         {"flagged_patterns", flagged_patterns}};
+                send_reply(peer_id, reply.dump());
+                return;
+            }
 
             // ---- 4. credit pipeline ---------------------------------
             // For each session in the bundle, replay
@@ -1471,6 +1655,40 @@ void RatsApi::handle_request(const std::string& peer_id,
                     {"mint",              complete_reply},
                 });
             }
+            // Persist the replay marker now that the bundle is processed,
+            // so a resubmit is rejected. Only mark when at least one
+            // session credited, so a fully-failed bundle (e.g. transient
+            // session_start failure) can be legitimately retried.
+            if (!accepted_arr.empty()) {
+                db_.put(replay_key, std::vector<uint8_t>{1});
+                // Append this bundle to the per-address rolling history that
+                // DeviceIDChurn / WalletAgeVsPlayVolume read (#5). Prune
+                // entries older than 24 h so the record stays bounded.
+                const uint64_t now_ms = (uint64_t)std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                const std::string hist_key = "obp:hist:" + addr_hex;
+                json hist = json::array();
+                if (auto raw = db_.get(hist_key)) {
+                    hist = json::parse(std::string(raw->begin(), raw->end()),
+                                       nullptr, false);
+                    if (!hist.is_array()) hist = json::array();
+                }
+                json pruned = json::array();
+                for (const auto& e : hist) {
+                    if (!e.is_object()) continue;
+                    uint64_t ts = e.value("ts",(uint64_t)0);
+                    if (now_ms > ts && now_ms - ts > 24ULL*60*60*1000) continue;
+                    pruned.push_back(e);
+                }
+                // Store SUBMITTED session count (h_sessions), matching what
+                // the WalletAgeVsPlayVolume heuristic adds for the current
+                // bundle — so historical and current counts use one metric.
+                pruned.push_back({ {"ts", now_ms}, {"dev", device_id_hex},
+                                   {"n", (uint64_t)h_sessions.size()} });
+                const std::string blob = pruned.dump();
+                db_.put(hist_key, std::vector<uint8_t>(blob.begin(), blob.end()));
+            }
             reply = {{"req_id", req_id}, {"status", "ok"},
                      {"body", {
                          {"accepted",         accepted_arr},
@@ -1495,31 +1713,12 @@ void RatsApi::handle_request(const std::string& peer_id,
                  {"error",  e.what()}};
     }
 
-    // Relay credit accounting. Only counts binary-traffic verbs that
-    // the mini-node tunneled on our behalf — stream.open today, future
-    // additions go in the verb check below alongside it. Skipped when:
-    //   * the request wasn't relayed (originator_peer_id is empty)
-    //   * the dispatch failed (status != "ok")
-    //   * we don't know the mini-node's wallet yet (mini.hello hasn't
-    //     landed for this peer, or it was a non-mini full-node/player)
-    if (relay_tracker_ && (type == "stream.open")) {
-        const std::string origin = env.value("originator_peer_id",
-                                              std::string());
-        const std::string status = reply.value("status", std::string());
-        if (!origin.empty() && status == "ok") {
-            Address mini_addr{};
-            bool have_wallet = false;
-            {
-                std::lock_guard<std::mutex> lk(peer_to_wallet_mu_);
-                auto it = peer_to_wallet_.find(peer_id);
-                if (it != peer_to_wallet_.end()) {
-                    mini_addr   = it->second;
-                    have_wallet = true;
-                }
-            }
-            if (have_wallet) relay_tracker_->increment(mini_addr, 1);
-        }
-    }
+    // (#10) Relay crediting moved OUT of here. The old per-stream.open
+    // `increment(mini, 1)` was unverifiable (the full node never sees a
+    // relayed byte) and per-stream not per-byte. Credit now happens only
+    // in try_corroborate(), when the broker's pending-delivery row, the
+    // mini's signed relay.report, and the player's signed relay.receipt
+    // all agree — per corroborated byte. See handle_relay_report/receipt.
 
     send_reply(peer_id, reply.dump());
 }
@@ -1580,6 +1779,15 @@ void RatsApi::handle_mod_envelope(const std::string& peer_id,
         return;
     }
 
+    // Forgery reports (#4) ride the same envelope/log/replay machinery but
+    // are node-signed (not moderator-gated) and handled with K-quorum +
+    // re-audit instead of a direct db mutation. Branch before the
+    // moderator-gated path below.
+    if (env.action == "forgery_report") {
+        handle_forgery_report(peer_id, payload_json, env, broadcast_if_new);
+        return;
+    }
+
     // Dedup BEFORE expensive verify so a re-broadcast storm bounces off
     // every node after first hop.
     if (db_.mod_log_has_sig(env.sig_hex)) return;
@@ -1626,6 +1834,253 @@ bool RatsApi::publish_mod_action(const std::string&         action,
 
     if (client_) rats_broadcast_string(client_, payload.c_str());
     return true;
+}
+
+// ---- Forgery reports (#4) -------------------------------------------
+
+void RatsApi::publish_forgery_report(const Hash256& content_hash,
+                                     const Hash256& block_hash,
+                                     float sim, const Hash256& audio_sha) {
+    nlohmann::json v = {
+        {"ch",  crypto::to_hex(content_hash)},
+        {"bh",  crypto::to_hex(block_hash)},
+        {"sim", sim},
+        {"afp", crypto::to_hex(audio_sha)},
+    };
+    // Node-signed (keypair_), not moderator-signed — a machine attestation.
+    moderation::Envelope env =
+        moderation::sign("forgery_report", v.dump(), keypair_);
+    const std::string payload = moderation::to_json(env).dump();
+    // Route through the same handler live reports take: records our report
+    // into the fr: tally, appends to the mod-log (so it replays to late
+    // joiners), and broadcasts. The auditor already marked the song deleted
+    // locally before calling us.
+    handle_forgery_report(/*peer_id=*/"self", payload, env,
+                          /*broadcast_if_new=*/true);
+}
+
+void RatsApi::handle_forgery_report(const std::string& peer_id,
+                                     const std::string& payload_json,
+                                     const moderation::Envelope& env,
+                                     bool broadcast_if_new) {
+    constexpr int kForgeryQuorum = 2;   // distinct independent reporters
+
+    // (a) crypto + structural gate.
+    if (db_.mod_log_has_sig(env.sig_hex)) return;          // replay-storm dedup
+    if (!moderation::verify_signature_only(env)) {
+        std::cerr << "[forgery] bad sig from " << peer_id.substr(0, 12) << "\n";
+        return;
+    }
+    Hash256 ch{}, bh{};
+    float sim = 1.0f;
+    try {
+        auto v = nlohmann::json::parse(env.value);
+        if (!crypto::parse_hash256(v.value("ch", std::string()), ch)) return;
+        crypto::parse_hash256(v.value("bh", std::string()), bh);
+        sim = v.value("sim", 1.0f);
+    } catch (...) { return; }
+    if (sim >= DeepAuditor::kSlashThreshold) return;       // not a forgery claim
+    // bh must resolve to a real on-chain block actually carrying ch — this
+    // rejects fabricated reports against songs that were never registered.
+    {
+        auto blk = chain_.get_block(bh);
+        if (!blk || !blk->has_song || blk->song.content_hash != ch) {
+            std::cerr << "[forgery] report names a block not carrying ch — drop\n";
+            return;
+        }
+    }
+    auto pub_bytes = crypto::from_hex(env.mod_pub_hex);
+    if (pub_bytes.size() != 33) return;
+    PubKey33 pub{};
+    std::copy(pub_bytes.begin(), pub_bytes.end(), pub.begin());
+    const Address reporter = crypto::address_from_pubkey(pub);
+
+    leveldb::WriteBatch batch;
+    // Record (idempotent per (ch, reporter)) + append to mod-log so the
+    // report replays to late joiners via mod.sync_since.
+    const std::string fr_key =
+        "fr:" + crypto::to_hex(ch) + ":" + crypto::to_hex(reporter.data(), 20);
+    const bool reporter_new = !db_.get(fr_key).has_value();
+    db_.record_forgery_report(batch, ch, reporter);
+    db_.append_mod_log_entry(batch, env.ts_ms, env.sig_hex, payload_json);
+
+    // Decide whether to invalidate: (c) re-audit if we hold the bytes,
+    // else (b) K-independent-reports quorum.
+    bool act = false;
+    auto local = audit_content(db_, audio_dir_, ch);
+    if (local) {
+        if (!local->ok) act = true;                        // we confirmed forgery
+        else std::cerr << "[forgery] re-audit says audio MATCHES — recording "
+                          "report but NOT deleting\n";
+    } else {
+        const int effective =
+            db_.forgery_report_count(ch) + (reporter_new ? 1 : 0);
+        if (effective >= kForgeryQuorum) act = true;
+    }
+    if (act && !db_.is_song_deleted(ch)) {
+        db_.mark_song_deleted(batch, ch);
+        std::cout << "[forgery] content " << crypto::to_hex(ch).substr(0, 16)
+                  << "… marked deleted (quorum/re-audit)\n";
+    }
+    db_.write(batch);
+
+    if (broadcast_if_new && client_)
+        rats_broadcast_string(client_, payload_json.c_str());
+}
+
+// ---- #10 relay-reward triangulation (broker side) -------------------
+//
+// pd:<delivery_id hex> row (JSON): { ch, broker, created, mw, relayed,
+// received, flags }. flags bit0=brokered, bit1=reported, bit2=receipted.
+// Credit fires only when all three are set, per min(relayed,received) byte.
+
+std::string RatsApi::mint_delivery(const Hash256& content_hash) {
+    uint8_t did[16];
+    if (RAND_bytes(did, 16) != 1) {
+        // Fallback: hash (now_ms || content_hash) — still unguessable enough.
+        const uint64_t t = (uint64_t)std::chrono::duration_cast<
+            std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        std::vector<uint8_t> seed(content_hash.begin(), content_hash.end());
+        for (int i=0;i<8;++i) seed.push_back((uint8_t)(t >> (8*i)));
+        Hash256 h = crypto::sha256(seed.data(), seed.size());
+        std::copy(h.begin(), h.begin()+16, did);
+    }
+    const std::string did_hex = crypto::to_hex(did, 16);
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    nlohmann::json row = {
+        {"ch",       crypto::to_hex(content_hash)},
+        {"broker",   crypto::to_hex(keypair_.address.data(), 20)},
+        {"created",  now},
+        {"mw",       std::string()},
+        {"relayed",  (uint64_t)0},
+        {"received", (uint64_t)0},
+        {"flags",    1},
+    };
+    const std::string s = row.dump();
+    db_.put("pd:" + did_hex, std::vector<uint8_t>(s.begin(), s.end()));
+    return did_hex;
+}
+
+bool RatsApi::handle_relay_report(const nlohmann::json& body) {
+    const std::string did_hex = body.value("delivery_id", std::string());
+    const uint64_t bytes_relayed = body.value("bytes_relayed", (uint64_t)0);
+    const std::string mw_hex  = body.value("mini_wallet",  std::string());
+    const std::string pk_hex  = body.value("mini_pubkey",  std::string());
+    const std::string sig_hex = body.value("sig",          std::string());
+    if (did_hex.size() != 32) return false;
+    auto row_opt = db_.get("pd:" + did_hex);
+    if (!row_opt) return false;                 // we didn't broker it — drop
+    auto pk = crypto::from_hex(pk_hex); if (pk.size() != 33) return false;
+    PubKey33 pub{}; std::copy(pk.begin(), pk.end(), pub.begin());
+    Address mini_addr{};
+    if (!crypto::parse_address_checksummed(mw_hex, mini_addr)) {
+        auto a = crypto::from_hex(mw_hex);
+        if (a.size() != 20) return false;
+        std::copy(a.begin(), a.end(), mini_addr.begin());
+    }
+    if (crypto::address_from_pubkey(pub) != mini_addr) return false;
+    auto sigb = crypto::from_hex(sig_hex); if (sigb.size() != 64) return false;
+    Sig64 sig{}; std::copy(sigb.begin(), sigb.end(), sig.begin());
+    auto did = crypto::from_hex(did_hex); if (did.size() != 16) return false;
+    // preimage = "relay.report" || did(16) || bytes(u64 LE) || mini_addr(20)
+    std::vector<uint8_t> msg;
+    const char* tag = "relay.report";
+    msg.insert(msg.end(), tag, tag + std::strlen(tag));
+    msg.insert(msg.end(), did.begin(), did.end());
+    for (int i=0;i<8;++i) msg.push_back((uint8_t)(bytes_relayed >> (8*i)));
+    msg.insert(msg.end(), mini_addr.begin(), mini_addr.end());
+    if (!crypto::verify_data(msg.data(), msg.size(), sig, pub)) return false;
+    auto row = nlohmann::json::parse(
+        std::string(row_opt->begin(), row_opt->end()), nullptr, false);
+    if (!row.is_object()) return false;
+    row["mw"]      = crypto::to_hex(mini_addr.data(), 20);
+    row["relayed"] = bytes_relayed;
+    row["flags"]   = row.value("flags", 0) | 2;
+    const std::string s = row.dump();
+    db_.put("pd:" + did_hex, std::vector<uint8_t>(s.begin(), s.end()));
+    try_corroborate(did_hex);
+    return true;
+}
+
+bool RatsApi::handle_relay_receipt(const nlohmann::json& body) {
+    const std::string did_hex = body.value("delivery_id", std::string());
+    const std::string ch_hex  = body.value("content_hash", std::string());
+    const uint64_t bytes_recv = body.value("bytes_received", (uint64_t)0);
+    const std::string pa_hex  = body.value("player_address", std::string());
+    const std::string pk_hex  = body.value("player_pubkey",  std::string());
+    const std::string sig_hex = body.value("sig",            std::string());
+    if (did_hex.size() != 32 || ch_hex.size() != 64) return false;
+    auto row_opt = db_.get("pd:" + did_hex);
+    if (!row_opt) return false;
+    auto row = nlohmann::json::parse(
+        std::string(row_opt->begin(), row_opt->end()), nullptr, false);
+    if (!row.is_object()) return false;
+    if (row.value("ch", std::string()) != ch_hex) return false;  // wrong song
+    auto pk = crypto::from_hex(pk_hex); if (pk.size() != 33) return false;
+    PubKey33 pub{}; std::copy(pk.begin(), pk.end(), pub.begin());
+    Address player{};
+    if (!crypto::parse_address_checksummed(pa_hex, player)) return false;
+    if (crypto::address_from_pubkey(pub) != player) return false;
+    auto sigb = crypto::from_hex(sig_hex); if (sigb.size() != 64) return false;
+    Sig64 sig{}; std::copy(sigb.begin(), sigb.end(), sig.begin());
+    auto did = crypto::from_hex(did_hex); if (did.size() != 16) return false;
+    auto ch  = crypto::from_hex(ch_hex);  if (ch.size()  != 32) return false;
+    // preimage = "relay.receipt" || did(16) || content_hash(32) || bytes(u64 LE)
+    std::vector<uint8_t> msg;
+    const char* tag = "relay.receipt";
+    msg.insert(msg.end(), tag, tag + std::strlen(tag));
+    msg.insert(msg.end(), did.begin(), did.end());
+    msg.insert(msg.end(), ch.begin(),  ch.end());
+    for (int i=0;i<8;++i) msg.push_back((uint8_t)(bytes_recv >> (8*i)));
+    if (!crypto::verify_data(msg.data(), msg.size(), sig, pub)) return false;
+    row["received"] = bytes_recv;
+    row["flags"]    = row.value("flags", 0) | 4;
+    const std::string s = row.dump();
+    db_.put("pd:" + did_hex, std::vector<uint8_t>(s.begin(), s.end()));
+    try_corroborate(did_hex);
+    return true;
+}
+
+void RatsApi::try_corroborate(const std::string& did_hex) {
+    auto row_opt = db_.get("pd:" + did_hex);
+    if (!row_opt) return;
+    auto row = nlohmann::json::parse(
+        std::string(row_opt->begin(), row_opt->end()), nullptr, false);
+    if (!row.is_object()) return;
+    if ((row.value("flags", 0) & 7) != 7) return;   // brokered+reported+receipted
+    const uint64_t relayed  = row.value("relayed",  (uint64_t)0);
+    const uint64_t received = row.value("received", (uint64_t)0);
+    // 1 MC (1e8 internal units) per 10 MB ⇒ 10 internal units per byte.
+    constexpr uint64_t kUnitsPerByte = 10;
+    // Clamp BEFORE the multiply so a colluding mini+player can't report
+    // absurd byte counts that overflow u64 and wrap to a small/garbage
+    // credit (or worse). The per-tx caps downstream only see the product,
+    // so the guard has to live here. UINT64_MAX/10 bytes ≈ 1.8e18 — far
+    // above any real delivery, so honest traffic is never touched.
+    const uint64_t credited =
+        std::min<uint64_t>(std::min(relayed, received), UINT64_MAX / kUnitsPerByte);
+    auto a = crypto::from_hex(row.value("mw", std::string()));
+    if (a.size() == 20 && relay_tracker_ && credited > 0) {
+        Address mini{}; std::copy(a.begin(), a.end(), mini.begin());
+        relay_tracker_->increment(mini, credited * kUnitsPerByte);
+        std::cout << "[relay] corroborated delivery " << did_hex.substr(0, 12)
+                  << "… credited " << credited << "B → "
+                  << credited * kUnitsPerByte << " units\n";
+    }
+    db_.del("pd:" + did_hex);   // single-use ⇒ replay-proof
+}
+
+void RatsApi::record_attestation_level(const std::string& device_id,
+                                       const std::string& level) {
+    if (device_id.empty()) return;
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string rec = level + "|" + std::to_string(now);
+    db_.put("dal:" + device_id, std::vector<uint8_t>(rec.begin(), rec.end()));
 }
 
 void RatsApi::push_mod_log_since(const std::string& peer_id,

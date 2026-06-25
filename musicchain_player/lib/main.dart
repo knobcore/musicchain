@@ -74,6 +74,10 @@ void main() async {
       final submitWallet = WalletService();
       unawaited(submitWallet.tryAutoLoad());
       await OfflineSubmitService.instance.start(wallet: submitWallet);
+      // #10: reuse this loaded wallet to sign relay.receipt messages.
+      // Best-effort — if the key isn't loaded yet when a receipt fires,
+      // _sendRelayReceipt silently skips (no reward, no crash).
+      rats.wallet = submitWallet;
     } catch (e) {
       // ignore: avoid_print
       print('[offline-play-log] init failed: $e');

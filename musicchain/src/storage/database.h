@@ -270,6 +270,16 @@ public:
                               const std::string&  payload_json);
     bool mod_log_has_sig(const std::string& sig_hex) const;
     uint64_t latest_mod_log_ts() const;
+
+    // Forgery-report tally (#4). One set-valued entry per (content_hash,
+    // reporter) under the `fr:` prefix, so a song is only marked deleted
+    // once K distinct nodes independently report it forged. Insertion is
+    // idempotent (a replayed report from the same reporter never inflates
+    // the count). `forgery_report_count` is the distinct-reporter count.
+    void record_forgery_report(leveldb::WriteBatch& b,
+                               const Hash256& content_hash,
+                               const Address& reporter);
+    int  forgery_report_count(const Hash256& content_hash) const;
     void iter_mod_log_since(
         uint64_t since_ts_ms,
         const std::function<bool(uint64_t ts_ms,

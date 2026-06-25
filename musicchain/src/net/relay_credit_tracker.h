@@ -14,38 +14,25 @@
 
 namespace mc::net {
 
-// RelayCreditTracker — full-node-side bookkeeping of how many times each
-// known mini-node has served as a tunnel for our binary traffic. The
-// mini-node never reports its own counts; the full node observes its
-// own outbound deliveries and credits the conduit.
+// RelayCreditTracker — full-node-side accumulator of relay reward owed to
+// each mini-node, in INTERNAL TOKEN UNITS (1 MC = 1e8 units).
 //
-// Storage: leveldb under the `rc:` prefix (`rc:<mini_addr_hex>` → u64).
-// Survives full-node restarts so credits accrued before a sweep aren't
-// lost when the operator bounces the service.
+// (#10) Crediting is now per CORROBORATED BYTE via the triangulation in
+// rats_api (RatsApi::try_corroborate): the broker brokered the stream, the
+// mini reported the bytes it relayed (signed), and the player confirmed the
+// bytes it received (signed); we credit min(relayed,received) bytes × the
+// per-byte rate. So `increment()` is now called with the already-computed
+// internal-unit amount, NOT a per-stream count of 1, and the mini-node DOES
+// report its own counts (cross-checked against the player's receipt).
 //
-// Sweep: every kSweepIntervalMs (~5 min), the tracker calls a caller-
-// supplied "mint" callback with each (mini_addr, count) pair, then
-// clears that entry. The callback constructs a RelayRewardTx, signs it
-// with the founder key, and pushes it into the mempool. We can't
-// know the mini-node's wallet address at config-time — we learn it
-// dynamically via the routes.get response (which now includes a
-// `wallet` field per the mini-node patch).
+// Storage: leveldb under the `rc:` prefix (`rc:<mini_addr_hex>` → u64 units).
+// Survives full-node restarts so credits accrued before a sweep aren't lost.
 //
-// Identifying "this request came in via a mini-node tunnel" lives at
-// the rats_api layer; the tracker exposes a simple increment() that
-// the API hook calls. The hook decides whether to count.
-//
-// SCOPE: only count streams + downloads, i.e. binary payload deliveries
-// that justify a mini-node operator hosting the relay. Chat /
-// moderation / routes RPCs are control-plane and don't qualify. The
-// canonical list of credit-earning verbs (single source of truth so
-// the policy isn't scattered across handlers):
-//
-//   - stream.open         → audio stream session start
-//   - song.audio          → full content download chunk
-//   - song.get            → metadata pull preceding a download
-//
-// Any other verb (chat.*, routes.*, mod.*) MUST NOT call increment().
+// Sweep: every kSweepIntervalMs (~5 min) the tracker calls a caller-supplied
+// "mint" callback with each (mini_addr, units) pair, then clears the entry.
+// The callback constructs a RelayRewardTx{count = units} (count now means
+// internal units, applied directly by apply_relay_reward — no per-MC scale),
+// signs it (founder for now), and pushes it to the mempool.
 class RelayCreditTracker {
 public:
     using MintCallback = std::function<void(const Address& mini_addr,

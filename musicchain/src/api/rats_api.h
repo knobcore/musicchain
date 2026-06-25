@@ -6,6 +6,7 @@
 #include "../network/manager.h"
 #include "../crypto/keys.h"
 #include "../store/swarm.h"
+#include <nlohmann/json_fwd.hpp>   // nlohmann::json fwd-decl for #10 handlers
 
 #include <atomic>
 #include <mutex>
@@ -18,6 +19,7 @@ extern "C" { typedef void* rats_client_t; }
 
 namespace mc { class BlockPropagator; }
 namespace mc::net { class RelayCreditTracker; }
+namespace mc::moderation { struct Envelope; }   // #4 forgery_report handler
 
 namespace mc::api {
 
@@ -91,6 +93,18 @@ public:
                              const std::string&          value,
                              const mc::crypto::KeyPair&  moderator_kp);
 
+    /// Sign + gossip a forgery report (#4): the DeepAuditor calls this when
+    /// a sampled block's audio fails to match its declared fingerprint, so
+    /// the whole mesh can independently corroborate (K reports) / re-audit
+    /// and drop the forged song. node_main wires it to DeepAuditor.
+    void publish_forgery_report(const Hash256& content_hash,
+                                const Hash256& block_hash,
+                                float sim, const Hash256& audio_sha);
+
+    /// Audio content-addressed store directory, so the forgery re-audit
+    /// path can locate local bytes. Set once at startup by node_main.
+    void set_audio_dir(const std::string& dir) { audio_dir_ = dir; }
+
 private:
     HttpServer&                 http_;
     Chain&                      chain_;
@@ -102,6 +116,7 @@ private:
     rats_client_t               client_ = nullptr;
     BlockPropagator*            propagator_ = nullptr;
     net::RelayCreditTracker*    relay_tracker_ = nullptr;
+    std::string                 audio_dir_;   // for forgery re-audit (#4)
 
     /// Mini-node librats peer_id → mini-node wallet (20-byte raw EVM
     /// address). Populated when a peer pushes `mini.hello` with a
@@ -129,6 +144,32 @@ private:
     void handle_mod_envelope(const std::string& peer_id,
                               const std::string& payload_json,
                               bool broadcast_if_new);
+
+    /// Receive a forgery report (#4) — node-signed (not moderator-gated).
+    /// Verifies the signature, validates the named block carries the named
+    /// content hash, records the report into the fr: tally, and marks the
+    /// song deleted IFF we re-audit it as forged locally OR K independent
+    /// reporters agree. Appends to the mod-log so it replays to late joiners.
+    void handle_forgery_report(const std::string& peer_id,
+                               const std::string& payload_json,
+                               const moderation::Envelope& env,
+                               bool broadcast_if_new);
+
+    // #10 relay-reward triangulation (broker side). mint_delivery records a
+    // pd:<id> pending-delivery row at stream.open; the two handlers verify
+    // the mini's signed byte-report and the player's signed receipt against
+    // that row; try_corroborate credits per min(relayed,received) byte once
+    // all three legs agree, then retires the row (single-use ⇒ replay-proof).
+    std::string mint_delivery(const Hash256& content_hash);
+    bool handle_relay_report(const nlohmann::json& body);
+    bool handle_relay_receipt(const nlohmann::json& body);
+    void try_corroborate(const std::string& delivery_id_hex);
+
+    // #5 "accept + record": persist the latest device attestation level per
+    // device (`dal:<device_id>` → "<level>|<ts_ms>") so a future verifier
+    // policy can tighten by level WITHOUT a client change. Never gates.
+    void record_attestation_level(const std::string& device_id,
+                                  const std::string& level);
 
     /// Push every mod-log entry strictly newer than `since_ts_ms` to the
     /// given peer as individual `musicchain.mod` messages. Called when a

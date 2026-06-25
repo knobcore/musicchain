@@ -160,6 +160,19 @@ class MusicChainBindings {
   late final _mc_wallet_get_public_key = _mc_wallet_get_public_keyPtr
       .asFunction<ffi.Pointer<ffi.Char> Function(mc_wallet_t)>();
 
+  /// Hardware-derived device fingerprint hex (#5 structural attestation),
+  /// or NULL if no hardware identifier is readable (desktop only; Android
+  /// uses a Kotlin MethodChannel). Caller must free with mc_free().
+  ffi.Pointer<ffi.Char> mc_device_fingerprint() {
+    return _mc_device_fingerprint();
+  }
+
+  late final _mc_device_fingerprintPtr =
+      _lookup<ffi.NativeFunction<ffi.Pointer<ffi.Char> Function()>>(
+          'mc_device_fingerprint');
+  late final _mc_device_fingerprint = _mc_device_fingerprintPtr
+      .asFunction<ffi.Pointer<ffi.Char> Function()>();
+
   /// Sign data with the wallet private key.
   /// Returns 128-character hex string (64-byte signature), or NULL on failure.
   /// Caller must free with mc_free().

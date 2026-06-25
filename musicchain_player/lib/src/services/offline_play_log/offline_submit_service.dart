@@ -17,8 +17,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:shared_preferences/shared_preferences.dart';
-
+import '../device_fingerprint_service.dart';
 import '../node_service.dart';
 import '../rats_client.dart';
 import '../wallet_service.dart';
@@ -145,7 +144,13 @@ class OfflineSubmitService {
     final nonceBytes = List<int>.generate(32, (_) => rng.nextInt(256));
     final nonceHex   = nonceBytes
         .map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    final deviceId   = await _deviceIdHex();
+    // #5: hardware-derived device attestation. device_id is now the hardware
+    // fingerprint (stable across reinstalls) rather than a random token, and
+    // the `attestation` object rides INSIDE the wallet-signed bundle so the
+    // signature binds (device ↔ wallet) — exactly the "include the wallet"
+    // requirement, without baking the wallet into the per-device id itself.
+    final attest     = await DeviceFingerprintService.instance.get();
+    final deviceId   = attest.deviceKey;
 
     // Bundle base time = the earliest captured signal we're shipping.
     final wallBase = sessions
@@ -168,6 +173,7 @@ class OfflineSubmitService {
       'bundle_nonce':      nonceHex,
       'created_at_ms':     DateTime.now().millisecondsSinceEpoch,
       'device_id':         deviceId,
+      'attestation':       attest.toJson(),
       'monotonic_base_ms': monoBase,
       'wall_base_ms':      wallBase,
       'sessions':          sessions.map((s) => s.toJson()).toList(),
@@ -212,20 +218,6 @@ class OfflineSubmitService {
       return buf.toString();
     }
     return jsonEncode(v);
-  }
-
-  /// Stable per-install id, hashed so we never leak a hardware id.
-  /// Persisted in shared_preferences after the first generation.
-  Future<String> _deviceIdHex() async {
-    final prefs = await SharedPreferences.getInstance();
-    final cached = prefs.getString('mc_device_id_hex');
-    if (cached != null && cached.length == 64) return cached;
-    final rng = Random.secure();
-    final bytes = List<int>.generate(32, (_) => rng.nextInt(256));
-    final hex = bytes.map((b) =>
-        b.toRadixString(16).padLeft(2, '0')).join();
-    await prefs.setString('mc_device_id_hex', hex);
-    return hex;
   }
 
 }

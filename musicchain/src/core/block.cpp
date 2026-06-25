@@ -74,28 +74,12 @@ std::vector<uint8_t> BlockHeader::serialize() const {
     write_bytes(buf, fingerprint_hash.data(), 32);
     write_bytes(buf, content_hash.data(),     32);
     write_u64le(buf, timestamp_ms);
-    write_u16le(buf, static_cast<uint16_t>(confirmations.size()));
-    for (const auto& c : confirmations) {
-        write_bytes(buf, c.validator_id.data(), 32);
-        write_bytes(buf, c.pubkey.data(), 33);
-        write_bytes(buf, c.signature.data(), 64);
-    }
+    // Model 1 / format v3: no confirmations vector in the header.
     return buf;
 }
 
 Hash256 BlockHeader::hash() const {
     auto hdr = serialize();
-    return crypto::sha256(hdr.data(), hdr.size());
-}
-
-Hash256 BlockHeader::signing_hash() const {
-    // Re-serialize with the confirmations field cleared so producers
-    // and validators can sign a stable hash that doesn't change as more
-    // confirmations accumulate. The on-wire confirmations.size() takes
-    // 2 bytes; with no entries the length encoding is just 0x00 0x00.
-    BlockHeader stripped = *this;
-    stripped.confirmations.clear();
-    auto hdr = stripped.serialize();
     return crypto::sha256(hdr.data(), hdr.size());
 }
 
@@ -154,14 +138,7 @@ bool Block::deserialize(const uint8_t* data, size_t len, Block& out) {
     if (!read_bytes(p, end, out.header.fingerprint_hash.data(), 32)) return false;
     if (!read_bytes(p, end, out.header.content_hash.data(),     32)) return false;
     if (!read_u64le(p, end, out.header.timestamp_ms))               return false;
-    uint16_t conf_count = 0;
-    if (!read_u16le(p, end, conf_count)) return false;
-    out.header.confirmations.resize(conf_count);
-    for (auto& c : out.header.confirmations) {
-        if (!read_bytes(p, end, c.validator_id.data(), 32)) return false;
-        if (!read_bytes(p, end, c.pubkey.data(),       33)) return false;
-        if (!read_bytes(p, end, c.signature.data(),    64)) return false;
-    }
+    // Model 1 / format v3: no confirmations vector to read.
 
     // --- Optional song record ---
     if (p >= end) return false;

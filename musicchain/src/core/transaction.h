@@ -64,12 +64,18 @@ struct TransferTx {
     Address  to_address;
     uint64_t amount;       // internal units (8 decimals)
     uint64_t nonce;
+    // Compressed secp256k1 pubkey of from_address, carried inline so
+    // verify_signature can run without ECDSA public-key recovery (which
+    // the OpenSSL-only crypto layer doesn't provide). Same pattern every
+    // other signed tx type uses. The chain cross-checks
+    // address_from_pubkey(from_pubkey) == from_address.
+    PubKey33 from_pubkey{};
     Sig64    signature;
 
     std::vector<uint8_t> serialize() const;
     static bool deserialize(const uint8_t* data, size_t len, TransferTx& out);
 
-    // Message bytes that are signed: from|to|amount|nonce
+    // Message bytes that are signed: chain_id|from|to|amount|nonce|from_pubkey
     std::vector<uint8_t> sign_message() const;
     Hash256 tx_hash() const;
     bool verify_signature() const;
@@ -231,29 +237,28 @@ struct UsernameTx {
 
 // ---- Relay reward transaction ---------------------------------------
 //
-// Issued by a full node to credit a mini-node for serving binary relay
-// traffic on its behalf. The full node is the source of truth (it sees
-// the librats connection metadata and knows when a request came in via
-// a mini-node tunnel) so the mini-node cannot inflate its claim. One
-// `RelayRewardTx` is emitted per (mini-node, sweep window). 1 MC per
-// relayed transfer (download or stream chunk) — `count` is the number
-// of transfers accumulated since the last sweep.
+// Issued by a full node to credit a mini-node for relayed bytes. (#10)
+// The amount is established by TRIANGULATION (RatsApi::try_corroborate):
+// the broker brokered the stream, the mini-node signed a byte-report, and
+// the player signed a byte-receipt; we credit min(relayed,received) bytes ×
+// the per-byte rate. So `count` is now ALREADY internal token units (1 MC =
+// 1e8 units), pre-computed by the relay tracker (1 MC per 10 MB ⇒ 10
+// units/byte). One `RelayRewardTx` is emitted per (mini-node, sweep window).
 //
 // Wire format (all little-endian):
 //   u8          TxType::RELAY_REWARD
-//   Address(20) target_address     — mini-node wallet receiving the MC
-//   u64         count              — number of relayed transfers
+//   Address(20) target_address     — mini-node wallet receiving the credit
+//   u64         count              — INTERNAL UNITS to credit (1 MC = 1e8)
 //   Address(20) issuer_address     — full node operator (founder)
 //   PubKey33    issuer_pubkey
 //   u64         nonce              — issuer's nonce
 //   Sig64       signature          — issuer signs the preimage
 //
-// On apply, chain credits target_address by count * 1_00000000 internal
-// units (8 decimals, so "1 MC" = 100_000_000) and advances the issuer
-// nonce. Without the founder signature the tx is rejected, so phantom
-// mini-nodes can't claim rewards — only a real full node operator can
-// emit one. (Once Phase-3 decentralized signing lands, this becomes
-// "any validator" rather than "founder only", same pattern as MintTx.)
+// On apply, chain credits target_address by `count` units DIRECTLY (no
+// per-MC scaling) and advances the issuer nonce. Without the founder
+// signature the tx is rejected. (Phase-3 widens the issuer to "any
+// validator"; the triangulation already makes each delivery single-issuer
+// since only the broker holds the pending-delivery row.)
 struct RelayRewardTx {
     Address  target_address{};
     uint64_t count          = 0;

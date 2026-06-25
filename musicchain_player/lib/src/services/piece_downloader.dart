@@ -148,6 +148,10 @@ class PieceDownloader {
   final List<PeerSource>  _sources       = [];
   final Map<String, int>  _perPeerErrors = {};
   final Set<String>       _bannedPeers   = {};
+  // (DHT un-nerf P0b) DHT-source dialing: address → resolved librats peer_id,
+  // and addresses that never validated (don't redial them every piece).
+  final Map<String, String> _dhtResolved = {};
+  final Set<String>         _dhtBanned   = {};
 
   Object?              _terminalError;
   Completer<void>?     _terminalSignal;
@@ -399,10 +403,38 @@ class PieceDownloader {
 
   Future<_PieceReply> _fetchPiece(
       PeerSource source, int offset, int length) async {
+    // (DHT un-nerf P0b) Resolve a routable peer_id for a DHT-discovered
+    // source that only carries a host:port. Without this the raw address was
+    // shoved into request()'s peer_id slot — never in validatedPeerIds, never
+    // dialed — so DHT sources threw send_failed and could not serve a byte.
+    // Dial once, cache the resolved id per address, ban an address that never
+    // validates so we don't redial it for every piece.
+    String target = source.peerId;
+    if (target.isEmpty) {
+      final addr = source.address;
+      if (addr.isEmpty || _dhtBanned.contains(addr)) {
+        throw _PeerProtocolException('unroutable DHT source $addr');
+      }
+      final cached = _dhtResolved[addr];
+      if (cached != null) {
+        target = cached;
+      } else {
+        final colon = addr.lastIndexOf(':');   // lastIndexOf for IPv6 literals
+        final host  = colon > 0 ? addr.substring(0, colon) : '';
+        final port  = colon > 0 ? (int.tryParse(addr.substring(colon + 1)) ?? 0) : 0;
+        final resolved = await RatsClient.instance.connectAndResolve(host, port);
+        if (resolved == null) {
+          _dhtBanned.add(addr);
+          throw _PeerStallException();   // move on to the next source
+        }
+        _dhtResolved[addr] = resolved;
+        target = resolved;
+      }
+    }
     Object? reply;
     try {
       reply = await RatsClient.instance.request(
-        source.peerId.isNotEmpty ? source.peerId : source.address,
+        target,
         'audio.piece_get',
         {
           'v':            1,

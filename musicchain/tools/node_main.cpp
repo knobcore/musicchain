@@ -22,7 +22,6 @@
 // when verbs moved to librats RPC. Restore behind MC_WITH_H3 when bringing
 // it back.
 #include "../src/consensus/candidate.h"
-#include "../src/consensus/validator.h"
 #include "../src/sync/block_propagator.h"
 #include "../src/sync/deep_audit.h"
 #include "../src/net/load_monitor.h"
@@ -92,6 +91,21 @@ static mc::net::NodeConfig load_config(const std::string& path) {
     if (j.contains("dht_bootstrap_hash"))
         cfg.dht_bootstrap_hash = j["dht_bootstrap_hash"];
     if (j.contains("registry_url"))  cfg.registry_url  = j["registry_url"];
+    // Checkpoints (#7): array of { "height": <int>, "hash": "<64-hex>" }.
+    if (j.contains("checkpoints") && j["checkpoints"].is_array()) {
+        for (const auto& c : j["checkpoints"]) {
+            if (!c.contains("height") || !c.contains("hash")) continue;
+            mc::Checkpoint cp;
+            cp.height = c["height"].get<uint32_t>();
+            std::string hex = c["hash"].get<std::string>();
+            if (!mc::crypto::parse_hash256(hex, cp.hash)) {
+                std::cerr << "[config] bad checkpoint hash '" << hex
+                          << "' — skipping\n";
+                continue;
+            }
+            cfg.checkpoints.push_back(cp);
+        }
+    }
     if (j.contains("load_monitor")) {
         const auto& lm = j["load_monitor"];
         if (lm.contains("max_bandwidth_bps"))
@@ -137,6 +151,13 @@ static void save_config(const std::string& path,
     j["sync_seeds"]        = cfg.sync_seeds;
     j["dht_bootstrap_hash"]= cfg.dht_bootstrap_hash;
     j["registry_url"]      = cfg.registry_url;
+    {   // Checkpoints (#7) round-trip so a --config-set value survives saves.
+        json cps = json::array();
+        for (const auto& c : cfg.checkpoints)
+            cps.push_back({ {"height", c.height},
+                            {"hash",   mc::crypto::to_hex(c.hash)} });
+        j["checkpoints"] = cps;
+    }
     json lm = json::object();
     lm["max_bandwidth_bps"]    = g_load_cfg.max_bandwidth_bps;
     lm["cpu_weight"]           = g_load_cfg.cpu_weight;
@@ -247,6 +268,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
         if (cfg.dht_bootstrap_hash.empty())
             cfg.dht_bootstrap_hash = file_cfg.dht_bootstrap_hash;
         if (cfg.registry_url.empty())  cfg.registry_url  = file_cfg.registry_url;
+        if (cfg.checkpoints.empty())   cfg.checkpoints   = file_cfg.checkpoints;
         // tui_mode: file value wins ONLY when the CLI didn't set it.
         // The old "if (tui_mode == true) tui_mode = g_tui_mode_persisted"
         // check couldn't tell "default true" from "operator passed
@@ -318,6 +340,10 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cerr << "[dbg] initializing chain\n";
     // Initialize chain
     mc::Chain chain(db);
+    // Merge operator checkpoints (#7) BEFORE init()/sync so the eclipse
+    // gate is live before any block is accepted.
+    if (size_t n = chain.add_config_checkpoints(cfg.checkpoints))
+        std::cout << "[node] " << n << " config checkpoint(s) active\n";
     if (!chain.init()) {
         std::cerr << "[node] chain init failed\n";
         return 1;
@@ -405,6 +431,15 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
                             cfg.api_port);
     rats.set_load_monitor(&load_mon);
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
+    // DeepAuditor (#4) at cmd_start scope, declared AFTER rats_api so it
+    // destructs (stop()+join the worker) BEFORE rats_api — the worker's
+    // on_forgery callback captures rats_api by reference, so it must not
+    // outlive it. Started below only if the rats link comes up.
+    mc::DeepAuditor audit(chain, db, cfg.data_dir + "/audio",
+        [&rats_api](const mc::Hash256& ch, const mc::Hash256& bh,
+                    float sim, const mc::Hash256& asha){
+            rats_api.publish_forgery_report(ch, bh, sim, asha);
+        });
     if (rats.start()) {
         std::cout << "[node] rats link active on port " << cfg.rats_port
                   << " (VPS " << mc::net::MC_VPS_HOST << ":"
@@ -431,158 +466,19 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
 
         rats_api.start(rats.client());
 
-        // ---- Consensus mesh wiring -------------------------------------
+        // ---- Consensus wiring (Model 1: vote-free) ---------------------
         //
-        // Hand RatsLink to the consensus layer so the producer (in
-        // CandidateManager::commit_block) can fan out fresh candidates
-        // and so we can count actual peers when deciding solo vs.
-        // multi-node. Without these two lines block production runs
-        // forever in the solo-self-sign path even when peers are present.
+        // There is no candidate/confirmation gossip. Block production is
+        // build → validate → connect → announce (CandidateManager), and
+        // every node re-derives validity deterministically on receipt
+        // (BlockPropagator, wired below). The only thing we still feed
+        // NetworkManager is the live validated-peer count, purely so the
+        // `status` RPC and the TUI report it accurately — no consensus
+        // decision consults it anymore.
         network.set_peer_count_provider([&rats] {
             int n = rats.validated_peer_count();
             return n < 0 ? size_t{0} : static_cast<size_t>(n);
         });
-        network.set_candidate_publisher([&rats](const std::vector<uint8_t>& b) {
-            rats.publish_block_candidate(b);
-        });
-
-        // ---- Validator-side: vote on incoming candidates --------------
-        //
-        // Other nodes' producers broadcast their freshly-minted block
-        // here. We re-deserialize, run the same checks chain.connect_block
-        // would later run, plus the uniqueness gate ("has anyone already
-        // registered this fingerprint?"). If everything passes we sign
-        // (block_hash, keypair.private_key) and publish a Confirmation
-        // back over the same channel, where the producer's confirmation
-        // handler picks it up and calls candidates.add_confirmation.
-        //
-        // We deliberately do NOT call chain.connect_block here — the block
-        // isn't final until REQUIRED_CONFIRMATIONS arrive at the producer.
-        // The producer then re-broadcasts the finalized block on a future
-        // turn (via routes / catch-up sync) and connect happens there.
-        rats.set_block_candidate_handler(
-            [&chain, &db, &cfg, &keypair, &rats](std::vector<uint8_t> bytes) {
-                mc::Block block;
-                if (!mc::Block::deserialize(bytes.data(), bytes.size(), block)) {
-                    std::cerr << "[consensus] dropped candidate: malformed\n";
-                    return;
-                }
-                std::string err;
-                if (!chain.validate_candidate(block, err)) {
-                    // Structural check only — prev_hash race against
-                    // BlockPropagator is handled by validate_candidate
-                    // (which skips it). Block::validate, called inside
-                    // validate_candidate, still enforces
-                    // sha256(compressed_fingerprint) ==
-                    // header.fingerprint_hash, so a producer can't lie
-                    // about which fingerprint the header claims.
-                    std::cerr << "[consensus] dropped candidate: validate failed — "
-                              << err << "\n";
-                    return;
-                }
-                if (block.has_song) {
-                    // Uniqueness gate #1 — same audio file already on-chain.
-                    // Indexed by content_hash via the "f:" prefix. Cheapest
-                    // check; one DB get.
-                    if (db.get_fingerprint(block.song.content_hash)) {
-                        std::cerr << "[consensus] dropped candidate: content_hash "
-                                     "already registered\n";
-                        return;
-                    }
-                    // Uniqueness gate #2 — SAME song re-encoded as a
-                    // different file. chromaprint is content-similarity,
-                    // not bit-equality: re-encoding an MP3 to OGG keeps
-                    // the song audibly identical but produces a *similar*
-                    // (not equal) fingerprint, which means a different
-                    // header.fingerprint_hash and a different
-                    // song.content_hash. So we have to decode the
-                    // candidate's chromaprint blob into raw 32-bit
-                    // per-frame codes and compute bin-level hamming-
-                    // distance similarity against everything in the
-                    // bucket index. Threshold matches rats_api's existing
-                    // fingerprint.submit fuzzy probe (kSimThreshold=0.55)
-                    // — anything above that is treated as the same song.
-                    auto submitted = mc::audio::Fingerprint::from_compressed(
-                        block.song.compressed_fingerprint);
-                    if (submitted) {
-                        constexpr float kSimThreshold = 0.55f;
-                        std::unordered_set<std::string> seen;
-                        float best_sim = 0.0f;
-                        mc::Hash256 best_match{};
-                        int n_candidates = 0;
-                        for (auto bucket : submitted->bucket_ids()) {
-                            for (const auto& cand_ch : db.get_bucket(bucket)) {
-                                if (cand_ch == block.song.content_hash) continue;
-                                const std::string key = mc::crypto::to_hex(cand_ch);
-                                if (!seen.insert(key).second) continue;
-                                ++n_candidates;
-                                auto entry = db.get_fingerprint(cand_ch);
-                                if (!entry) continue;
-                                auto cand_fp = mc::audio::Fingerprint::from_compressed(
-                                    entry->compressed_fingerprint);
-                                if (!cand_fp) continue;
-                                const float sim = submitted->similarity(*cand_fp);
-                                if (sim > best_sim) {
-                                    best_sim   = sim;
-                                    best_match = cand_ch;
-                                }
-                                if (sim >= kSimThreshold) goto reject_dup;
-                            }
-                        }
-                        std::cout << "[consensus] fuzzy probe: "
-                                  << n_candidates << " candidates, best="
-                                  << best_sim << "\n";
-                        goto fuzzy_ok;
-reject_dup:
-                        std::cerr << "[consensus] dropped candidate: chromaprint "
-                                     "similar to already-registered song "
-                                  << mc::crypto::to_hex(best_match).substr(0, 16)
-                                  << "… (sim=" << best_sim << " >= "
-                                  << kSimThreshold << ")\n";
-                        return;
-fuzzy_ok: ;
-                    }
-                }
-                // Validation passed. Sign and broadcast a confirmation.
-                mc::Confirmation conf{};
-                conf.validator_id = cfg.node_id;
-                std::copy(keypair.public_key.begin(), keypair.public_key.end(),
-                          conf.pubkey.begin());
-                conf.signature = mc::crypto::sign_ecdsa(block.hash(),
-                                                        keypair.private_key);
-                const std::string block_hash_hex =
-                    mc::crypto::to_hex(block.hash());
-                rats.publish_confirmation(block_hash_hex, conf);
-                std::cout << "[consensus] confirmed candidate "
-                          << block_hash_hex.substr(0, 16) << "…\n";
-            });
-
-        // ---- Producer-side: collect votes from validators -------------
-        rats.set_confirmation_handler(
-            [&candidates, &chain](std::string block_hash_hex,
-                                   mc::Confirmation c) {
-                // Slashed validators' confirmations don't count. We
-                // derive the validator's address from their public key
-                // and check the slashed: index. This protects against
-                // a slashed party still emitting confirmation messages
-                // from their old key — those go in the bin.
-                const auto addr =
-                    mc::crypto::address_from_pubkey(c.pubkey);
-                if (chain.is_slashed(addr)) {
-                    std::cerr << "[consensus] dropped confirmation from "
-                                 "slashed validator "
-                              << mc::crypto::to_hex(addr.data(), 20)
-                                    .substr(0, 16) << "…\n";
-                    return;
-                }
-                bool now_final =
-                    candidates.add_confirmation(block_hash_hex, c);
-                if (now_final) {
-                    std::cout << "[consensus] candidate "
-                              << block_hash_hex.substr(0, 16)
-                              << "… reached quorum\n";
-                }
-            });
     } else {
         std::cerr << "[node] rats link failed to start — continuing without NAT punch\n";
     }
@@ -609,17 +505,21 @@ fuzzy_ok: ;
         // most cycles will no-op (graceful — the audit just skips). On
         // the player + on nodes that opt into a content cache, this is
         // the gate against fingerprint-vs-audio forgery.
-        static mc::DeepAuditor audit(chain, db, cfg.data_dir + "/audio");
+        // Give RatsApi the audio dir so its forgery re-audit path (#4) can
+        // locate local bytes, then start the auditor (declared at
+        // cmd_start scope above so its worker is joined before rats_api dies).
+        rats_api.set_audio_dir(cfg.data_dir + "/audio");
         audit.start();
 
         // ---- Relay credit tracker + periodic RelayRewardTx sweep ----
         //
-        // Counts every mini-node tunneled delivery this full node serves
-        // (populated by rats_api hooks, persisted to leveldb under "rc:"
-        // so credits aren't lost across restarts). Every 5 minutes we
-        // sweep the counters into one RelayRewardTx per mini-node,
-        // signed by the founder key (loaded from founder.seed alongside
-        // the chain data dir). Counter zeroes when the tx hits a block.
+        // (#10) Accumulates per-mini-node relay reward in INTERNAL UNITS,
+        // credited per CORROBORATED BYTE by RatsApi::try_corroborate (broker
+        // + signed mini report + signed player receipt). Persisted under
+        // "rc:". Every 5 minutes we sweep into one RelayRewardTx{count=units}
+        // per mini-node, signed by the founder key (loaded from founder.seed).
+        // `count` below is already internal units — apply_relay_reward credits
+        // it directly. Counter zeroes when the tx hits a block.
         //
         // The mint callback is no-op until the operator has bootstrapped
         // the founder seed — before that we can't sign a RELAY_REWARD
@@ -690,9 +590,11 @@ fuzzy_ok: ;
             });
     }
 
-    // UPnP removed. NAT traversal is now mc_rats_quic's job (QUIC peers all
-    // connect outbound to the mini-node first; inbound flows tunnel via the
-    // relay if reachability probing showed this node is firewalled).
+    // UPnP removed. NAT traversal is now librats's job (frozen v0.2.0):
+    // peers connect outbound to the mini-node first; inbound flows tunnel via
+    // the relay when reachability probing shows this node is firewalled.
+    // (There is no separate mc_rats_quic transport anymore — it's a CMake
+    // alias for the librats target.)
 
     // Start the HTTP API server (it was constructed earlier so RatsApi
     // could borrow its verb handlers).
@@ -709,22 +611,13 @@ fuzzy_ok: ;
     std::signal(SIGTERM, signal_handler);
 
     if (tui_mode) {
-        // Kick a background maintenance thread so the TUI's redraw loop
-        // doesn't have to busy-poll candidates.cleanup_expired().
-        std::thread janitor([&]{
-            while (g_running) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));
-                candidates.cleanup_expired();
-            }
-        });
+        // Model 1: no candidate map to expire, so no janitor thread.
         mc::ui::run_tui(api, rats_api, chain, db, rats_api.swarm_index(),
                         network, candidates, keypair, cfg.data_dir, g_running);
-        if (janitor.joinable()) janitor.join();
     } else {
         std::cout << "[node] running. Press Ctrl+C to stop.\n";
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
-            candidates.cleanup_expired();
         }
     }
 

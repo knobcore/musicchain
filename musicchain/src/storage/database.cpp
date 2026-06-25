@@ -849,6 +849,25 @@ bool Database::mod_log_has_sig(const std::string& sig_hex) const {
     return get(ms_key(sig_hex)).has_value();
 }
 
+// ---- Forgery-report tally (#4) --------------------------------------
+
+void Database::record_forgery_report(leveldb::WriteBatch& b,
+                                     const Hash256& content_hash,
+                                     const Address& reporter) {
+    // Set-valued key fr:<content_hash hex>:<reporter addr hex>. Idempotent,
+    // so a replayed report from the same reporter never inflates the count.
+    put_batch(b, "fr:" + hex(content_hash) + ":" + hex(reporter), {});
+}
+
+int Database::forgery_report_count(const Hash256& content_hash) const {
+    const std::string prefix = "fr:" + hex(content_hash) + ":";
+    int n = 0;
+    for_each_with_prefix(prefix, [&](const std::string&, const std::string&){
+        ++n; return true;
+    });
+    return n;
+}
+
 uint64_t Database::latest_mod_log_ts() const {
     uint64_t latest = 0;
     for_each_with_prefix("ml:", [&](const std::string& k, const std::string&){

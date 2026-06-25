@@ -176,6 +176,17 @@ class PlayerServer {
       String peerId, Map<String, dynamic> body, String originator) async {
     final hash = body['content_hash'] as String? ?? '';
     if (hash.isEmpty) return null;
+    // (#13 instability fix) On the relay path the originator peer-id is
+    // written verbatim into the F-frame prefix (codeUnitAt(0..39)). A
+    // malformed originator (non-empty but not exactly 40 chars) would
+    // RangeError mid-stream and hang the seeder ~30s. Reject it here so the
+    // requester learns immediately instead of stalling.
+    if (originator.isNotEmpty && originator.length != 40) {
+      return {'matched': false, 'content_hash': hash, 'error': 'bad_originator'};
+    }
+    // #10: the requester threads the broker-minted delivery_id here so we
+    // can stamp it into the F-frame prefix the mini-node accounts on.
+    final deliveryId = body['delivery_id'] as String? ?? '';
     final entry = _lib.entryByHash(hash);
     if (entry == null || !entry.isLocal) {
       return {'matched': false, 'content_hash': hash};
@@ -192,7 +203,20 @@ class PlayerServer {
     } on FileSystemException catch (e) {
       return {'matched': false, 'content_hash': hash, 'error': e.message};
     }
-    final sid = _rng.nextInt(0xFFFFFFFF);
+    // (#17 instability fix) The REQUESTER proposes a stream_id it has
+    // guaranteed unique among its own concurrent fetches (a monotonic
+    // counter), so chunks can't be misrouted in its _streams map by two
+    // serving peers independently picking the same random 32-bit id. We
+    // honor it for the wire framing, masking to the 32 bits the chunk header
+    // actually carries, and only reallocate if it already names another
+    // stream WE are serving (cross-requester collision on this node). Absent
+    // (old client) → fall back to a random id, the legacy behavior.
+    int sid = (body['client_stream_id'] as num?)?.toInt()
+        ?? _rng.nextInt(0xFFFFFFFF);
+    sid &= 0xFFFFFFFF;
+    while (_streams.containsKey(sid)) {
+      sid = _rng.nextInt(0xFFFFFFFF);
+    }
 
     // If [originator] is non-empty, the request arrived via VPS relay.
     // The VPS doesn't track stream chunks by req_id — only the 'F' tag
@@ -205,6 +229,7 @@ class PlayerServer {
       streamId:   sid,
       file:       file,
       totalBytes: totalBytes,
+      deliveryId: deliveryId,
     ));
 
     return {
@@ -250,10 +275,16 @@ class PlayerServer {
     required int    streamId,
     required File   file,
     required int    totalBytes,
+    String          deliveryId = '',
   }) async {
     final relay      = relayTo.isNotEmpty;
     const kTagF      = 0x46; // 'F'
-    final prefixLen  = relay ? (1 + 40) : 0;
+    // #10: on the relay path the F-frame prefix is ALWAYS 'F'(1) +
+    // target(40) + delivery_id(16). The mini-node strips exactly 1+40+16
+    // (tools/mini_node.cpp on_relay_binary), so we always reserve the 16
+    // bytes — writing the delivery_id when we have one, zeros otherwise —
+    // or the receiver would read the chunk header off the delivery_id.
+    final prefixLen  = relay ? (1 + 40 + 16) : 0;
     final peerPtr    = sendTo.toNativeUtf8();
     final native     = malloc<Uint8>(prefixLen + 9 + chunkPayload);
     // Page-sized scratch we reuse across iterations. We could read
@@ -271,6 +302,17 @@ class PlayerServer {
         // 40 hex characters of the originator's peer id, ASCII-encoded.
         for (int i = 0; i < 40; ++i) {
           native[1 + i] = relayTo.codeUnitAt(i);
+        }
+        // 16 raw delivery_id bytes (#10). 32 valid hex chars → 16 bytes;
+        // otherwise zeros (no triangulation for this delivery).
+        final haveDid = deliveryId.length == 32;
+        for (int i = 0; i < 16; ++i) {
+          int v = 0;
+          if (haveDid) {
+            v = (_hexNibble(deliveryId.codeUnitAt(i * 2)) << 4) |
+                 _hexNibble(deliveryId.codeUnitAt(i * 2 + 1));
+          }
+          native[1 + 40 + i] = v;
         }
       }
       var offset = 0;
@@ -371,4 +413,13 @@ class _ActiveStream {
   final String peerId;
   bool cancelled = false;
   final Completer<void> done = Completer<void>();
+}
+
+// One hex char (ASCII code unit) → nibble value 0..15 (0 on non-hex). Used
+// to pack the delivery_id hex into the F-frame prefix (#10).
+int _hexNibble(int c) {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;        // '0'..'9'
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10;   // 'a'..'f'
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10;   // 'A'..'F'
+  return 0;
 }

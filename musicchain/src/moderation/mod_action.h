@@ -124,6 +124,29 @@ inline bool verify(const Envelope& e, const Database& db) {
     return mc::crypto::verify_ecdsa(h, sig, pub);
 }
 
+// Like verify() but WITHOUT the is_moderator gate. Used by the forgery-
+// report path (#4): a forgery_report is a *machine attestation* ("I, node
+// X, decoded the audio at this content_hash and measured a fingerprint
+// mismatch"), signed by the auditing node's own key — which is not a
+// moderator key. Trust comes from K-independent-reports + local re-audit
+// (see RatsApi::handle_forgery_report), NOT a moderator allowlist. Verifies
+// only that the signature is valid for the carried pubkey.
+inline bool verify_signature_only(const Envelope& e) {
+    if (e.v != 1) return false;
+    auto pub_bytes = mc::crypto::from_hex(e.mod_pub_hex);
+    if (pub_bytes.size() != 33) return false;
+    PubKey33 pub{};
+    std::copy(pub_bytes.begin(), pub_bytes.end(), pub.begin());
+    const std::string c = canon(e.action, e.value, e.ts_ms, e.mod_pub_hex);
+    const Hash256 h = mc::crypto::sha256(
+        reinterpret_cast<const uint8_t*>(c.data()), c.size());
+    auto sig_bytes = mc::crypto::from_hex(e.sig_hex);
+    if (sig_bytes.size() != 64) return false;
+    Sig64 sig{};
+    std::copy(sig_bytes.begin(), sig_bytes.end(), sig.begin());
+    return mc::crypto::verify_ecdsa(h, sig, pub);
+}
+
 // Mutate db so it reflects the envelope's action. The caller must already
 // have verified the signature; replay protection (dedup by sig) is
 // expected to be enforced upstream via mod_log_has_sig.

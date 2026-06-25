@@ -39,13 +39,21 @@ Java_com_example_musicchain_1player_Chromaprint_nativeFeedShorts(
         jlong handle, jshortArray data, jint count) {
     auto* ctx = reinterpret_cast<ChromaprintContext*>(handle);
     if (!ctx || !data || count <= 0) return JNI_FALSE;
-    // GetPrimitiveArrayCritical avoids the copy that GetShortArrayElements
-    // would do — important when we feed millions of samples per song.
-    void* raw = env->GetPrimitiveArrayCritical(data, nullptr);
-    if (!raw) return JNI_FALSE;
+    // (#crash) Never read past the array — `count` comes from Kotlin and a
+    // stale/oversized value would over-read the buffer.
+    const jsize arrLen = env->GetArrayLength(data);
+    if (count > arrLen) count = arrLen;
+    if (count <= 0) return JNI_FALSE;
+    // (#crash) Use GetShortArrayElements, NOT GetPrimitiveArrayCritical: the
+    // critical variant disables GC for the whole span, and holding it across
+    // the slow chromaprint_feed can trip a CheckJNI / GC-safepoint-timeout
+    // abort (SIGABRT) on Android. The elements API is safe to hold across
+    // slow work (it may copy, which is an acceptable cost for not crashing).
+    jshort* elems = env->GetShortArrayElements(data, nullptr);
+    if (!elems) return JNI_FALSE;
     const int rc = chromaprint_feed(
-        ctx, static_cast<int16_t*>(raw), count);
-    env->ReleasePrimitiveArrayCritical(data, raw, JNI_ABORT);
+        ctx, reinterpret_cast<int16_t*>(elems), count);
+    env->ReleaseShortArrayElements(data, elems, JNI_ABORT);
     return rc == 1 ? JNI_TRUE : JNI_FALSE;
 }
 

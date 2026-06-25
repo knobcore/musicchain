@@ -97,10 +97,9 @@ if(NOT LEVELDB_FOUND AND NOT leveldb_FOUND)
   endif()
 endif()
 
-# libuv
-if(PKG_CONFIG_FOUND)
-  pkg_check_modules(UV REQUIRED libuv)
-endif()
+# libuv removed — its only consumer was the legacy libuv TCP mesh
+# (network/peer.cpp), deleted in the Model 1 cleanup. The live transport
+# is librats (QUIC), which has no libuv dependency.
 
 # libmicrohttpd was removed — HTTP/3 now goes through msh3 (see
 # src/transport/h3_server.cpp) tunneled inside the librats QUIC mesh on
@@ -198,15 +197,9 @@ else()
   set(MC_OPENSSL_CRYPTO OpenSSL::Crypto)
 endif()
 
-# libcurl (for registry announcer)
-find_package(CURL QUIET)
-if(NOT CURL_FOUND)
-  find_path(CURL_INCLUDE_DIRS curl/curl.h)
-  find_library(CURL_LIBRARIES NAMES libcurl curl)
-  if(CURL_INCLUDE_DIRS AND CURL_LIBRARIES)
-    set(CURL_FOUND TRUE)
-  endif()
-endif()
+# libcurl removed — its only consumer was the HttpGossip registry
+# announcer (network/registry_announcer.cpp), deleted in the Model 1
+# cleanup. Block sync now runs over librats (BlockPropagator).
 
 # nlohmann/json
 find_package(nlohmann_json QUIET)
@@ -279,8 +272,6 @@ set(MC_LINK_LIBS
   ${OPUS_LIBRARIES}
   ${OPUSFILE_LIBRARIES}
   ${LEVELDB_LIBRARIES}
-  ${UV_LIBRARIES}
-  ${CURL_LIBRARIES}
 )
 
 if(NOT MSVC)
@@ -321,25 +312,25 @@ if(TARGET leveldb::leveldb)
   list(APPEND MC_LINK_LIBS leveldb::leveldb)
 endif()
 
-if(TARGET CURL::libcurl)
-  list(REMOVE_ITEM MC_LINK_LIBS ${CURL_LIBRARIES})
-  list(APPEND MC_LINK_LIBS CURL::libcurl)
-endif()
-
 if(MINIUPNPC_FOUND)
   list(APPEND MC_LINK_LIBS ${MINIUPNPC_LIBRARIES})
 endif()
 
 list(APPEND MC_LINK_LIBS mc_rats_quic)
 
-# librats has been replaced by src/transport/mc_rats_quic.cpp which provides
-# the same C API on top of msquic. The player still ships rats.dll separately
-# until Phase 2c swaps the Dart FFI bindings to load mc_rats.dll instead.
+# NOTE (historical): src/transport/mc_rats_quic.cpp was a custom msquic-based
+# reimplementation of the librats C API. That QUIC bridge was removed; the
+# real transport is now librats (frozen v0.2.0), and `mc_rats_quic` is just a
+# CMake ALIAS for the `rats` target (see the add_library(mc_rats_quic ALIAS
+# rats) below) so older link references keep resolving. The include dir is
+# retained for the few headers (e.g. cert_util.h) still shared with the
+# opt-in HTTP/3 surface.
 list(APPEND MC_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/src/transport")
 
 # ---- Windows: socket libs needed by rats_link / peer code ----
+# advapi32: RegGetValueA in src/util/hw_fingerprint.cpp (MachineGuid etc.).
 if(WIN32)
-  list(APPEND MC_LINK_LIBS ws2_32 iphlpapi bcrypt)
+  list(APPEND MC_LINK_LIBS ws2_32 iphlpapi bcrypt advapi32)
 endif()
 
 # ---- Library sources ----
@@ -364,7 +355,6 @@ set(MC_SOURCES
   src/audio/ogg_decoder.cpp
   src/audio/fingerprint.cpp
   src/audio/multi_decoder.cpp
-  src/consensus/validator.cpp
   src/consensus/candidate.cpp
   src/consensus/slashing.cpp
   src/sync/block_propagator.cpp
@@ -381,6 +371,7 @@ set(MC_SOURCES
   src/api/jsonrpc_server.cpp
   src/api/routes.cpp
   src/api/rats_api.cpp
+  src/util/hw_fingerprint.cpp
   src/capi/capi.cpp
 )
 if(msh3_FOUND)

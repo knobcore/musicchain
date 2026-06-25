@@ -15,9 +15,17 @@ struct ChainTip {
     Hash256  hash;
     uint32_t height;
     // Timestamp of the tip header (ms since epoch). Used by the
-    // fork-choice rule below to break ties when two competing chains
-    // sit at the same height. Zero on a freshly-initialized chain.
+    // fork-choice rule below to break ties. Zero on a fresh chain.
     uint64_t timestamp_ms = 0;
+    // Fork weight (#8) = cumulative count of MintTx (play-reward mints)
+    // across every block from genesis to this tip. Each MintTx required a
+    // realtime, per-device-gated, audited play to exist, so this is
+    // "cumulative audited plays" — demand-backed and deterministic (every
+    // node counts the same MintTxs). Heartbeat / song-registration blocks
+    // with no plays add 0, so a fork padded with free heartbeats cannot
+    // out-weight a chain carrying real plays. Persisted per block under
+    // the "cw:" prefix; recovered on startup.
+    uint64_t weight = 0;
 };
 
 // Hardcoded checkpoint baked into the binary. Any chain we sync from a
@@ -40,20 +48,25 @@ inline std::vector<Checkpoint> hardcoded_checkpoints() {
     return {};
 }
 
-// Fork-choice rule used by BlockPropagator when comparing a peer's tip
-// to our own. "Better" means we should adopt theirs.
+// Fork-choice rule (#8, Model 1): "better" means we should adopt theirs.
 //
-//   1. Longer chain wins (higher height).
-//   2. On ties, newer block timestamp wins.
-//   3. On both ties, hash-bytewise wins (deterministic tiebreaker so
-//      every node converges on the same winner; prevents oscillation
-//      between two equally-good chains).
+//   1. More cumulative audited plays wins (higher weight). This is the
+//      Sybil-resistant metric: a heavier chain required more realtime,
+//      device-gated, audited plays — work an attacker can't fake for
+//      free. Free heartbeat blocks add 0 weight, so they can't pump a
+//      fork past a real chain (closes the old free-heartbeat height pump).
+//   2. On equal weight, longer chain wins (higher height).
+//   3. On ties, newer block timestamp wins.
+//   4. On all ties, hash-bytewise wins (deterministic tiebreaker so every
+//      node converges on the same winner; prevents oscillation).
 //
-// This is the simplest defensible rule we can ship without an economic
-// stake model — Bitcoin uses cumulative work, we use cumulative height
-// + recency. Equivalent under honest-majority assumption, and easy for
-// peers to verify without holding the whole chain.
+// Every term is a deterministic function the receiving node recomputes
+// itself, so "majority agreement" is convergence on this rule — no votes
+// (see docs §22). Cheap to verify: weight + height + ts + hash all live
+// in the tip the peer advertises.
 inline bool tip_is_better(const ChainTip& candidate, const ChainTip& current) {
+    if (candidate.weight != current.weight)
+        return candidate.weight > current.weight;
     if (candidate.height != current.height)
         return candidate.height > current.height;
     if (candidate.timestamp_ms != current.timestamp_ms)
@@ -70,6 +83,14 @@ public:
     // Initialize from database; rebuilds derived state if necessary.
     bool init();
 
+    // Merge operator-supplied checkpoints (from config.json) on top of
+    // the baked-in hardcoded_checkpoints(). A config entry at a height
+    // that is also hardcoded overrides the baked value (the operator
+    // explicitly took responsibility); otherwise the lists are unioned.
+    // Call once at startup, BEFORE init()/sync, so the eclipse gate is
+    // live before any block is accepted. Returns the count merged.
+    size_t add_config_checkpoints(const std::vector<Checkpoint>& cps);
+
     // Returns current tip (height and hash). Atomic snapshot under the
     // chain's internal mutex so producer + network threads see a
     // consistent (hash, height) pair.
@@ -84,6 +105,22 @@ public:
 
     // Disconnect the most recent block (for reorg support).
     bool disconnect_block();
+
+    // Fork-choice reorg (#8). `branch` is a contiguous run of blocks
+    // starting at fork_height+1, with branch[0].prev_hash == fork_hash
+    // (a block already on our chain at fork_height). Adopts the branch
+    // IFF its cumulative weight (audited plays) exceeds our current tip's.
+    // Implemented as a try-and-rollback: rewrite the height→hash index to
+    // the branch, rebuild_derived_state() to re-derive balances/indexes
+    // deterministically, and if the result isn't actually heavier (or a
+    // branch block fails validation) restore the previous chain. Returns
+    // true only when the reorg succeeded and is now canonical. Safe to
+    // call with a non-heavier branch — it just returns false.
+    bool reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
+                         const std::vector<Block>& branch, std::string& err);
+
+    // Cumulative audited-play weight at the current tip (fork weight).
+    uint64_t tip_weight() const { return tip().weight; }
 
     // Retrieve block by hash.
     std::optional<Block> get_block(const Hash256& hash) const;
@@ -183,6 +220,18 @@ private:
     mutable std::mutex mu_;
     Database& db_;
     ChainTip  tip_{};
+
+    // Effective checkpoint set (#7): seeded from hardcoded_checkpoints()
+    // at construction, extended via add_config_checkpoints(). Keyed by
+    // height so checkpoint_ok() is an O(log n) lookup. Empty today (no
+    // audited mainnet height yet) → the gate is a no-op until populated.
+    std::map<uint32_t, Hash256> checkpoints_;
+
+    // Returns true unless `height` is a checkpoint AND `hash` differs from
+    // the pinned value. A height with no checkpoint always passes. This is
+    // the eclipse defense: even if every peer we see is the attacker, they
+    // can't reproduce an audited hash without holding the real block.
+    bool checkpoint_ok(uint32_t height, const Hash256& hash) const;
 
     // Votes recorded earlier in the *current* block but not yet
     // flushed to leveldb. We consult both this set and the persistent

@@ -4,6 +4,15 @@ Canonical reference for the post-2026-06-21 topology: web/browser surfaces delet
 librats frozen at v0.2.0, mini-nodes hardened as relays, full nodes as chain authority
 and content trackers, players as Android + Windows only.
 
+**Consensus is Model 1 — vote-free deterministic** (post-2026-06-24 de-nerf pass): blocks
+carry NO validator confirmations; every node independently re-derives validity from content
++ history and converges on the heaviest chain, where "heaviest" = **cumulative audited plays**
+(`MintTx` count, so free heartbeat blocks add 0 weight). MC is an **internal-only token** —
+there is no external bridge (the Base / mcCOIN bridge was removed for its custodial,
+forge-to-cash security model). The full blockchain + validation internals, the Model 1
+design, and the de-nerf changelog live in
+[`docs/BLOCKCHAIN_AND_NETWORK_INTERNALS.md`](docs/BLOCKCHAIN_AND_NETWORK_INTERNALS.md).
+
 This file describes what is actually on disk, not what we wish were on disk. When
 code disagrees with prose, code wins; if you change one, change the other.
 
@@ -46,10 +55,15 @@ state (catalog, swarm membership, moderation log, DMCA/KYC inbox, offline
 play-proof verification, username registration, royalty session bookkeeping,
 encrypted moderator inbox).
 
-Full nodes run the consensus loop (BlockPropagator + `mc::Chain`), persist a
-LevelDB at `<data_dir>/blockchain.db`, and gossip block candidates and
-confirmations via librats typed messages (`src/network/rats_link.cpp:417-440`).
-They expose the entire RPC verb surface in `src/api/rats_api.cpp`.
+Full nodes run the chain (`mc::Chain`) + block distribution (`BlockPropagator`) and
+persist a LevelDB at `<data_dir>/blockchain.db`. Consensus is **vote-free (Model 1)**:
+a block is built → `connect_block`-validated → announced, with **no candidate/confirmation
+gossip** (that machinery — `BlockCandidate`/`dynamic_quorum`/`mc:block_candidate`/
+`mc:block_confirmation` — was deleted). Peers fetch blocks via the `block.*` verbs
+(`block.hello`/`getblocks`/`inv`/`getdata`/`data` + per-block DHT announce) and re-validate
+them deterministically. Fork choice adopts the chain with the most **cumulative audited
+plays** (`ChainTip.weight`, `cw:` index), with an automatic try-and-rollback reorg
+(`Chain::reorg_to_branch`). They expose the entire RPC verb surface in `src/api/rats_api.cpp`.
 
 Full nodes discover content holders for a given song two ways:
 
@@ -235,11 +249,14 @@ The non-data verbs that keep the mesh coherent.
   Wrapped as a normal `musicchain.reply` with the inner type set verbatim
   so the receiver sees it on its push channel without `req_id` correlation.
 - **F-tag binary relay** — player → mini-node. Wire format: `0x46` (`'F'`) +
-  40 hex chars of `target_peer_id` + payload (`tools/mini_node.cpp:1484-1495`).
-  Mini-node strips the prefix and calls `rats_send_binary` against the target
-  (`:1576-1577`). Now rate-limited per source peer via a 50 MB token bucket
-  refilling at 10 MB/s (`:153-160` and `:1536-1570`), so a chatty cellular
-  peer can no longer saturate the VPS uplink.
+  40 hex chars of `target_peer_id` + **16 raw `delivery_id` bytes** (#10, zeros if none) +
+  payload. Mini-node strips the full `1+40+16` prefix, charges the payload to the rate
+  bucket, accumulates the bytes against the `delivery_id` for the relay-reward triangulation
+  (§5), and calls `rats_send_binary` against the target (`tools/mini_node.cpp on_relay_binary`).
+  The `1+40+16` prefix length moves in **lockstep** across the player writer
+  (`player_server.dart _streamChunks`) and the mini stripper — change one, change both, or the
+  receiver reads its chunk header off the wrong offset. Rate-limited per source peer via a
+  50 MB token bucket refilling at 10 MB/s, so a chatty cellular peer can't saturate the uplink.
 - **`stun.observe`** — player → mini-node. Echoes the IP:port the responder
   sees the caller from, using `source_port` (NAT-mapped) not `port`
   (handshake-claimed listen port) — see the comment at
@@ -275,38 +292,37 @@ The non-data verbs that keep the mesh coherent.
 
 ## 5. Earning model
 
-Mini-nodes earn `RelayRewardTx` for tunneling binary-traffic verbs on behalf
-of a player.
+MC is **internal-only** (no external bridge), so reward integrity is about fair internal
+distribution, not external value. The relay reward is now credited **per corroborated byte**
+via a **player/mini-node/full-node triangulation** (the old "one credit per `stream.open`,
+founder trusts the relay" model is gone). Full design + exact wire formats:
+[`docs/BLOCKCHAIN_AND_NETWORK_INTERNALS.md`](docs/BLOCKCHAIN_AND_NETWORK_INTERNALS.md) §19.1.
 
-- **Counting** — the full node's `RatsApi::handle_request` notices when an
-  incoming envelope has a non-empty `originator_peer_id` AND the immediate
-  sender peer is in `peer_to_wallet_` AND the dispatch status is `ok` AND the
-  verb is in the credit-earning whitelist. It calls
-  `RelayCreditTracker::increment(mini_addr, 1)`
-  (`src/api/rats_api.cpp:1498-1522`).
-- **Whitelist** — currently only `stream.open` (`src/api/rats_api.cpp:1505`).
-  The header comment at `src/net/relay_credit_tracker.h:38-48` names the
-  canonical earning verbs as `stream.open`, `song.audio`, `song.get`; the
-  latter two were pre-pivot verbs and are not implemented in the current
-  rats_api. Per-stream not per-byte — see §8.
-- **Storage** — credits hit LevelDB under the `rc:` prefix immediately
-  (`src/net/relay_credit_tracker.cpp:41-50`). Survives full-node restarts.
-- **Sweep** — `RelayCreditTracker::loop` wakes every `kSweepIntervalMs`
-  (5 minutes, `src/net/relay_credit_tracker.h:54`), swaps the in-memory map
-  under the lock, calls the caller-supplied mint callback for each
-  `(mini_addr, count)`, and clears LevelDB on success
-  (`src/net/relay_credit_tracker.cpp:69-135`).
-- **Pre-cap** — counts above `kMaxCountPerTx = 1,000,000` are clamped to
-  1M and the overflow carried over to the next sweep
-  (`src/net/relay_credit_tracker.cpp:95-130`). This matches the
-  `apply_relay_reward` chain-side validation cap (`src/core/chain.cpp:470+`,
-  see `src/core/transaction.cpp:491+` for the rejection point). A runaway
-  accumulator can no longer mint an unmineable tx and silently drop the
-  credit.
-- **Mint callback** — constructs a `RelayRewardTx`, signs it with the
-  founder key, and pushes to the mempool. The transaction layout lives in
-  `src/core/transaction.h:238-266` (1 MC per credit unit, target = mini
-  wallet).
+Mini-nodes earn `RelayRewardTx` for the bytes they actually tunnel, established by three
+independent signed reports that must agree:
+
+- **Broker mint** — at `stream.open` the full node mints a random 16-byte `delivery_id`,
+  records a `pd:<id>` pending-delivery row, and returns the id on the reply
+  (`RatsApi::mint_delivery`). The full node is the anchor: it provably brokered the request.
+- **F-frame carries the id** — the requesting player threads `delivery_id` into its per-peer
+  `stream.open`; the serving player stamps the 16 raw bytes into the relay F-frame prefix
+  (`'F'`(1) + target(40) + **delivery_id(16)** + chunk, §4). The mini-node strips `1+40+16`,
+  charges the payload to its rate bucket, and accumulates bytes per `delivery_id`.
+- **Mini report (signed)** — on idle the reaper broadcasts a `relay.report` to every full
+  node in `g_routes`; only the broker holds the matching `pd:` row and accepts it (others
+  reply `ignored`). Signed `"relay.report" || delivery_id || bytes_relayed(LE) || mini_wallet`.
+- **Player receipt (signed)** — the requesting player sends `relay.receipt` to the broker:
+  `"relay.receipt" || delivery_id || content_hash || bytes_received(LE)`, signed with the
+  player wallet (broker verifies with `verify_data`).
+- **Credit on corroboration** — when brokered+reported+receipted all set, the broker credits
+  `min(relayed,received)` bytes × **10 internal units** (1 MC / 10 MB, overflow-clamped) to
+  the mini wallet via `RelayCreditTracker::increment`, then deletes the `pd:` row (single-use
+  ⇒ replay-proof). Orphan rows are TTL-pruned in the tracker sweep.
+- **Storage / sweep** — credits accrue in LevelDB under `rc:` (survives restarts); every
+  `kSweepIntervalMs` (5 min) the tracker mints one `RelayRewardTx{count = internal units}` per
+  mini, founder-signed, into the mempool. `apply_relay_reward` credits `count` **directly as
+  units** (no per-MC scaling) under the `SUPPLY_CAP` guard, with a `kMaxUnitsPerTx = 1e12` cap
+  the tracker pre-clamps against. Transaction layout: `src/core/transaction.h` (RelayRewardTx).
 
 ---
 
@@ -389,41 +405,45 @@ Things that bound the design and are non-negotiable inside this codebase.
 
 ## 8. Open issues + known limitations
 
-This is the honest list of what isn't fully fixed as of 2026-06-21.
+This is the honest list of what isn't fully fixed (updated 2026-06-24 after the de-nerf pass;
+items marked ✅ were resolved then — see the internals doc §21 for the full changelog).
 
-1. **Per-stream credit, not per-byte.** `RelayCreditTracker::increment` is
-   called with `n=1` per relayed `stream.open`
-   (`src/api/rats_api.cpp:1520`). A 10 MB song and a 100 MB FLAC mint the
-   same credit. The right behavior is to charge bytes against the bucket
-   at the mini-node and report them to the full node on the sweep tick,
-   but neither side has the wire field today.
+1. **✅ FIXED — Per-byte credit via triangulation.** Credit is now `min(relayed,received)`
+   bytes × 10 internal units, established by the broker-minted `delivery_id` + the mini's
+   signed `relay.report` + the player's signed `relay.receipt` (§5, internals §19.1). A 100 MB
+   FLAC earns 10× a 10 MB song. `RelayCreditTracker` accumulates internal units and
+   `apply_relay_reward` credits them directly, under the `SUPPLY_CAP` guard. **⚠ New + not
+   build-verified; the founder key still signs the `RelayRewardTx` until Phase-3.**
 2. **No application-layer ACKs on the binary relay path.** PlayerServer
    paces by time, not by receiver feedback (`player_server.dart:96-97`).
    On a saturated mini-node uplink, chunks are dropped at the F-tag rate
    limiter or queued indefinitely in TCP buffers; the sender doesn't
    notice until a timeout.
-3. **No sender-side proof of delivery.** The mini-node could under-report
-   relayed traffic to under-credit a competitor's wallet, or the receiving
-   player could lie about EOF. Today the full node trusts that `status:"ok"`
-   on `stream.open` means the swarm session is real.
+3. **✅ FIXED (over-claim) — Signed three-way proof of delivery.** The mini-node can no longer
+   over-claim: the broker credits only `min(relayed, received)` where `relayed` comes from the
+   mini's signed `relay.report` and `received` from the player's signed `relay.receipt`, both
+   bound to the broker-minted `delivery_id` (§5). A lying mini is capped by the player's
+   receipt and vice-versa. **⚠ Residual:** a mini+player *colluding* can still inflate up to
+   what they jointly sign (bounded by the per-tx unit cap + supply cap); fully closing that
+   needs the real device attestation to make Sybil players scarce.
 4. **Single-VPS dev/test target.** The codebase supports multi-VPS topology,
    but daily testing uses one box at `85.239.238.226:8080`
    (`rats_client.dart:30`). Mesh edge cases — partition healing, leadership
    between mini-nodes when one goes down mid-stream, route TTL races on
    re-elect — are under-tested.
-5. **No replay protection on `offline.play_proof.submit` across restarts.**
-   The TODO at `src/api/rats_api.cpp:1301-1305` admits in-process-only
-   protection. A player that restarts the full node loses its dedup state
-   and a captured bundle replays.
-6. **Bot-detection heuristics are stubs.** Every heuristic in
-   `offline.play_proof.submit` returns `true`
-   (`src/api/rats_api.cpp:1308-1318` and below). The credit pipeline runs
-   end-to-end but the rejection criteria don't exist yet.
-7. **`RelayCreditTracker` whitelist is one verb.** Only `stream.open`. The
-   header comment names `song.audio` and `song.get` as the canonical set
-   but those verbs were removed pre-pivot — the actual data-plane earning
-   surface is just streams, not PieceDownloader's `audio.piece_get`. Per-
-   piece downloads don't credit the mini-node today.
+5. **✅ FIXED — Cross-restart replay protection on `offline.play_proof.submit`.** A
+   resubmitted bundle is rejected via a persisted `obp:<sig_hex>` marker (survives restarts).
+6. **✅ FIXED — Bot heuristics + structural device attestation.** All 11 heuristics in
+   `offline.play_proof.submit` are real (6 hard-rejecting, 4 soft-logging, `obp:hist:<addr>`
+   index). The player now ships a **hardware-derived `attestation`** (desktop native FFI
+   `mc_device_fingerprint`; Android Kotlin ANDROID_ID + `Build.*`) inside the wallet-signed
+   bundle + `session.start`; the `DeviceAttestationVerifier` derives a hardware-bound
+   `device_id` and records the level (`dal:` key). *Remaining (needs platform trust roots):
+   real battery/BSSID signals + the real hardware-attested verifier (Play Integrity / TPM).*
+7. **✅ FIXED — Earning is per-byte, keyed on `delivery_id`, not a verb whitelist.** The relay
+   credit is now driven by the F-frame `delivery_id` accounting, so it covers any relayed audio
+   bytes the broker brokered — the old single-verb (`stream.open`-only) whitelist is gone.
+   `song.audio`/`song.get` were pre-pivot verbs; the live data plane is streams.
 8. **F-tag binary relay has no length field.** Receiver-side validation
    trusts librats's framing. A malformed F-tag with a runt body could
    confuse the receiver's stream demuxer; the player's 1 MB hard ceiling

@@ -104,6 +104,20 @@ MUSICCHAIN_API char* mc_wallet_get_public_key(mc_wallet_t wallet);
  *  Caller must free with mc_free(). */
 MUSICCHAIN_API char* mc_wallet_sign(mc_wallet_t wallet, const uint8_t* data, size_t len);
 
+// ---- Device fingerprint (#5 structural attestation) -----------------
+
+/** Hardware-derived device fingerprint for the desktop platforms
+ *  (Windows / Linux / macOS). Returns the lowercase hex of a SHA-256 over
+ *  the machine's stable hardware identifiers — primary MAC address, board /
+ *  CPU / disk serials, the OS name+version string, and (Windows)
+ *  MachineGuid. Stable across reboots and app reinstalls, so the full
+ *  node's per-device rate limiter buckets honest hardware rather than a
+ *  resettable random token. Android supplies its own fingerprint over a
+ *  Kotlin MethodChannel instead (the NDK can't read these identifiers), so
+ *  this returns NULL there. Returns NULL if no identifier could be read.
+ *  Caller must free with mc_free(). */
+MUSICCHAIN_API char* mc_device_fingerprint(void);
+
 // ---- Audio decoding -------------------------------------------------
 
 typedef void* mc_decoder_t;

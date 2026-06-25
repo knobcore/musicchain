@@ -133,6 +133,7 @@ private:
     // -- peer state ---------------------------------------------------
     struct PeerState {
         uint32_t tip_height{0};
+        uint64_t tip_weight{0};   // #8: peer's cumulative-play fork weight
         Hash256  tip_hash{};
         bool     hello_received{false};
         /// Hashes we know this peer already knows about — used to
@@ -243,6 +244,13 @@ private:
     std::unordered_set<Hash256, Hash256Hash>                              announced_;
     std::chrono::steady_clock::time_point                                 last_full_announce_{};
 
+    /// (#11) Per-peer last block.hello time so a flapping peer reconnecting
+    /// can't re-trigger block.hello → getblocks catch-up on every connect.
+    /// Pruned of stale entries on access, so it stays bounded by active peers.
+    /// Guarded by peers_mu_.
+    std::unordered_map<std::string,
+                       std::chrono::steady_clock::time_point>             last_hello_at_;
+
     std::thread             announce_thread_;
     std::thread             apply_thread_;
     std::thread             stall_thread_;
@@ -255,6 +263,11 @@ private:
     static constexpr std::chrono::seconds    kGetdataStall{20};
     static constexpr std::chrono::seconds    kDhtSearchMinGap{30};
     static constexpr std::chrono::minutes    kReannounceMin{30};
+    /// (#11) cooldown between block.hello to the same peer across reconnects.
+    static constexpr std::chrono::seconds    kHelloCooldown{15};
+    /// (#8) cap on a peer's `known` set; cleared past this so a long-lived
+    /// connection can't grow it without bound (a re-INV is harmless/deduped).
+    static constexpr size_t                  kKnownCap            = 8192;
     /// Above this height we DHT-announce every block on startup; below
     /// it we walk the chain in batches and announce in bursts (gives
     /// brand-new nodes a chance to find the chain quickly via DHT).

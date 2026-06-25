@@ -68,11 +68,14 @@ class Fingerprinter {
           // path rather than NPE-via-TypeError if the bridge omitted
           // the fingerprint string (e.g. older APK, malformed reply).
           final compressedRaw = reply['compressed'];
-          if (compressedRaw is String && compressedRaw.isNotEmpty) {
-            final compressed   = compressedRaw;
-            final sampleRate   = reply['sample_rate']   as int;
-            final channelCount = reply['channel_count'] as int;
-            final pcmSamples   = (reply['pcm_samples']  as num).toInt();
+          // (#crash) coerce every field — a raw `as int` here would TypeError
+          // on a null/double from the bridge and ESCAPE (the on PlatformException
+          // clauses don't catch a TypeError). Null fields → fall through to legacy.
+          final compressed   = compressedRaw is String ? compressedRaw : '';
+          final sampleRate   = (reply['sample_rate']   as num?)?.toInt();
+          final channelCount = (reply['channel_count'] as num?)?.toInt();
+          final pcmSamples   = (reply['pcm_samples']   as num?)?.toInt() ?? 0;
+          if (compressed.isNotEmpty && sampleRate != null && channelCount != null) {
             final digest = crypto.sha256.convert(utf8.encode(compressed));
             return FingerprintResult(
               compressed:      compressed,
@@ -102,9 +105,17 @@ class Fingerprinter {
       if (reply == null) {
         throw StateError('decodeToPcm returned null');
       }
-      pcm          = reply['pcm']           as Uint8List;
-      sampleRate   = reply['sample_rate']   as int;
-      channelCount = reply['channel_count'] as int;
+      // (#crash) validate before assigning — a raw `as Uint8List`/`as int` on
+      // a malformed bridge reply TypeErrors out of the scan with no context.
+      final pcmRaw = reply['pcm'];
+      final sr     = (reply['sample_rate']   as num?)?.toInt();
+      final cc     = (reply['channel_count'] as num?)?.toInt();
+      if (pcmRaw is! Uint8List || sr == null || cc == null) {
+        throw StateError('decodeToPcm returned a malformed reply');
+      }
+      pcm          = pcmRaw;
+      sampleRate   = sr;
+      channelCount = cc;
     } else if (Platform.isWindows) {
       final d = MediaFoundationDecoder.instance.decode(path);
       pcm          = d.pcm;

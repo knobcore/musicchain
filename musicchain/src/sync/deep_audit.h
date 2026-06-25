@@ -5,9 +5,31 @@
 #include "../storage/database.h"
 
 #include <atomic>
+#include <functional>
+#include <optional>
+#include <string>
 #include <thread>
 
 namespace mc {
+
+// Result of comparing a song's audio bytes against its declared
+// fingerprint. ok = matches within tolerance; sim = measured similarity;
+// audio_sha = sha256 of the exact bytes audited (the audit transcript,
+// gossiped in a forgery report so other nodes can corroborate / re-audit).
+struct AuditResult {
+    bool    ok;
+    float   sim;
+    Hash256 audio_sha;
+};
+
+// Reusable core: decode the audio stored at `content_hash` in the
+// content-addressed store under `audio_dir`, re-fingerprint it, and compare
+// to the declared fingerprint recorded for that hash in `db`. Returns
+// nullopt if the bytes aren't held locally or can't be decoded. Used by the
+// DeepAuditor loop AND by RatsApi's forgery-report re-audit path.
+std::optional<AuditResult> audit_content(Database& db,
+                                         const std::string& audio_dir,
+                                         const Hash256& content_hash);
 
 // DeepAuditor — anti-forgery check that closes the audio↔fingerprint
 // gap our sync-time fingerprint validation can't on its own.
@@ -43,7 +65,17 @@ public:
     static constexpr float    kSlashThreshold    = 0.50f;
     static constexpr uint32_t kAuditIntervalMs   = 60 * 1000; // 1/min
 
-    DeepAuditor(Chain& chain, Database& db, const std::string& audio_dir);
+    // on_forgery (optional): called when a sampled block's audio does NOT
+    // match its declared fingerprint, with (content_hash, block_hash,
+    // measured similarity, audio sha256). node_main wires this to
+    // RatsApi::publish_forgery_report so the finding gossips across the mesh
+    // (#4). When unset, the auditor only invalidates the content locally.
+    using OnForgery = std::function<void(const Hash256& content_hash,
+                                         const Hash256& block_hash,
+                                         float sim,
+                                         const Hash256& audio_sha)>;
+    DeepAuditor(Chain& chain, Database& db, const std::string& audio_dir,
+                OnForgery on_forgery = {});
     ~DeepAuditor();
 
     void start();
@@ -51,14 +83,14 @@ public:
 
 private:
     void loop();
-    // Returns true if the block's audio matches its declared fingerprint
-    // within tolerance. False = forgery detected. nullopt = couldn't
-    // audit (audio not available locally — try again next cycle).
-    std::optional<bool> audit_block(const Block& block);
+    // Audit a sampled block's audio against its declared fingerprint.
+    // nullopt = couldn't audit (audio not held locally — retry next cycle).
+    std::optional<AuditResult> audit_block(const Block& block);
 
     Chain&            chain_;
     Database&         db_;
     std::string       audio_dir_;
+    OnForgery         on_forgery_;
     std::thread       worker_;
     std::atomic<bool> running_{false};
 };

@@ -7,11 +7,15 @@ namespace mc::crypto {
 
 // Ethereum-style Keccak-256 (NB: NOT the same as NIST SHA-3-256).
 //
-// We need this because the Base / mcCOIN bridge derives the user's
-// Base address with keccak256(uncompressed_pubkey)[12..32], and
-// OpenSSL only exposes the SHA-3 variant (which uses a different
-// padding byte — `0x06` instead of Keccak's `0x01` — so the digests
-// diverge for any input).
+// We need this because MusicChain addresses are EVM-compatible: the
+// 20-byte address is keccak256(uncompressed_pubkey)[12..32], exactly as
+// Ethereum/MetaMask derive it, so the same secp256k1 key yields the same
+// address in any standard EVM wallet. OpenSSL only exposes the SHA-3
+// variant (which uses a different padding byte — `0x06` instead of
+// Keccak's `0x01` — so the digests diverge for any input), hence this
+// self-contained implementation.
+// (The former Base/mcCOIN bridge that originally motivated this was
+// removed — keccak is retained purely for EVM-address compatibility.)
 //
 // Self-contained reference implementation of the Keccak-f[1600]
 // permutation. ~200 lines, no external deps. The constants are

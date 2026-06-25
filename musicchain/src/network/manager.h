@@ -43,6 +43,11 @@ struct NodeConfig {
     std::string log_level    = "info";
     Hash256     node_id      = {};
     std::string registry_url = {};
+    // Operator-supplied checkpoints (#7) merged on top of the baked-in
+    // hardcoded_checkpoints() at startup. Each entry pins a (height, hash)
+    // the synced chain must match — lets an operator bake in an audited
+    // height without recompiling. Empty by default.
+    std::vector<Checkpoint> checkpoints;
 };
 
 // Kept around so any future inbound-route persistence has a place to live —
@@ -60,9 +65,10 @@ struct DhtEntry {
 };
 
 /// `NetworkManager` is now a thin shim retained so existing call sites compile
-/// and link. The real transport is `mc_rats_quic`. All legacy methods are
-/// no-ops or trivially-empty getters until callers migrate over to direct
-/// rats calls.
+/// and link. The real transport is **librats** (frozen v0.2.0), driven via
+/// RatsLink + BlockPropagator. (`mc_rats_quic` is now just a CMake alias for
+/// the librats target — the old custom msquic transport was removed.) All
+/// legacy methods are no-ops or trivially-empty getters.
 class NetworkManager {
 public:
     NetworkManager(Chain& chain, CandidateManager& candidates,
@@ -77,33 +83,23 @@ public:
     using BlockHandler = std::function<void(mc::Block)>;
     void set_block_handler(BlockHandler h) { on_block_ = std::move(h); }
 
-    // Outbound broadcast is now a no-op; mc_rats_quic is the broadcast path.
-    // We keep the signature so consensus/candidate code doesn't have to be
-    // rewritten in this phase.
+    // Outbound broadcast is now a no-op; librats (via RatsLink /
+    // BlockPropagator) is the broadcast path. We keep the signature so
+    // consensus/candidate code doesn't have to be rewritten in this phase.
     template <typename T> void broadcast(const T&) {}
 
     // ---- peer_count plumbing ----------------------------------------
     //
-    // CandidateManager::commit_block branches on peer_count(): == 0 picks
-    // the solo self-sign fast path, > 0 broadcasts the candidate and
-    // waits for confirmations. Until node_main hands us a real provider
-    // we return 0 (correct for boot, before RatsLink is up).
+    // Model 1 (vote-free): consensus no longer branches on peer_count().
+    // This is now purely informational — node_main feeds the live
+    // validated-peer count so the `status` RPC and TUI report it. Until
+    // node_main hands us a provider we return 0 (correct for boot).
     using PeerCountProvider = std::function<size_t()>;
     void   set_peer_count_provider(PeerCountProvider p) { peers_ = std::move(p); }
     size_t peer_count() const { return peers_ ? peers_() : 0; }
 
-    // ---- candidate publisher ----------------------------------------
-    //
-    // Hook so CandidateManager can fan out a freshly-minted candidate
-    // block to the validator peer set. node_main wires this to
-    // RatsLink::publish_block_candidate. Until then it's a no-op — the
-    // self-sign path doesn't need it.
-    using CandidatePublisher =
-        std::function<void(const std::vector<uint8_t>& /*block_bytes*/)>;
-    void set_candidate_publisher(CandidatePublisher p) { publish_ = std::move(p); }
-    void publish_candidate(const std::vector<uint8_t>& bytes) const {
-        if (publish_) publish_(bytes);
-    }
+    // (Model 1) The candidate-publisher hook was removed — there is no
+    // candidate broadcast. Block distribution lives in BlockPropagator.
 
     // Diagnostic helpers — all return empty since the TCP mesh is gone.
     // Callers should migrate to `rats_get_peer_count()` etc.
@@ -122,7 +118,6 @@ private:
     crypto::KeyPair    keypair_;
     BlockHandler       on_block_;
     PeerCountProvider  peers_;
-    CandidatePublisher publish_;
 };
 
 } // namespace mc::net

@@ -8,15 +8,25 @@ namespace mc {
 
 // ---- Constants -------------------------------------------------------
 
-// Block format v2 — fingerprint-anchored, audio lives OUT of band.
+// Block format v3 — fingerprint-anchored, audio lives OUT of band,
+// and (Model 1) NO validator confirmations in the header.
 // Audio bytes are stored in a content-addressed file store keyed by
 // content_hash (see HttpServer::audio_dir() + verb_song_audio). The
 // block records only the fingerprint, content_hash, and song metadata.
 //
+// v3 vs v2: the BlockHeader.confirmations vote vector was removed. Under
+// vote-free deterministic consensus a block is canonical because every
+// node independently re-derives its validity from content + history;
+// there are no stored block-level votes to tally. Transactions keep
+// their own signatures — only block-level confirmation was removed.
+// This makes block.hash() a single canonical hash (no separate
+// signing_hash) and is a consensus-breaking format change, hence the
+// version bump.
+//
 // Heartbeat blocks (no fingerprint submissions in 5 minutes) ship with
 // has_song == 0; the SongSection is empty and only the tx pool is
-// confirmed.
-static constexpr uint32_t BLOCK_VERSION      = 2;
+// carried.
+static constexpr uint32_t BLOCK_VERSION      = 3;
 static constexpr uint8_t  SEPARATOR_BYTE     = 0xFF;
 static constexpr size_t   SEPARATOR_LENGTH   = 8;
 
@@ -124,8 +134,14 @@ struct SongSection {
     std::vector<RoyaltySplit> royalty_splits;
 };
 
-// ---- Validator confirmation -----------------------------------------
-
+// ---- Confirmation ---------------------------------------------------
+//
+// (validator_id, pubkey, signature) triple. As of block format v3 this
+// is NO LONGER part of the block header — Model 1 consensus stores no
+// block-level votes. The struct is retained for transaction-level use:
+// SlashTx EquivocationProof evidence carries Confirmations, and the type
+// is available for any future per-transaction confirmation scheme. It is
+// not written into BlockHeader.
 struct Confirmation {
     Hash256  validator_id;
     PubKey33 pubkey;
@@ -149,19 +165,21 @@ struct BlockHeader {
     Hash256                    fingerprint_hash{}; // zero on heartbeat
     Hash256                    content_hash{};     // zero on heartbeat
     uint64_t                   timestamp_ms     = 0;
-    std::vector<Confirmation>  confirmations;
+    // Model 1 (vote-free deterministic consensus): the header carries NO
+    // validator confirmations. Canonicality is re-derived by every node
+    // from content + history (fingerprint_hash, merkle_root, prev_hash,
+    // tx signatures); there are no stored block-level votes. The old
+    // `confirmations` vector and the separate signing_hash() it required
+    // were removed in format v3.
 
     // Serialise header to bytes (used for hash calculation)
     std::vector<uint8_t> serialize() const;
-    // Compute block hash = SHA256(header bytes including confirmations).
-    // The chain-canonical identifier — used as the leveldb key and what
-    // the inv/getdata protocol references.
+    // Compute block hash = SHA256(header bytes). The single chain-
+    // canonical identifier — the leveldb key and what the inv/getdata
+    // protocol references. With confirmations gone, this is also what a
+    // producer/verifier hashes for tx-signature anchoring; there is no
+    // separate signing_hash anymore.
     Hash256 hash() const;
-    // SHA256 of the header bytes with confirmations CLEARED. This is
-    // what producers and validators sign; verifiers must use the same
-    // hash so the signature lookup converges regardless of how many
-    // confirmations were appended to the header after signing.
-    Hash256 signing_hash() const;
 };
 
 // ---- Full block -----------------------------------------------------
@@ -178,11 +196,10 @@ struct Block {
     // Parse block from bytes; returns false on malformed input
     static bool deserialize(const uint8_t* data, size_t len, Block& out);
 
-    // Convenience: block hash (full header, used as the canonical id)
+    // Convenience: block hash (header, used as the canonical id). Under
+    // Model 1 this is the only block hash — confirmations are not stored,
+    // so there is no separate signing_hash.
     Hash256 hash()         const { return header.hash(); }
-    // Convenience: signing hash (header with confirmations cleared) —
-    // see BlockHeader::signing_hash docstring for why this is separate.
-    Hash256 signing_hash() const { return header.signing_hash(); }
 
     // Compute merkle root over transactions
     static Hash256 compute_merkle_root(const std::vector<std::vector<uint8_t>>& txs);

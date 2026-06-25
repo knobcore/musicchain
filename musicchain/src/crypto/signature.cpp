@@ -87,11 +87,16 @@ bool verify_ecdsa(const Hash256& hash, const Sig64& sig, const PubKey33& pubkey)
 
 bool verify_ecdsa_from_address(const Hash256& hash, const Sig64& sig,
                                 const Address& expected_address) {
-    // ECDSA does not support key recovery with basic OpenSSL without secp256k1 lib.
-    // We use a workaround: this is a placeholder that always fails for unknown keys.
-    // In production, use libsecp256k1 for key recovery.
+    // DEAD STUB — ALWAYS RETURNS FALSE. ECDSA public-key recovery isn't
+    // available in the OpenSSL-only crypto layer, so verifying a
+    // signature from an address alone (without the pubkey) is impossible
+    // here. Live code MUST NOT use this: every signed transaction now
+    // carries its signer's compressed pubkey inline and verifies via
+    // verify_ecdsa() with an address cross-check (see TransferTx and the
+    // other *Tx::verify_signature). The only remaining caller is the
+    // legacy HTTP moderator route verify_moderator_sig(), which is
+    // unreachable (no HTTP listener post-pivot) and slated for deletion.
     (void)hash; (void)sig; (void)expected_address;
-    // TODO: implement ECDSA recovery with libsecp256k1
     return false;
 }
 

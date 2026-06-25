@@ -1,5 +1,4 @@
 #include "chain.h"
-#include "../consensus/candidate.h"   // REQUIRED_CONFIRMATIONS
 #include "../consensus/slashing.h"    // EquivocationProof / FingerprintForgeryProof
 #include "../audio/fingerprint.h"     // chromaprint similarity on replay
 #include "../tokens/ledger.h"
@@ -16,7 +15,36 @@
 
 namespace mc {
 
-Chain::Chain(Database& db) : db_(db) {}
+Chain::Chain(Database& db) : db_(db) {
+    // Seed the effective checkpoint set from the baked-in list (#7).
+    for (const auto& c : hardcoded_checkpoints())
+        checkpoints_[c.height] = c.hash;
+}
+
+bool Chain::checkpoint_ok(uint32_t height, const Hash256& hash) const {
+    auto it = checkpoints_.find(height);
+    if (it == checkpoints_.end()) return true;   // no checkpoint at this height
+    return it->second == hash;
+}
+
+size_t Chain::add_config_checkpoints(const std::vector<Checkpoint>& cps) {
+    // Startup-only, single-threaded by contract (before init()/start()).
+    for (const auto& c : cps) checkpoints_[c.height] = c.hash;  // override on collision
+    return cps.size();
+}
+
+namespace {
+// Fork weight (#8) contribution of a block = number of MintTx
+// (play-reward mints) it carries. One MintTx == one realtime, audited,
+// device-gated play, so summing this across the chain gives "cumulative
+// audited plays." Heartbeat / registration-only blocks contribute 0.
+uint64_t count_plays(const Block& block) {
+    uint64_t n = 0;
+    for (const auto& tx : block.transactions)
+        if (!tx.empty() && static_cast<TxType>(tx[0]) == TxType::MINT) ++n;
+    return n;
+}
+} // namespace
 
 bool Chain::init() {
     return load_tip();
@@ -39,6 +67,8 @@ bool Chain::load_tip() {
     // to compare against immediately after startup instead of zero.
     if (auto tb = get_block(tip_.hash))
         tip_.timestamp_ms = tb->header.timestamp_ms;
+    // Cumulative fork weight (#8) — recover from the per-block "cw:" index.
+    tip_.weight = db_.get_u64("cw:" + db_.hex(tip_.hash)).value_or(0);
     return true;
 }
 
@@ -61,7 +91,18 @@ bool Chain::connect_block(const Block& block) {
     db_.put_batch(batch, "b:" + db_.hex(hash), serialized);
     // Height → hash
     uint32_t new_height = tip_.height + 1;
+    // Eclipse defense (#7): if a checkpoint pins this height, the block we
+    // are about to accept MUST carry the pinned hash. No-op at heights with
+    // no checkpoint, so this is inert until the list is populated.
+    if (!checkpoint_ok(new_height, hash)) {
+        std::cerr << "[chain] connect_block: checkpoint mismatch at height "
+                  << new_height << " — refusing fork\n";
+        return false;
+    }
     db_.put_batch_u32(batch, "h:" + db_.hex(hash), new_height);
+    // Cumulative fork weight (#8): parent weight + plays in this block.
+    uint64_t new_weight = tip_.weight + count_plays(block);
+    db_.put_batch_u64(batch, "cw:" + db_.hex(hash), new_weight);
     // Index → hash
     db_.put_batch(batch, "n:" + std::to_string(new_height),
                   std::vector<uint8_t>(hash.begin(), hash.end()));
@@ -115,6 +156,7 @@ bool Chain::connect_block(const Block& block) {
     tip_.hash         = hash;
     tip_.height       = new_height;
     tip_.timestamp_ms = block.header.timestamp_ms;
+    tip_.weight       = new_weight;
     return true;
 }
 
@@ -490,23 +532,33 @@ bool Chain::apply_relay_reward(const RelayRewardTx& tx,
                   << tx.nonce << " expected=" << expected << ")\n";
         return false;
     }
-    // Don't accept absurd claims — bound the credit per tx so a buggy
-    // counter can't mint a fortune in one shot.
-    constexpr uint64_t kMaxCountPerTx = 1'000'000ull;
-    if (tx.count == 0 || tx.count > kMaxCountPerTx) {
-        std::cerr << "[chain] relay_reward reject: count out of range ("
+    // (#10) tx.count is now INTERNAL UNITS (1 MC = 1e8 units), pre-computed
+    // by the relay tracker as corroborated_bytes × 10 (1 MC per 10 MB).
+    // Bound the per-tx credit so a buggy counter can't mint a fortune in
+    // one shot — matches the tracker's pre-clamp (kMaxCountPerTx there).
+    constexpr uint64_t kMaxUnitsPerTx = 1'000'000'000'000ull;  // 10,000 MC
+    if (tx.count == 0 || tx.count > kMaxUnitsPerTx) {
+        std::cerr << "[chain] relay_reward reject: units out of range ("
                   << tx.count << ")\n";
         return false;
     }
-    // 1 MC = 1_00000000 internal units (8 decimals). Credit the target.
-    constexpr uint64_t kUnitPerMc = 100'000'000ull;
-    uint64_t amount = tx.count * kUnitPerMc;
+    const uint64_t amount = tx.count;   // credit units directly (no ×1e8)
+    // Hard supply cap — Ledger::credit bumps total_supply, so relay rewards
+    // inflate supply; reject rather than overshoot SUPPLY_CAP.
+    {
+        uint64_t current_supply = db_.get_total_supply();
+        if (current_supply + amount > SUPPLY_CAP) {
+            std::cerr << "[chain] relay_reward reject: would exceed SUPPLY_CAP\n";
+            return false;
+        }
+    }
     Ledger ledger(db_);
-    ledger.credit(batch, tx.target_address, amount);  // void — no supply-cap guard for now
+    ledger.credit(batch, tx.target_address, amount);
     db_.set_nonce(batch, tx.issuer_address, expected + 1);
     record_applied_nonce(tx.issuer_address, expected + 1);
-    std::cout << "[chain] RELAY_REWARD: +" << tx.count << " MC to "
-              << db_.hex(tx.target_address).substr(0, 12) << "…\n";
+    std::cout << "[chain] RELAY_REWARD: +" << amount << " units ("
+              << (amount / 100'000'000ull) << "." << ((amount / 1'000'000ull) % 100)
+              << " MC) to " << db_.hex(tx.target_address).substr(0, 12) << "…\n";
     return true;
 }
 
@@ -878,6 +930,7 @@ bool Chain::disconnect_block() {
     db_.del_batch(batch, "b:" + db_.hex(tip_.hash));
     db_.del_batch(batch, "h:" + db_.hex(tip_.hash));
     db_.del_batch(batch, "n:" + std::to_string(tip_.height));
+    db_.del_batch(batch, "cw:" + db_.hex(tip_.hash));   // #8 weight index
 
     // Restore previous tip
     auto prev_hash = get_block_hash(tip_.height - 1);
@@ -885,7 +938,7 @@ bool Chain::disconnect_block() {
         // Genesis revert
         db_.del_batch(batch, "t:tip");
         db_.write(batch);
-        tip_ = {{}, 0};
+        tip_ = {};   // hash{}, height 0, timestamp 0, weight 0
         return true;
     }
     std::vector<uint8_t> tip_val(36);
@@ -896,12 +949,183 @@ bool Chain::disconnect_block() {
     db_.write(batch);
     tip_.hash   = *prev_hash;
     tip_.height = new_height;
+    // Restore cumulative weight from the now-current tip's "cw:" entry.
+    tip_.weight = db_.get_u64("cw:" + db_.hex(*prev_hash)).value_or(0);
     // Restore timestamp from the now-current tip's block.
     if (auto pb = get_block(*prev_hash))
         tip_.timestamp_ms = pb->header.timestamp_ms;
     else
         tip_.timestamp_ms = 0;
     return true;
+}
+
+// ---- Fork-choice reorg (#8) -----------------------------------------
+//
+// Adopt a heavier branch via try-and-rollback. We rewrite the
+// height→hash index (n:) and per-block weight (cw:) to the new branch,
+// then rebuild_derived_state() replays it deterministically. If the
+// re-derived chain isn't actually heavier (a branch block failed to
+// apply, so rebuild rolled it back), we restore the previous chain. Old
+// block bytes (b:/h:/cw: keyed by hash) are never overwritten by the new
+// branch — only the per-height n: index and t:tip move — so restore just
+// rewrites those back. Rare-path: holds the chain mutex throughout;
+// derived state (balances/song index) is briefly cleared during rebuild,
+// so a concurrent RPC read can momentarily see empty state. Acceptable
+// for a young chain where reorgs are infrequent.
+//
+// NOTE: this path is new and not exercised by an automated test yet —
+// see docs §22.5 / §21 #8.
+bool Chain::reorg_to_branch(const Hash256& fork_hash, uint32_t fork_height,
+                            const std::vector<Block>& branch, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (branch.empty()) { err = "empty branch"; return false; }
+
+    // Fork point must be a block on our current chain at fork_height.
+    {
+        auto fh = get_block_height(fork_hash);
+        if (!fh || *fh != fork_height) { err = "fork point not on chain"; return false; }
+    }
+    // Branch must chain-link from fork_hash and be intrinsically valid.
+    {
+        Hash256 expect_prev = fork_hash;
+        for (const auto& b : branch) {
+            if (b.header.prev_hash != expect_prev) { err = "branch not contiguous"; return false; }
+            if (!b.validate())                     { err = "branch block invalid"; return false; }
+            expect_prev = b.hash();
+        }
+    }
+    // Checkpoint gate (#7): every branch block lands at a known height; if
+    // any is pinned by a checkpoint, its hash must match, or we refuse the
+    // whole reorg — an attacker can't roll us across a checkpoint even with
+    // a heavier branch.
+    for (size_t i = 0; i < branch.size(); ++i) {
+        const uint32_t h = fork_height + 1 + static_cast<uint32_t>(i);
+        if (!checkpoint_ok(h, branch[i].hash())) {
+            err = "branch violates checkpoint at height " + std::to_string(h);
+            return false;
+        }
+    }
+    // Adopt only if the branch is "better" by the canonical fork-choice
+    // rule (weight → height → timestamp → hash) — the SINGLE source of
+    // truth, shared with the propagator's peer-ahead check.
+    const uint64_t fork_weight = db_.get_u64("cw:" + db_.hex(fork_hash)).value_or(0);
+    uint64_t branch_weight = fork_weight;
+    for (const auto& b : branch) branch_weight += count_plays(b);
+    const uint32_t new_height   = fork_height + static_cast<uint32_t>(branch.size());
+    const Hash256  new_tip_hash = branch.back().hash();
+    ChainTip cand{ new_tip_hash, new_height,
+                   branch.back().header.timestamp_ms, branch_weight };
+    if (!tip_is_better(cand, tip_)) { err = "branch not better than current tip"; return false; }
+
+    // Snapshot the current chain above the fork so we can restore.
+    const uint32_t old_height = tip_.height;
+    const Hash256  old_hash   = tip_.hash;
+    const uint64_t old_weight = tip_.weight;
+    const uint64_t old_ts     = tip_.timestamp_ms;
+    std::vector<Hash256> old_hashes;
+    for (uint32_t h = fork_height + 1; h <= old_height; ++h) {
+        auto bh = get_block_hash(h);
+        if (!bh) { err = "missing old block during snapshot"; return false; }
+        old_hashes.push_back(*bh);
+    }
+
+    // Write a sequence of blocks into the index starting at base_height+1.
+    auto write_branch = [&](const std::vector<Block>& blocks,
+                            uint32_t base_height, uint64_t base_weight,
+                            const Hash256& tip_hash, uint32_t tip_h) -> bool {
+        leveldb::WriteBatch batch;
+        uint64_t w = base_weight;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            const Block& b = blocks[i];
+            const uint32_t h = base_height + 1 + static_cast<uint32_t>(i);
+            auto ser = b.serialize();
+            auto hh  = b.hash();
+            db_.put_batch(batch, "b:" + db_.hex(hh), ser);
+            db_.put_batch_u32(batch, "h:" + db_.hex(hh), h);
+            db_.put_batch(batch, "n:" + std::to_string(h),
+                          std::vector<uint8_t>(hh.begin(), hh.end()));
+            Hash256 fh = Block::full_hash(ser);
+            db_.put_batch(batch, "k:" + std::to_string(h),
+                          std::vector<uint8_t>(fh.begin(), fh.end()));
+            w += count_plays(b);
+            db_.put_batch_u64(batch, "cw:" + db_.hex(hh), w);
+            // Drain adopted txs from the mempool, same as connect_block, so
+            // they aren't re-proposed and rejected on nonce after the reorg.
+            for (const auto& raw_tx : b.transactions) {
+                if (raw_tx.empty()) continue;
+                auto th = crypto::sha256(raw_tx.data(), raw_tx.size());
+                db_.del_batch(batch, "p:" + db_.hex(th));
+            }
+        }
+        std::vector<uint8_t> tv(36);
+        std::memcpy(tv.data(), tip_hash.data(), 32);
+        for (int i = 0; i < 4; ++i) tv[32+i] = (tip_h >> (8*i)) & 0xFF;
+        db_.put_batch(batch, "t:tip", tv);
+        return db_.write(batch);
+    };
+    auto clear_n_above = [&](uint32_t from_h, uint32_t to_h) {
+        if (from_h > to_h) return;
+        leveldb::WriteBatch b;
+        for (uint32_t h = from_h; h <= to_h; ++h)
+            db_.del_batch(b, "n:" + std::to_string(h));
+        db_.write(b);
+    };
+
+    if (!write_branch(branch, fork_height, fork_weight, new_tip_hash, new_height)) {
+        err = "failed to write branch"; return false;
+    }
+    if (new_height < old_height) clear_n_above(new_height + 1, old_height);
+
+    // Re-derive ALL state from the rewritten index. rebuild walks
+    // n:1..tip_.height, so point the tip at the new branch first.
+    tip_.hash = new_tip_hash;
+    tip_.height = new_height;
+    tip_.timestamp_ms = branch.back().header.timestamp_ms;
+    tip_.weight = branch_weight;
+    rebuild_derived_state();   // may roll the tip back if a branch block fails
+
+    // Success ONLY if the FULL branch applied (tip is exactly the branch
+    // tip). If a middle block failed apply, rebuild rolled back to a prefix
+    // — even if that prefix out-weighs the old chain we reject and restore,
+    // so we never silently adopt a truncated branch the peer didn't offer.
+    if (tip_.hash == new_tip_hash) {
+        std::cout << "[chain] REORG: adopted branch — height "
+                  << old_height << "→" << tip_.height << ", weight "
+                  << old_weight << "→" << tip_.weight << "\n";
+        return true;
+    }
+
+    // A branch block failed re-validation → restore the previous chain.
+    err = "branch failed re-validation; restored previous chain";
+    std::cerr << "[chain] REORG aborted, restoring previous chain\n";
+    std::vector<Block> old_blocks;
+    for (const auto& oh : old_hashes) {
+        auto ob = get_block(oh);
+        if (!ob) break;                  // old bytes gone (shouldn't happen)
+        old_blocks.push_back(std::move(*ob));
+    }
+    // Drop the orphaned per-hash index entries the abandoned branch wrote
+    // (n: is rewritten below; b:/h:/cw: are keyed by branch hash and would
+    // otherwise leak).
+    {
+        leveldb::WriteBatch ob;
+        for (const auto& b : branch) {
+            const std::string hh = db_.hex(b.hash());
+            db_.del_batch(ob, "b:"  + hh);
+            db_.del_batch(ob, "h:"  + hh);
+            db_.del_batch(ob, "cw:" + hh);
+        }
+        db_.write(ob);
+    }
+    clear_n_above(fork_height + 1, std::max(new_height, old_height));
+    if (old_blocks.size() == old_hashes.size()) {
+        if (!write_branch(old_blocks, fork_height, fork_weight, old_hash, old_height))
+            std::cerr << "[chain] REORG restore: write_branch failed\n";
+        tip_.hash = old_hash; tip_.height = old_height;
+        tip_.weight = old_weight; tip_.timestamp_ms = old_ts;
+        rebuild_derived_state();
+    }
+    return false;
 }
 
 std::optional<Hash256> Chain::get_block_full_hash(uint32_t height) const {
@@ -919,21 +1143,16 @@ bool Chain::rebuild_derived_state() {
     // an earlier weaker check) is caught at the earliest possible point
     // rather than silently producing a broken index.
     //
-    // Per-block validation runs the SAME five checks the candidate
-    // handler does at consensus time:
+    // Per-block validation runs the SAME deterministic checks every node
+    // applies at ingest time (Model 1 — no block-level votes):
     //   1. block.validate()                   — internal consistency:
     //        sha256(compressed_fingerprint) == header.fingerprint_hash,
     //        merkle_root matches txs, structural fields well-formed.
     //   2. prev_hash chain link               — points at h-1's block hash.
-    //   3. Confirmation quorum                — REQUIRED_CONFIRMATIONS
-    //        distinct validator_ids, each signature verifies against
-    //        block.hash().
-    //   4. chromaprint fuzzy uniqueness       — incoming song's
+    //   3. chromaprint fuzzy uniqueness       — incoming song's
     //        fingerprint isn't ≥0.55-similar to anything already
-    //        replayed. Catches duplicate registrations that snuck past
-    //        the original validator set (or were never validated because
-    //        the chain predates the new gate).
-    //   5. apply_transactions                 — every tx is well-formed,
+    //        replayed. Catches duplicate registrations.
+    //   4. apply_transactions                 — every tx is well-formed,
     //        has sufficient balance / valid nonce / valid signature.
     //
     // If any block fails, we stop the replay and roll the chain back to
@@ -943,6 +1162,7 @@ bool Chain::rebuild_derived_state() {
 
     Hash256 prev_hash{};                             // genesis prev = zero
     uint32_t last_good_height = 0;
+    uint64_t cum_weight = 0;                          // #8: cumulative plays
     for (uint32_t h = 1; h <= tip_.height; ++h) {
         auto bhash = get_block_hash(h);
         if (!bhash) return false;
@@ -961,38 +1181,19 @@ bool Chain::rebuild_derived_state() {
                       << " prev_hash break — stopping\n";
             break;
         }
-        // 3. Confirmation quorum + signatures. Heartbeat / non-song
-        //    blocks are exempt from REQUIRED_CONFIRMATIONS during
-        //    bootstrap (height 1 was the founder's solo block).
-        bool quorum_ok = true;
-        {
-            std::set<Hash256> seen_ids;
-            uint32_t valid_sigs = 0;
-            // Sigs were made over signing_hash() (header without
-            // confirmations); the canonical hash() includes them and
-            // would mismatch.
-            const auto sign_hash = block->signing_hash();
-            for (const auto& c : block->header.confirmations) {
-                if (!seen_ids.insert(c.validator_id).second) continue;
-                if (crypto::verify_ecdsa(sign_hash, c.signature, c.pubkey))
-                    ++valid_sigs;
-            }
-            // h == 1 is the genesis-bootstrap window (solo self-sign was
-            // allowed). Past that, demand at least one valid signature.
-            // The exact quorum a block needed at mint time is
-            // dynamic_quorum(peer_count_at_that_time) — values the chain
-            // can't reconstruct during a replay — so the replay check
-            // only verifies authenticity (>=1 valid sig). The producer
-            // enforces the dynamic quorum at commit time.
-            if (h > 1 && valid_sigs < 1) {
-                std::cerr << "[chain] replay: block " << h
-                          << " has no valid confirmations — stopping\n";
-                quorum_ok = false;
-            }
+        // 2b. Checkpoint gate (#7): catches a chain a weaker earlier build
+        //     (or DB tampering) wrote past a height since pinned in config.
+        if (!checkpoint_ok(h, *bhash)) {
+            std::cerr << "[chain] replay: checkpoint mismatch at height " << h
+                      << " — truncating to last good height " << last_good_height << "\n";
+            break;
         }
-        if (!quorum_ok) break;
+        // 3. (Model 1) No block-level confirmation/quorum check. Blocks
+        //    carry no validator votes; validity is the deterministic
+        //    content + history check (steps 1, 2, 4, 5). Transaction
+        //    signatures are still verified in apply_transactions (step 5).
 
-        // 4. chromaprint fuzzy uniqueness against the partial index
+        // 3. chromaprint fuzzy uniqueness against the partial index
         //    we've built so far. Skipped for heartbeat / non-song blocks.
         if (block->has_song && !block->song.compressed_fingerprint.empty()) {
             auto fp = audio::Fingerprint::from_compressed(
@@ -1027,7 +1228,7 @@ bool Chain::rebuild_derived_state() {
             }
         }
 
-        // 5. Apply.
+        // 4. Apply.
         leveldb::WriteBatch batch;
         if (block->has_song) {
             db_.put_fingerprint(batch, block->song);
@@ -1044,11 +1245,19 @@ bool Chain::rebuild_derived_state() {
                       << " apply_transactions failed — stopping\n";
             break;
         }
+        // #8: accumulate fork weight and persist the per-block "cw:" index
+        // in the SAME batch as the rest of this block's derived state.
+        cum_weight += count_plays(*block);
+        db_.put_batch_u64(batch, "cw:" + db_.hex(*bhash), cum_weight);
         db_.write(batch);
 
         prev_hash       = *bhash;
         last_good_height = h;
     }
+
+    // The tip's cumulative weight is whatever we accumulated up to the
+    // last good height (rebuild stops on the first bad block).
+    tip_.weight = cum_weight;
 
     // Roll the tip back to the last good height if we stopped early.
     if (last_good_height < tip_.height) {

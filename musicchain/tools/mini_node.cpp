@@ -16,7 +16,9 @@
 #include "librats_c.h"
 #include "../src/net/load_monitor.h"
 #include "../src/crypto/keys.h"
+#include "../src/crypto/signature.h"  // sign_data for relay.report (#10)
 #include "../src/crypto/bip39.h"   // bip39_generate_12 / bip39_mnemonic_to_keypair
+#include <array>                    // DeliveryAccum delivery_id (#10)
 #include <fstream>
 #include <memory>
 #include <sys/stat.h>
@@ -77,6 +79,13 @@ struct PendingRelay {
 
 std::mutex                                       g_relay_mu;
 std::unordered_map<std::string, PendingRelay>    g_pending_relays;
+// (#1 instability fix) g_pending_relays must be reaped: an entry leaks for
+// every relay.forward whose target never replies (full-node restart, dropped
+// link, fire-and-forget inner verb, player abandoning its 15s request).
+// Nothing matched it before, so a busy VPS grew it without bound → slow OOM
+// + rising g_relay_mu hash-probe cost mesh-wide. TTL is comfortably past the
+// player's 15s RPC timeout so a real in-flight reply is never dropped early.
+constexpr uint64_t kPendingRelayTtlMs = 30'000;
 
 std::string new_relay_req_id() {
     static std::atomic<uint64_t> counter{1};
@@ -159,6 +168,22 @@ constexpr uint64_t kRelayRefillBps   = 10ULL * 1024 * 1024; // 10 MB/s sustained
 std::mutex                                       g_relay_bucket_mu;
 std::unordered_map<std::string, RelayBucket>     g_relay_buckets;
 
+// #10 relay-reward triangulation: per-delivery_id byte accumulator. On each
+// relayed F-frame we add the payload bytes; the reaper flushes a signed
+// relay.report on idle timeout. We DON'T learn the broker from the F-frame
+// (its target is the originator player, not the broker that minted the
+// delivery_id), so the reaper broadcasts the report to every full node in
+// g_routes — only the broker holds the matching pd: row; the rest reply
+// "ignored". Keyed by lowercase-hex of the 16-byte delivery_id.
+struct DeliveryAccum {
+    std::array<uint8_t, 16> delivery_id{};
+    uint64_t                bytes   = 0;
+    uint64_t                last_ms = 0;
+};
+constexpr uint64_t kDeliveryIdleMs = 5000;   // flush a delivery this idle
+std::mutex                                       g_delivery_mu;
+std::unordered_map<std::string, DeliveryAccum>   g_delivery_accum;
+
 // Peers that responded to mini.hello are tracked here so we can replicate
 // every fresh route to them. The "from_mininode" loop guard in ingest_route
 // prevents an A→B→A→B forwarding ping-pong.
@@ -217,6 +242,15 @@ std::unordered_map<std::string, PlayerEntry>     g_players;
 constexpr const char* kChatRoomsTopic  = "chat:rooms";
 constexpr const char* kChatRoomPrefix  = "chat:room:";
 constexpr size_t      kChatRingPerRoom = 1000;
+// (#2 instability fix) Hard caps on the chat maps. on_chat_room_announce is
+// unauthenticated and used to auto-subscribe + allocate a deque per distinct
+// room name with no limit — a remote peer could announce unbounded room
+// names to exhaust VPS memory + gossipsub subscriptions. librats (frozen)
+// exposes no unsubscribe, so the only durable bound is to refuse rooms beyond
+// a cap (rather than evict-and-leak-the-subscription). Body size is capped so
+// one message can't pin arbitrary memory in the ring.
+constexpr size_t      kMaxChatRooms     = 128;
+constexpr size_t      kMaxChatBodyBytes = 8 * 1024;
 
 struct ChatRoom {
     std::string name;
@@ -384,6 +418,12 @@ std::unique_ptr<mc::net::LoadMonitor> g_load_mon;
 // it before the rats client starts.
 std::string g_wallet_address_hex;  // EIP-55 checksummed
 std::string g_wallet_address_raw;  // 40-char lowercase hex
+// #10: retain the full keypair so the mini-node can SIGN relay.report
+// (the same key that derives g_wallet_address_hex, so the broker verifies
+// recover(sig) == the wallet it already knows for this peer).
+std::vector<uint8_t> g_mini_priv;          // 32-byte secp256k1 private
+mc::PubKey33         g_mini_pub{};         // 33-byte compressed public
+mc::Address          g_mini_addr20{};      // raw 20-byte address (sign preimage)
 
 std::string routes_json() {
     std::ostringstream ss;
@@ -441,10 +481,10 @@ std::string routes_json() {
 // ---- Reachability probe ---------------------------------------------
 //
 // For each route we receive, spawn a one-shot worker that brings up a fresh
-// mc_rats_quic client on an OS-picked ephemeral port and tries to connect to
-// the node's STUN-discovered public_address. If the QUIC handshake completes
-// within `kProbeTimeoutMs`, the node's NAT lets independent flows in (full-
-// cone or restricted-cone-with-permissive-mapping) → reachability = direct.
+// librats client on an OS-picked ephemeral port and tries to connect to the
+// node's STUN-discovered public_address. If the handshake completes within
+// `kProbeTimeoutMs`, the node's NAT lets independent flows in (full-cone or
+// restricted-cone-with-permissive-mapping) → reachability = direct.
 // If the handshake times out, peer-to-peer traffic must be relayed through
 // this mini-node instead → reachability = relay.
 
@@ -461,9 +501,23 @@ void mark_reachability(const std::string& node_id, Reachability r) {
     }
 }
 
+// (#10 instability fix) bound concurrent reachability probes. Each probe
+// spawns a full librats client + a 3s handshake wait; an unthrottled
+// route-gossip burst would otherwise spawn unbounded detached threads/clients
+// and exhaust the VPS (fd/thread/memory). Over the cap we skip — reachability
+// stays Unknown and ingest_route's staleness check re-probes it later.
+std::atomic<int> g_active_probes{0};
+constexpr int    kMaxConcurrentProbes = 8;
+
 void probe_reachability(std::string node_id, std::string public_address) {
+    if (g_active_probes.fetch_add(1) >= kMaxConcurrentProbes) {
+        g_active_probes.fetch_sub(1);
+        return;
+    }
     std::thread([node_id = std::move(node_id),
                  public_address = std::move(public_address)]() mutable {
+        // Release the probe slot on every exit path.
+        struct SlotGuard { ~SlotGuard() { g_active_probes.fetch_sub(1); } } slot_guard;
         if (public_address.empty()) return;
         const auto colon = public_address.find(':');
         if (colon == std::string::npos) return;
@@ -662,6 +716,18 @@ void on_peer_disconnected(void* /*ud*/, const char* peer_id) {
     // (the mesh handles those via direct rats reconnection and mini.hello).
     if (peer_id && *peer_id && !was_mininode) {
         broadcast_swarm_peer_offline(peer_id);
+    }
+    // (#1 instability fix) Purge any pending relay forwards owned by the
+    // departed originator — its reply would be black-holed anyway (the
+    // transport peer_id is gone), so dropping them now bounds g_pending_relays
+    // immediately on the disconnect instead of waiting out the TTL reaper.
+    if (peer_id && *peer_id) {
+        std::lock_guard<std::mutex> lk(g_relay_mu);
+        for (auto it = g_pending_relays.begin(); it != g_pending_relays.end(); ) {
+            if (it->second.originator_peer_id == peer_id) {
+                it = g_pending_relays.erase(it);
+            } else { ++it; }
+        }
     }
 }
 
@@ -918,7 +984,15 @@ void on_chat_room_announce(void* /*ud*/, const char* /*peer_id*/,
         bool added = false;
         {
             std::lock_guard<std::mutex> lk(g_chat_rooms_mu);
-            added = g_chat_rooms.emplace(room.name, room).second;
+            // (#2) refuse new rooms past the cap so subscriptions + deques
+            // stay bounded; existing rooms still update.
+            const bool known = g_chat_rooms.find(room.name) != g_chat_rooms.end();
+            if (known || g_chat_rooms.size() < kMaxChatRooms) {
+                added = g_chat_rooms.emplace(room.name, room).second;
+            } else if (!g_quiet) {
+                std::cerr << "[mini-node] chat-room cap (" << kMaxChatRooms
+                          << ") reached — ignoring '" << room.name << "'\n";
+            }
         }
         if (added) {
             chat_subscribe_room(g_client, room.name);
@@ -951,7 +1025,11 @@ void on_chat_message(void* /*ud*/, const char* /*peer_id*/,
         m.body        = j.value("body",        std::string());
         m.sig         = j.value("sig",         std::string());
         if (m.from.empty() || m.ts_ms == 0) return;
+        if (m.body.size() > kMaxChatBodyBytes) return;   // (#2) drop oversized
         std::lock_guard<std::mutex> lk(g_chat_msgs_mu);
+        // (#2) don't allocate a new room deque past the cap.
+        if (g_chat_msgs.find(room_name) == g_chat_msgs.end() &&
+            g_chat_msgs.size() >= kMaxChatRooms) return;
         auto& dq = g_chat_msgs[room_name];
         dq.push_back(std::move(m));
         while (dq.size() > kChatRingPerRoom) dq.pop_front();
@@ -1035,9 +1113,15 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
             // case they connected first.
             send_mini_hello(pid);
         }
+        // (#3 instability fix) g_routes.size() must be read under g_routes_mu
+        // — the reaper erases-while-iterating g_routes on another thread, and
+        // a lock-free size()/rehash race is UB that can crash the rendezvous
+        // node. Snapshot under the lock, exactly like the `status` verb does.
+        uint64_t route_count;
+        { std::lock_guard<std::mutex> lk(g_routes_mu); route_count = g_routes.size(); }
         nlohmann::json body{{"role",         "mini-node"},
                             {"peer_address", addr},
-                            {"route_count",  static_cast<uint64_t>(g_routes.size())}};
+                            {"route_count",  route_count}};
         r << "{\"req_id\":\"" << req_id << "\",\"status\":\"ok\",\"body\":"
           << body.dump() << "}";
     } else if (type == "mininodes.list") {
@@ -1464,9 +1548,19 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
     }
 
     env["req_id"] = rec.original_req_id;
-    rats_send_message(g_client, rec.originator_peer_id.c_str(),
-                      kReplyType, env.dump().c_str());
-    if (!g_quiet) {
+    // (#18 instability fix) the originator may have vanished (player
+    // reconnected with a fresh transport peer_id) — don't silently
+    // black-hole the reply; surface the send result so the dead-originator
+    // case is observable rather than a mystery stall. (The player's own
+    // re-issue-on-reconnect path is the real recovery.)
+    const rats_error_t sent = rats_send_message(
+        g_client, rec.originator_peer_id.c_str(),
+        kReplyType, env.dump().c_str());
+    if (sent != RATS_SUCCESS) {
+        if (!g_quiet)
+            push_event("relay-rep-drop", rec.originator_peer_id,
+                       "send=" + std::to_string((int)sent));
+    } else if (!g_quiet) {
         push_event("relay-rep", rec.originator_peer_id,
                    "via " + std::string(peer_id).substr(0, 12));
     }
@@ -1521,7 +1615,12 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
         cleanup();
         return;
     }
-    if (size < 1 + 40) { cleanup(); return; }
+    // #10: extended F-frame is 'F'(1) + target hex(40) + delivery_id(16) +
+    // payload. The serving player ALWAYS writes the 16-byte delivery_id on
+    // the relay path (zeros if it has none), so we unconditionally strip
+    // 1+40+16 — keeping this in lockstep with player_server.dart, or the
+    // receiver would read the chunk header off the delivery_id bytes.
+    if (size < 1 + 40 + 16) { cleanup(); return; }
     char target_hex[41];
     std::memcpy(target_hex, b + 1, 40);
     target_hex[40] = '\0';
@@ -1532,7 +1631,10 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
                          || (c >= 'A' && c <= 'F');
         if (!is_hex) { cleanup(); return; }
     }
-    const size_t payload_size = size - 1 - 40;
+    uint8_t delivery_id[16];
+    std::memcpy(delivery_id, b + 1 + 40, 16);
+    const size_t payload_off  = 1 + 40 + 16;
+    const size_t payload_size = size - payload_off;
     // ---- Per-peer token-bucket rate limit --------------------------
     //
     // Audit issue: a misbehaving cellular peer could spam relay
@@ -1559,14 +1661,16 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
                             : (bk.tokens + refill);
             bk.last_refill_ms = now;
         }
-        if (bk.tokens < size) {
+        // Charge the PAYLOAD (the bytes that actually traverse the uplink),
+        // not the 1+40+16 mini-node header.
+        if (bk.tokens < payload_size) {
             if (!g_quiet) {
                 push_event("relay-drop", sender_pid, "rate_limited");
             }
             cleanup();
             return;
         }
-        bk.tokens -= size;
+        bk.tokens -= payload_size;
     }
     if (!g_quiet) {
         push_event("relay-bin", std::string(target_hex),
@@ -1574,13 +1678,86 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
                        + std::string(peer_id).substr(0, 12));
     }
     rats_send_binary(g_client, target_hex,
-                      b + 1 + 40, payload_size);
+                      b + payload_off, payload_size);
+    // #10: accumulate relayed bytes per delivery_id, keyed by its hex, with
+    // the broker (= target full node) so the reaper can flush a signed
+    // relay.report. delivery_id == all-zero means "no triangulation" (legacy
+    // / direct full-node request) → skip accounting.
+    {
+        bool all_zero = true;
+        for (uint8_t x : delivery_id) if (x) { all_zero = false; break; }
+        if (!all_zero) {
+            std::string did_hex; did_hex.reserve(32);
+            static const char* hx = "0123456789abcdef";
+            for (uint8_t x : delivery_id) {
+                did_hex.push_back(hx[x >> 4]);
+                did_hex.push_back(hx[x & 0xF]);
+            }
+            std::lock_guard<std::mutex> lk(g_delivery_mu);
+            auto& a = g_delivery_accum[did_hex];
+            std::memcpy(a.delivery_id.data(), delivery_id, 16);
+            a.bytes        += payload_size;
+            a.last_ms       = now_ms();
+        }
+    }
     cleanup();
 }
 
 // ---- Background reaper ---------------------------------------------
 //
-// Wakes every kReaperIntervalMs while g_reaper_running. Three jobs:
+// #10: flush one delivery accumulator as a signed relay.report to its
+// broker (the full node the bytes were relayed to). Signature preimage:
+//   "relay.report" || delivery_id(16) || bytes_relayed(u64 LE) || wallet(20)
+// signed with the mini-node's own key (whose address == the advertised
+// wallet), so the broker verifies recover(sig) == the wallet it knows.
+void flush_relay_report(const DeliveryAccum& a) {
+    if (!g_client || g_mini_priv.empty()) return;
+    std::vector<uint8_t> msg;
+    static const char tag[] = "relay.report";
+    msg.insert(msg.end(), tag, tag + (sizeof(tag) - 1));        // 12 bytes, no NUL
+    msg.insert(msg.end(), a.delivery_id.begin(), a.delivery_id.end());  // 16
+    for (int i = 0; i < 8; ++i) msg.push_back(uint8_t(a.bytes >> (8 * i))); // u64 LE
+    msg.insert(msg.end(), g_mini_addr20.begin(), g_mini_addr20.end());  // 20
+    mc::Sig64 sig = mc::crypto::sign_data(msg.data(), msg.size(), g_mini_priv);
+    auto to_hex = [](const uint8_t* p, size_t n){
+        static const char* hx = "0123456789abcdef"; std::string s; s.reserve(n*2);
+        for (size_t i = 0; i < n; ++i) { s.push_back(hx[p[i]>>4]); s.push_back(hx[p[i]&0xF]); }
+        return s; };
+    nlohmann::json body = {
+        {"delivery_id",   to_hex(a.delivery_id.data(), 16)},
+        {"bytes_relayed", a.bytes},
+        {"mini_wallet",   g_wallet_address_hex},                    // EIP-55 string
+        {"mini_pubkey",   to_hex(g_mini_pub.data(), g_mini_pub.size())}, // 33-byte
+        {"sig",           to_hex(sig.data(), sig.size())},          // 64-byte compact
+    };
+    nlohmann::json env = {
+        {"req_id", new_relay_req_id()},
+        {"type",   "relay.report"},
+        {"body",   body},
+    };
+    const std::string env_str = env.dump();
+    // Broadcast to every full node we know about (g_routes). Only the broker
+    // that minted this delivery_id holds the matching pd: row and credits it;
+    // every other full node returns "ignored". The rats_peer_id is the dial
+    // handle; fall back to node_id when the route didn't carry one.
+    std::vector<std::string> targets;
+    {
+        std::lock_guard<std::mutex> lk(g_routes_mu);
+        targets.reserve(g_routes.size());
+        for (const auto& kv : g_routes) {
+            const std::string& pid = kv.second.rats_peer_id.empty()
+                ? kv.second.node_id : kv.second.rats_peer_id;
+            if (!pid.empty()) targets.push_back(pid);
+        }
+    }
+    for (const auto& pid : targets)
+        rats_send_message(g_client, pid.c_str(), kRequestType, env_str.c_str());
+    if (!g_quiet) push_event("relay-report",
+                             std::to_string(targets.size()) + " nodes",
+                             std::to_string(a.bytes) + "B");
+}
+
+// Wakes every kReaperIntervalMs while g_reaper_running. Four jobs:
 //   1. Expire RouteEntry records older than kRouteTtlMs so a vanished
 //      full node stops appearing in routes.get.
 //   2. Prune mini-node auxiliary tables (g_mininode_load /
@@ -1588,6 +1765,8 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
 //   3. Prune g_relay_buckets entries for peers no longer present in
 //      rats_get_validated_peer_ids — otherwise a churn of cellular
 //      peers would let the bucket map grow unboundedly.
+//   4. (#10) Flush idle delivery accumulators as signed relay.report.
+//   5. (#1) Expire stale g_pending_relays + synthetic-timeout the originator.
 void reaper_loop() {
     while (g_reaper_running.load()) {
         // Sleep in small slices so shutdown is responsive.
@@ -1654,6 +1833,55 @@ void reaper_loop() {
                     ++it;
                 }
             }
+        }
+
+        // 4: (#10) flush idle delivery accumulators as signed relay.report.
+        {
+            const uint64_t now = now_ms();
+            std::vector<DeliveryAccum> ready;
+            {
+                std::lock_guard<std::mutex> lk(g_delivery_mu);
+                for (auto it = g_delivery_accum.begin();
+                     it != g_delivery_accum.end(); ) {
+                    if (it->second.last_ms + kDeliveryIdleMs < now) {
+                        ready.push_back(it->second);
+                        it = g_delivery_accum.erase(it);
+                    } else { ++it; }
+                }
+            }
+            for (const auto& a : ready) flush_relay_report(a);
+        }
+
+        // 5: (#1 instability fix) expire stale pending relay forwards whose
+        // target never replied, and send the originator a synthetic timeout
+        // reply so it fails fast instead of waiting out its own 15s timer.
+        {
+            struct Expired { std::string originator, orig_req; };
+            std::vector<Expired> expired;
+            {
+                std::lock_guard<std::mutex> lk(g_relay_mu);
+                for (auto it = g_pending_relays.begin();
+                     it != g_pending_relays.end(); ) {
+                    if (it->second.created_ms + kPendingRelayTtlMs < now) {
+                        expired.push_back({it->second.originator_peer_id,
+                                           it->second.original_req_id});
+                        it = g_pending_relays.erase(it);
+                    } else { ++it; }
+                }
+            }
+            for (const auto& e : expired) {
+                if (e.originator.empty() || !g_client) continue;
+                nlohmann::json err = {
+                    {"req_id", e.orig_req},
+                    {"status", "error"},
+                    {"error",  "relay_timeout"},
+                };
+                rats_send_message(g_client, e.originator.c_str(),
+                                  kReplyType, err.dump().c_str());
+            }
+            if (!expired.empty() && !g_quiet)
+                push_event("relay-expire",
+                           std::to_string(expired.size()) + " pending", "ttl");
         }
     }
 }
@@ -1821,6 +2049,10 @@ int main(int argc, char** argv) {
             return 5;
         }
         g_wallet_address_hex = mc::crypto::to_checksum_hex(kp_opt->address);
+        // #10: retain the keypair so the reaper can sign relay.report.
+        g_mini_priv   = kp_opt->private_key;
+        g_mini_pub    = kp_opt->public_key;
+        g_mini_addr20 = kp_opt->address;
         std::ostringstream raw;
         for (uint8_t b : kp_opt->address) {
             raw << std::hex << std::setw(2) << std::setfill('0')

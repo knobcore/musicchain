@@ -145,6 +145,33 @@ void RatsApi::on_peer_connected_cb(void* user_data, const char* peer_id) {
             };
             rats_send_message(self->client_, peer_id,
                               MC_REQUEST_TYPE, req.dump().c_str());
+
+            // DB2 anti-entropy: send the peer our library/playlist summary
+            // ({key -> version}) so it can push back every record we're behind
+            // on. Both sides do this on connect, so they converge. Players /
+            // mini-nodes don't handle db2.sync and just no-op.
+            {
+                nlohmann::json lib = nlohmann::json::object();
+                self->library_.for_each_library_payload(
+                    [&](const Address& w, uint64_t ver, const std::string&) {
+                        lib[crypto::to_hex(w.data(), w.size())] = ver;
+                    });
+                nlohmann::json pl = nlohmann::json::object();
+                self->library_.for_each_playlist_payload(
+                    [&](const Address& w, const std::array<uint8_t, 16>& id,
+                        uint64_t ver, const std::string&) {
+                        pl[crypto::to_hex(w.data(), w.size()) +
+                           crypto::to_hex(id.data(), id.size())] = ver;
+                    });
+                nlohmann::json sreq = {
+                    {"req_id", std::string("db2-sync-") +
+                                  std::to_string(moderation::now_ms())},
+                    {"type",   "db2.sync"},
+                    {"body",   {{"lib", lib}, {"pl", pl}}},
+                };
+                rats_send_message(self->client_, peer_id,
+                                  MC_REQUEST_TYPE, sreq.dump().c_str());
+            }
         }
 
         // Block-distribution handshake: send block.hello so the new
@@ -628,6 +655,34 @@ void RatsApi::handle_request(const std::string& peer_id,
                              {"playlists", arr},
                          }}};
             }
+        }
+        // ---- DB2 anti-entropy: catch a peer up on what it missed ---------
+        //   db2.sync { lib:{walletHex:ver}, pl:{walletHex+idHex:ver} }
+        //       The requester's summary; we push every record it is behind on
+        //       as the normal flooded type (its on_*_cb ingests version-gated).
+        else if (type == "db2.sync") {
+            const json lib_sum = in.value("lib", json::object());
+            const json pl_sum  = in.value("pl",  json::object());
+            std::vector<std::pair<const char*, std::string>> to_push;
+            library_.for_each_library_payload(
+                [&](const Address& w, uint64_t ver, const std::string& payload) {
+                    const std::string k = crypto::to_hex(w.data(), w.size());
+                    if (ver > lib_sum.value(k, static_cast<uint64_t>(0)))
+                        to_push.emplace_back(MC_LIBRARY_TYPE, payload);
+                });
+            library_.for_each_playlist_payload(
+                [&](const Address& w, const std::array<uint8_t, 16>& id,
+                    uint64_t ver, const std::string& payload) {
+                    const std::string k = crypto::to_hex(w.data(), w.size()) +
+                                          crypto::to_hex(id.data(), id.size());
+                    if (ver > pl_sum.value(k, static_cast<uint64_t>(0)))
+                        to_push.emplace_back(MC_PLAYLIST_TYPE, payload);
+                });
+            for (const auto& [mt, payload] : to_push)
+                if (client_)
+                    rats_send_message(client_, peer_id.c_str(), mt, payload.c_str());
+            reply = {{"req_id", req_id}, {"status", "ok"},
+                     {"body", {{"pushed", to_push.size()}}}};
         }
         // ---- mini-node identity (relay credit attribution) --------------
         //
@@ -2085,8 +2140,12 @@ bool RatsApi::ingest_library_delta(const std::string& payload_json,
     const Hash256 digest = crypto::sha256(canon.data(), canon.size());
     if (!crypto::verify_ecdsa(digest, sig, pubkey)) return false;
 
-    // Apply (version-gated + idempotent). Only a genuinely-new version floods.
-    if (!library_.apply_delta(wallet, add, del, version)) return false;
+    // Apply as a version-gated SNAPSHOT: the published `add` set is the full,
+    // authoritative library, so removals propagate (a node that had extra
+    // songs drops them). `del` is still covered by the signature above. Store
+    // the signed payload so a node can re-send it during anti-entropy.
+    if (!library_.set_library(wallet, add, version)) return false;
+    library_.store_library_payload(wallet, version, payload_json);
 
     if (broadcast_if_new && client_)
         rats_broadcast_message(client_, MC_LIBRARY_TYPE, payload_json.c_str());
@@ -2167,6 +2226,7 @@ bool RatsApi::ingest_playlist(const std::string& payload_json,
         ? library_.delete_playlist(wallet, pid, version)
         : library_.set_playlist(wallet, pid, name, songs, version);
     if (!applied) return false;
+    library_.store_playlist_payload(wallet, pid, version, payload_json);
 
     if (broadcast_if_new && client_)
         rats_broadcast_message(client_, MC_PLAYLIST_TYPE, payload_json.c_str());

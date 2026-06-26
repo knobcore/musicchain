@@ -164,11 +164,18 @@ void LibraryStore::attach(Database& db) {
     });
 }
 
-uint64_t LibraryStore::set_library(const Address& wallet,
-                                   const std::vector<Hash256>& hashes) {
+bool LibraryStore::set_library(const Address& wallet,
+                               const std::vector<Hash256>& hashes,
+                               uint64_t version) {
     std::lock_guard<std::mutex> lk(p_->mu);
-    if (!p_->db) return 0;
+    if (!p_->db) return false;
     const std::string wkey = akey(wallet);
+    // Version-gated SNAPSHOT replace: only a strictly-newer full set applies
+    // (gossip re-delivery / out-of-order arrival drop here). Replacing rather
+    // than adding means removals propagate too.
+    auto vit = p_->versions.find(wkey);
+    if (vit != p_->versions.end() && version <= vit->second) return false;
+
     leveldb::WriteBatch batch;
     const uint32_t ord = p_->intern_wallet(wallet, batch);
 
@@ -184,12 +191,11 @@ uint64_t LibraryStore::set_library(const Address& wallet,
     }
     for (uint32_t id : next) p_->holders[id].add(ord);
 
-    const uint64_t version = p_->versions[wkey] + 1;
     p_->versions[wkey] = version;
     p_->persist_library(batch, wallet, version, next);
     p_->libs[wkey] = std::move(next);
     p_->db->write(batch);
-    return version;
+    return true;
 }
 
 bool LibraryStore::apply_delta(const Address& wallet,
@@ -409,6 +415,64 @@ std::vector<LibraryStore::Playlist> LibraryStore::list_playlists(
         return true;
     });
     return out;
+}
+
+// ---- anti-entropy: stored signed payloads ------------------------------
+void LibraryStore::store_library_payload(const Address& w, uint64_t version,
+                                         const std::string& payload) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return;
+    std::string key = "Ls";
+    key.append(reinterpret_cast<const char*>(w.data()), w.size());
+    std::vector<uint8_t> v; v.reserve(8 + payload.size());
+    w8(v, version);
+    v.insert(v.end(), payload.begin(), payload.end());
+    p_->db->put(key, v);
+}
+
+void LibraryStore::store_playlist_payload(const Address& w,
+                                          const std::array<uint8_t, 16>& id,
+                                          uint64_t version,
+                                          const std::string& payload) {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return;
+    std::string key = "Ps";
+    key.append(reinterpret_cast<const char*>(w.data()), w.size());
+    key.append(reinterpret_cast<const char*>(id.data()), id.size());
+    std::vector<uint8_t> v; v.reserve(8 + payload.size());
+    w8(v, version);
+    v.insert(v.end(), payload.begin(), payload.end());
+    p_->db->put(key, v);
+}
+
+void LibraryStore::for_each_library_payload(
+        const std::function<void(const Address&, uint64_t,
+                                 const std::string&)>& cb) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return;
+    p_->db->for_each_with_prefix("Ls", [&](const std::string& key,
+                                           const std::string& val) {
+        if (key.size() != 2 + 20 || val.size() < 8) return true;
+        Address w{}; std::memcpy(w.data(), key.data() + 2, 20);
+        cb(w, r8(val, 0), val.substr(8));
+        return true;
+    });
+}
+
+void LibraryStore::for_each_playlist_payload(
+        const std::function<void(const Address&, const std::array<uint8_t, 16>&,
+                                 uint64_t, const std::string&)>& cb) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    if (!p_->db) return;
+    p_->db->for_each_with_prefix("Ps", [&](const std::string& key,
+                                           const std::string& val) {
+        if (key.size() != 2 + 20 + 16 || val.size() < 8) return true;
+        Address w{}; std::memcpy(w.data(), key.data() + 2, 20);
+        std::array<uint8_t, 16> id{};
+        std::memcpy(id.data(), key.data() + 2 + 20, 16);
+        cb(w, id, r8(val, 0), val.substr(8));
+        return true;
+    });
 }
 
 } // namespace mc::store

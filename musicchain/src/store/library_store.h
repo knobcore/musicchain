@@ -29,9 +29,12 @@
 
 #include "../core/block.h"      // Hash256, Address
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace mc { class Database; }
@@ -51,10 +54,12 @@ public:
 
     // ---- mutate ------------------------------------------------------------
 
-    /// Replace a wallet's whole library with `hashes` (the "say hi — here's my
-    /// list" path). Bumps the wallet's version and returns the new value.
-    uint64_t set_library(const Address& wallet,
-                         const std::vector<Hash256>& hashes);
+    /// Replace a wallet's whole library with `hashes` at `version` (a SNAPSHOT
+    /// — the authoritative full set, so removals propagate). Version-gated +
+    /// idempotent: a NO-OP returning false unless `version` is strictly newer
+    /// than the wallet's current version. Returns true if applied.
+    bool set_library(const Address& wallet,
+                     const std::vector<Hash256>& hashes, uint64_t version);
 
     /// Apply an edit: add `add` and remove `remove` from the wallet's library.
     /// `version` is the new monotonic version carried by a (signed) delta;
@@ -107,6 +112,25 @@ public:
         const Address& wallet, const std::array<uint8_t, 16>& id) const;
     /// Every live (non-tombstoned) playlist a wallet owns.
     std::vector<Playlist> list_playlists(const Address& wallet) const;
+
+    // ---- anti-entropy: stored signed payloads ------------------------------
+    //
+    // The latest signed wire payload of each library / playlist record is kept
+    // so a node can RE-SEND it to a peer that missed the live flood (e.g. the
+    // peer was offline during the edit). On connect, peers exchange a
+    // {key -> version} summary and push the payloads the other is behind on.
+    // Keyed Ls<wallet:20> / Ps<wallet:20><id:16>, value = ver(8 LE) | payload.
+    void store_library_payload(const Address& wallet, uint64_t version,
+                               const std::string& payload);
+    void store_playlist_payload(const Address& wallet,
+                                const std::array<uint8_t, 16>& id,
+                                uint64_t version, const std::string& payload);
+    void for_each_library_payload(
+        const std::function<void(const Address&, uint64_t,
+                                 const std::string&)>& cb) const;
+    void for_each_playlist_payload(
+        const std::function<void(const Address&, const std::array<uint8_t, 16>&,
+                                 uint64_t, const std::string&)>& cb) const;
 
     // ---- stats -------------------------------------------------------------
 

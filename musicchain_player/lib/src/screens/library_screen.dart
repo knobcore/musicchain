@@ -32,22 +32,26 @@ import '../services/library_service.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/rats_client.dart';
+import '../services/playlist_service.dart';
 import 'dmca_screen.dart';
 
-enum _FacetMode { artist, genre }
+enum _FacetMode { artist, genre, playlists }
 
 extension _FacetModeLabel on _FacetMode {
   String get label => switch (this) {
-    _FacetMode.artist => 'Artist',
-    _FacetMode.genre  => 'Genre',
+    _FacetMode.artist    => 'Artist',
+    _FacetMode.genre     => 'Genre',
+    _FacetMode.playlists => 'Playlists',
   };
   IconData get icon => switch (this) {
-    _FacetMode.artist => Icons.person_outline,
-    _FacetMode.genre  => Icons.style_outlined,
+    _FacetMode.artist    => Icons.person_outline,
+    _FacetMode.genre     => Icons.style_outlined,
+    _FacetMode.playlists => Icons.queue_music,
   };
   String get rootLabel => switch (this) {
-    _FacetMode.artist => 'Artists',
-    _FacetMode.genre  => 'Genres',
+    _FacetMode.artist    => 'Artists',
+    _FacetMode.genre     => 'Genres',
+    _FacetMode.playlists => 'Playlists',
   };
 }
 
@@ -68,6 +72,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String? _drillGenre;
   String? _drillArtist;
   String? _selectedAlbum;
+
+  /// Playlists facet: the id of the playlist whose tracks fill the bottom
+  /// pane — the exact same track view albums open into.
+  String? _selectedPlaylistId;
 
   /// Vertical split: fraction of body height the top pane occupies.
   /// Drag handle below the top pane updates this within a clamp so
@@ -99,6 +107,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
       if (lib.loading) return;
       lib.refresh();
     });
+    // Keep the playlists facet (chips + track pane) in sync with edits.
+    PlaylistService.instance
+      ..ensureLoaded()
+      ..addListener(_onPlaylistsChanged);
+  }
+
+  void _onPlaylistsChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -124,6 +140,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void dispose() {
     _autoRefreshTimer?.cancel();
     _disc?.removeListener(_onDiscoveryChanged);
+    PlaylistService.instance.removeListener(_onPlaylistsChanged);
     super.dispose();
   }
 
@@ -202,6 +219,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _drillGenre   = null;
       _drillArtist  = null;
       _selectedAlbum = null;
+      _selectedPlaylistId = null;
     });
   }
 
@@ -298,20 +316,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
     // by a phone that later disconnected stays visible but unstreamable
     // — the original "songs stay in list when user disconnects" bug.
     final live = lib.filteredSongs;
-    final wantedAlbum = _selectedAlbum?.toLowerCase();
-    final selectedTracks = wantedAlbum == null
-        ? const <Song>[]
-        : _drillFilter(live)
-            .where((s) => _albumKeyNorm(s) == wantedAlbum)
-            .toList();
+    final isPlaylists = _mode == _FacetMode.playlists;
+
+    // Bottom-pane tracks. In playlists mode, the selected playlist's songs
+    // resolved to live (online) tracks in the playlist's own order — playlists
+    // open in the exact same track pane albums do. Otherwise, the selected
+    // album's tracks.
+    final Playlist? selPlaylist =
+        isPlaylists ? _currentPlaylist(PlaylistService.instance) : null;
+    final List<Song> selectedTracks;
+    final String bottomTitle;
+    if (isPlaylists) {
+      if (selPlaylist != null) {
+        final byHash = <String, Song>{for (final s in live) s.contentHash: s};
+        selectedTracks = [
+          for (final h in selPlaylist.songs)
+            if (byHash[h] != null) byHash[h]!,
+        ];
+        bottomTitle = selPlaylist.name;
+      } else {
+        selectedTracks = const <Song>[];
+        bottomTitle = '';
+      }
+    } else {
+      final wantedAlbum = _selectedAlbum?.toLowerCase();
+      selectedTracks = wantedAlbum == null
+          ? const <Song>[]
+          : _drillFilter(live)
+              .where((s) => _albumKeyNorm(s) == wantedAlbum)
+              .toList();
+      bottomTitle = _selectedAlbum ?? '';
+    }
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalH = constraints.maxHeight;
-        // When no album is selected the bottom pane collapses; the top
+        // When nothing is selected the bottom pane collapses; the top
         // pane gets all the room. Once a pick lands the drag handle
         // springs up and the two share according to _topFraction.
-        final hasBottom = _selectedAlbum != null;
+        final hasBottom =
+            isPlaylists ? selPlaylist != null : _selectedAlbum != null;
         final topH = hasBottom ? totalH * _topFraction : totalH;
         final bottomH = hasBottom ? totalH - topH - _kHandleHeight : 0.0;
         return Stack(
@@ -321,7 +365,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               left: 0,
               right: 0,
               height: topH,
-              child: _topPane(lib),
+              child: isPlaylists ? _playlistPane() : _topPane(lib),
             ),
             if (hasBottom) ...[
               Positioned(
@@ -344,17 +388,202 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 right: 0,
                 height: bottomH,
                 child: _TrackPane(
-                  albumName:      _selectedAlbum!,
-                  artistFallback: _drillArtist,
-                  tracks:         _TrackPane.sortTracks(selectedTracks),
+                  albumName:      bottomTitle,
+                  artistFallback: isPlaylists ? null : _drillArtist,
+                  // Albums sort by track number; a playlist keeps its order.
+                  tracks:         isPlaylists
+                      ? selectedTracks
+                      : _TrackPane.sortTracks(selectedTracks),
                   onPlay:         _play,
-                  onClose:        () => setState(() => _selectedAlbum = null),
+                  onClose:        () => setState(() {
+                    if (isPlaylists) {
+                      _selectedPlaylistId = null;
+                    } else {
+                      _selectedAlbum = null;
+                    }
+                  }),
                 ),
               ),
             ],
           ],
         );
       },
+    );
+  }
+
+  Playlist? _currentPlaylist(PlaylistService svc) {
+    final id = _selectedPlaylistId;
+    if (id == null) return null;
+    for (final p in svc.playlists) {
+      if (p.id == id) return p;
+    }
+    return null; // selected playlist was deleted — bottom pane collapses
+  }
+
+  /// Top pane for the playlists facet: one chip per saved playlist (tap fills
+  /// the track pane; long-press/right-click for add/rename/delete) plus a
+  /// "New playlist" chip.
+  Widget _playlistPane() {
+    final pls = PlaylistService.instance.playlists;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (final pl in pls)
+            _DiscoverChip(
+              icon:     Icons.queue_music,
+              label:    '${pl.name}  (${pl.songs.length})',
+              selected: _selectedPlaylistId == pl.id,
+              onTap: () => setState(() {
+                _selectedPlaylistId =
+                    _selectedPlaylistId == pl.id ? null : pl.id;
+              }),
+              onContextMenu: (pos) => _playlistMenu(pos, pl),
+            ),
+          _DiscoverChip(
+            icon:     Icons.add,
+            label:    'New playlist',
+            selected: false,
+            onTap:    _createPlaylistDialog,
+            onContextMenu: (_) {},
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _playlistMenu(Offset position, Playlist pl) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final picked = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        position & const Size(40, 40),
+        Offset.zero & overlay.size,
+      ),
+      items: const [
+        PopupMenuItem(
+          value: 'add',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.playlist_add, size: 18),
+            title: Text('Add songs…'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+        PopupMenuItem(
+          value: 'rename',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.edit_outlined, size: 18),
+            title: Text('Rename'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+        PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'delete',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.delete_outline, size: 18),
+            title: Text('Delete'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+      ],
+    );
+    if (!mounted) return;
+    switch (picked) {
+      case 'add':
+        _addSongsSheet(pl);
+      case 'rename':
+        _renamePlaylistDialog(pl);
+      case 'delete':
+        if (_selectedPlaylistId == pl.id) {
+          setState(() => _selectedPlaylistId = null);
+        }
+        PlaylistService.instance.delete(pl);
+    }
+  }
+
+  void _createPlaylistDialog() {
+    final ctrl = TextEditingController();
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('New playlist'),
+        content: TextField(
+            controller: ctrl,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Name')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () {
+                PlaylistService.instance.create(ctrl.text);
+                Navigator.pop(ctx);
+              },
+              child: const Text('Create')),
+        ],
+      ),
+    );
+  }
+
+  void _renamePlaylistDialog(Playlist pl) {
+    final ctrl = TextEditingController(text: pl.name);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename playlist'),
+        content: TextField(
+            controller: ctrl,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Name')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () {
+                PlaylistService.instance.rename(pl, ctrl.text);
+                Navigator.pop(ctx);
+              },
+              child: const Text('Save')),
+        ],
+      ),
+    );
+  }
+
+  /// Pick from the discoverable (online) library to add to [pl].
+  void _addSongsSheet(Playlist pl) {
+    final lib = context.read<LibraryProvider>();
+    final candidates = lib.filteredSongs
+        .where((s) => !pl.songs.contains(s.contentHash))
+        .toList();
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => candidates.isEmpty
+          ? const SizedBox(
+              height: 160,
+              child: Center(child: Text('No songs available to add.')))
+          : ListView.builder(
+              itemCount: candidates.length,
+              itemBuilder: (ctx, i) {
+                final s = candidates[i];
+                return ListTile(
+                  leading: const Icon(Icons.music_note),
+                  title: Text(
+                      s.title.isEmpty ? s.contentHash.substring(0, 12) : s.title),
+                  subtitle: Text(s.artist),
+                  onTap: () {
+                    PlaylistService.instance.addSong(pl, s.contentHash);
+                    Navigator.pop(ctx);
+                  },
+                );
+              },
+            ),
     );
   }
 

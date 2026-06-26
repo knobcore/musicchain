@@ -18,6 +18,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'fingerprinter.dart';
 import 'library_publisher.dart';
+import 'playlist_service.dart';
 import 'library_service.dart';
 import 'node_service.dart';
 import 'rats_client.dart';
@@ -127,6 +128,9 @@ class LibraryScanner {
     // LibraryStore so the full node (and, via flood, every other node) has our
     // current list. Fire-and-forget; the node's version gate makes it idempotent.
     unawaited(LibraryPublisher.publishFull());
+    // Same for saved playlists — re-publish on reconnect so edits made while
+    // the home node was unreachable converge. Idempotent (version-gated).
+    unawaited(PlaylistService.instance.republishAll());
   }
 
   /// Compute the local canonical-hash set, send `swarm.hello_digest`,

@@ -16,23 +16,27 @@ import '../providers/wallet_provider.dart';
 import '../services/library_scanner.dart';
 import '../services/library_service.dart';
 import '../services/local_library_actions.dart';
+import '../services/playlist_service.dart';
 import 'dmca_screen.dart';
 import 'folders_screen.dart';
 
-enum _FacetMode { artist, genre }
+enum _FacetMode { artist, genre, playlists }
 
 extension _FacetModeLabel on _FacetMode {
   String get label => switch (this) {
-    _FacetMode.artist => 'Artist',
-    _FacetMode.genre  => 'Genre',
+    _FacetMode.artist    => 'Artist',
+    _FacetMode.genre     => 'Genre',
+    _FacetMode.playlists => 'Playlists',
   };
   IconData get icon => switch (this) {
-    _FacetMode.artist => Icons.person_outline,
-    _FacetMode.genre  => Icons.style_outlined,
+    _FacetMode.artist    => Icons.person_outline,
+    _FacetMode.genre     => Icons.style_outlined,
+    _FacetMode.playlists => Icons.queue_music,
   };
   String get rootLabel => switch (this) {
-    _FacetMode.artist => 'Artists',
-    _FacetMode.genre  => 'Genres',
+    _FacetMode.artist    => 'Artists',
+    _FacetMode.genre     => 'Genres',
+    _FacetMode.playlists => 'Playlists',
   };
 }
 
@@ -48,8 +52,27 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   String? _drillGenre;
   String? _drillArtist;
   String? _selectedAlbum;
+  String? _selectedPlaylistId; // playlists facet → fills the track pane
   double  _topFraction = 0.5;
   bool    _scanning    = false;
+
+  @override
+  void initState() {
+    super.initState();
+    PlaylistService.instance
+      ..ensureLoaded()
+      ..addListener(_onPlaylistsChanged);
+  }
+
+  @override
+  void dispose() {
+    PlaylistService.instance.removeListener(_onPlaylistsChanged);
+    super.dispose();
+  }
+
+  void _onPlaylistsChanged() {
+    if (mounted) setState(() {});
+  }
 
   Future<void> _openFolders() async {
     await Navigator.of(context).push(MaterialPageRoute(
@@ -145,6 +168,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
       _drillGenre    = null;
       _drillArtist   = null;
       _selectedAlbum = null;
+      _selectedPlaylistId = null;
     });
   }
 
@@ -358,16 +382,43 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   }
 
   Widget _splitBody(List<LibraryEntry> allEntries) {
-    final wantedAlbum = _selectedAlbum?.toLowerCase();
-    final selectedTracks = wantedAlbum == null
-        ? const <LibraryEntry>[]
-        : _sortEntries(_drillFilter(allEntries)
-            .where((e) => _albumKeyNorm(e) == wantedAlbum));
+    final isPlaylists = _mode == _FacetMode.playlists;
+
+    // Bottom-pane tracks. In playlists mode, the selected playlist's songs
+    // resolved to the entries the user actually has locally, in the playlist's
+    // own order — playlists open in the exact same track pane albums do.
+    final Playlist? selPlaylist =
+        isPlaylists ? _currentPlaylist(PlaylistService.instance) : null;
+    final List<LibraryEntry> selectedTracks;
+    final String bottomTitle;
+    if (isPlaylists) {
+      if (selPlaylist != null) {
+        final byHash = <String, LibraryEntry>{
+          for (final e in allEntries) e.contentHash: e
+        };
+        selectedTracks = [
+          for (final h in selPlaylist.songs)
+            if (byHash[h] != null) byHash[h]!,
+        ];
+        bottomTitle = selPlaylist.name;
+      } else {
+        selectedTracks = const <LibraryEntry>[];
+        bottomTitle = '';
+      }
+    } else {
+      final wantedAlbum = _selectedAlbum?.toLowerCase();
+      selectedTracks = wantedAlbum == null
+          ? const <LibraryEntry>[]
+          : _sortEntries(_drillFilter(allEntries)
+              .where((e) => _albumKeyNorm(e) == wantedAlbum));
+      bottomTitle = _selectedAlbum ?? '';
+    }
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalH   = constraints.maxHeight;
-        final hasBottom = _selectedAlbum != null;
+        final hasBottom =
+            isPlaylists ? selPlaylist != null : _selectedAlbum != null;
         final topH    = hasBottom ? totalH * _topFraction : totalH;
         final bottomH = hasBottom ? totalH - topH - _kHandleHeight : 0.0;
         return Stack(
@@ -377,7 +428,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
               left: 0,
               right: 0,
               height: topH,
-              child: _topPane(allEntries),
+              child: isPlaylists ? _playlistPane() : _topPane(allEntries),
             ),
             if (hasBottom) ...[
               Positioned(
@@ -398,17 +449,199 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
                 right: 0,
                 height: bottomH,
                 child: _TrackPane(
-                  albumName:      _selectedAlbum!,
-                  artistFallback: _drillArtist,
+                  albumName:      bottomTitle,
+                  artistFallback: isPlaylists ? null : _drillArtist,
                   tracks:         selectedTracks,
                   onPlay:         _playFromAlbum,
-                  onClose:        () => setState(() => _selectedAlbum = null),
+                  onClose:        () => setState(() {
+                    if (isPlaylists) {
+                      _selectedPlaylistId = null;
+                    } else {
+                      _selectedAlbum = null;
+                    }
+                  }),
                 ),
               ),
             ],
           ],
         );
       },
+    );
+  }
+
+  Playlist? _currentPlaylist(PlaylistService svc) {
+    final id = _selectedPlaylistId;
+    if (id == null) return null;
+    for (final p in svc.playlists) {
+      if (p.id == id) return p;
+    }
+    return null; // selected playlist was deleted — bottom pane collapses
+  }
+
+  /// Top pane for the playlists facet: one chip per saved playlist (tap fills
+  /// the track pane; long-press / right-click for add/rename/delete) plus a
+  /// "New playlist" chip.
+  Widget _playlistPane() {
+    final pls = PlaylistService.instance.playlists;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (final pl in pls)
+            GestureDetector(
+              onLongPressStart: (d) => _playlistMenu(d.globalPosition, pl),
+              onSecondaryTapDown: (d) => _playlistMenu(d.globalPosition, pl),
+              child: FilterChip(
+                avatar: const Icon(Icons.queue_music, size: 18),
+                label: Text('${pl.name}  (${pl.songs.length})'),
+                selected: _selectedPlaylistId == pl.id,
+                onSelected: (_) => setState(() {
+                  _selectedPlaylistId =
+                      _selectedPlaylistId == pl.id ? null : pl.id;
+                }),
+              ),
+            ),
+          ActionChip(
+            avatar: const Icon(Icons.add, size: 18),
+            label: const Text('New playlist'),
+            onPressed: _createPlaylistDialog,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _playlistMenu(Offset position, Playlist pl) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final picked = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        position & const Size(40, 40),
+        Offset.zero & overlay.size,
+      ),
+      items: const [
+        PopupMenuItem(
+          value: 'add',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.playlist_add, size: 18),
+            title: Text('Add songs…'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+        PopupMenuItem(
+          value: 'rename',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.edit_outlined, size: 18),
+            title: Text('Rename'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+        PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'delete',
+          child: ListTile(
+            dense: true,
+            leading: Icon(Icons.delete_outline, size: 18),
+            title: Text('Delete'),
+            contentPadding: EdgeInsets.zero,
+          ),
+        ),
+      ],
+    );
+    if (!mounted) return;
+    switch (picked) {
+      case 'add':
+        _addSongsSheet(pl);
+      case 'rename':
+        _renamePlaylistDialog(pl);
+      case 'delete':
+        if (_selectedPlaylistId == pl.id) {
+          setState(() => _selectedPlaylistId = null);
+        }
+        PlaylistService.instance.delete(pl);
+    }
+  }
+
+  void _createPlaylistDialog() {
+    final ctrl = TextEditingController();
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('New playlist'),
+        content: TextField(
+            controller: ctrl,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Name')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () {
+                PlaylistService.instance.create(ctrl.text);
+                Navigator.pop(ctx);
+              },
+              child: const Text('Create')),
+        ],
+      ),
+    );
+  }
+
+  void _renamePlaylistDialog(Playlist pl) {
+    final ctrl = TextEditingController(text: pl.name);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename playlist'),
+        content: TextField(
+            controller: ctrl,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Name')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () {
+                PlaylistService.instance.rename(pl, ctrl.text);
+                Navigator.pop(ctx);
+              },
+              child: const Text('Save')),
+        ],
+      ),
+    );
+  }
+
+  /// Pick from the user's local library to add to [pl].
+  void _addSongsSheet(Playlist pl) {
+    final candidates = LibraryService.instance.entries
+        .where((e) => !pl.songs.contains(e.contentHash))
+        .toList();
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => candidates.isEmpty
+          ? const SizedBox(
+              height: 160,
+              child: Center(child: Text('No more local songs to add.')))
+          : ListView.builder(
+              itemCount: candidates.length,
+              itemBuilder: (ctx, i) {
+                final e = candidates[i];
+                return ListTile(
+                  leading: const Icon(Icons.music_note),
+                  title: Text(
+                      e.title.isEmpty ? e.contentHash.substring(0, 12) : e.title),
+                  subtitle: Text(e.artist),
+                  onTap: () {
+                    PlaylistService.instance.addSong(pl, e.contentHash);
+                    Navigator.pop(ctx);
+                  },
+                );
+              },
+            ),
     );
   }
 

@@ -779,12 +779,21 @@ class RatsClient {
   static const _kDhtRegistryCap = 512;
   final Map<String, NativeCallable<NativePeersFoundCb>> _dhtCallbacks = {};
   final Map<String, Set<String>>                       _dhtResults   = {};
+  /// Evicted DHT callbacks are RETIRED here, never closed while librats is
+  /// live. librats's DHT can still deliver a late peers-found batch for an
+  /// evicted key; closing the trampoline first aborts the VM with
+  /// "Callback invoked after it has been deleted" (the exact crash we hit).
+  /// dispose() closes these only AFTER _b.stop() halts the worker threads —
+  /// the same invariant the dispose teardown already documents.
+  final List<NativeCallable<NativePeersFoundCb>>       _retiredDhtCallbacks = [];
 
   void _capDhtRegistry() {
     while (_dhtCallbacks.length > _kDhtRegistryCap) {
       final oldest = _dhtCallbacks.keys.first;
-      try { _dhtCallbacks[oldest]?.close(); } catch (_) {}
-      _dhtCallbacks.remove(oldest);
+      // Retire, don't close: a late DHT batch for this key would invoke a
+      // freed trampoline → SIGABRT. These are closed safely in dispose().
+      final cb = _dhtCallbacks.remove(oldest);
+      if (cb != null) _retiredDhtCallbacks.add(cb);
       _dhtResults.remove(oldest);
     }
   }
@@ -933,6 +942,12 @@ class RatsClient {
     for (final cb in _dhtCallbacks.values) {
       try { cb.close(); } catch (_) {}
     }
+    // Retired (evicted) DHT callbacks: now safe to close — _b.stop has halted
+    // the worker threads, so no late peers-found batch can fire into them.
+    for (final cb in _retiredDhtCallbacks) {
+      try { cb.close(); } catch (_) {}
+    }
+    _retiredDhtCallbacks.clear();
     _dhtCallbacks.clear();
     _dhtResults.clear();
     _b.destroy(_handle);

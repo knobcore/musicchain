@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import '../providers/wallet_provider.dart';
 import 'library_scanner.dart';
 import 'library_service.dart';
@@ -21,6 +23,13 @@ import 'rats_client.dart';
 class LibraryPublisher {
   static bool _inFlight = false;
 
+  /// Digest of the hash-set we last SUCCESSFULLY published this session.
+  /// In-memory (cleared on app restart) so we still re-publish once per launch
+  /// — covering the node ever losing the record — but skip the redundant
+  /// ~N-hash re-upload on every reconnect / node-change / scan when nothing
+  /// changed. Updated only on applied=true, so a failed publish retries.
+  static String? _lastPublishedDigest;
+
   /// Publish the wallet's whole current library as a full delta (add =
   /// every content hash, del = none). No-op without a wallet, an empty
   /// library, or a reachable full node. Safe to call repeatedly — the node's
@@ -35,11 +44,31 @@ class LibraryPublisher {
 
       final lib = LibraryService.instance;
       await lib.ensureLoaded();
-      final hashes = <String>[
-        for (final e in lib.entries)
-          if (e.contentHash.isNotEmpty) e.contentHash,
-      ];
+      // Tie the library to the SONG identity — the chain's fingerprint-resolved
+      // CANONICAL hash — not the local file's content hash. Two encodings/
+      // formats of the same song share one canonicalHash (the chain's fuzzy
+      // fingerprint match collapses them), so they stop looking like different
+      // songs in discovery. canonicalHash falls back to contentHash for a song
+      // this device first-registered (they're equal then). The Set dedups
+      // variants that resolve to the same canonical id.
+      final ids = <String>{};
+      for (final e in lib.entries) {
+        if (e.songId.isNotEmpty) ids.add(e.songId);
+      }
+      final hashes = ids.toList();
       if (hashes.isEmpty) return;
+
+      // Digest-gate: if the library is identical to our last ACCEPTED publish
+      // this session, skip the full upload — presence.hello (~150 B) already
+      // keeps us online + bound. Saves re-sending ~32 KB (at 474 songs) on
+      // every reAnnounce when nothing changed.
+      final digest = _digestOf(hashes);
+      if (digest == _lastPublishedDigest) {
+        // ignore: avoid_print
+        print('[db2] library unchanged (${hashes.length} songs) — '
+            'skipping library.delta');
+        return;
+      }
 
       final homePid =
           await NodeService.getRatsPeerId(waitFor: const Duration(seconds: 8));
@@ -87,6 +116,9 @@ class LibraryPublisher {
       );
 
       final applied = (reply is Map) && (reply['applied'] == true);
+      // Remember the digest only on a confirmed apply, so a failed/rejected
+      // publish retries on the next reAnnounce instead of being gated out.
+      if (applied) _lastPublishedDigest = digest;
       // The node replies with `unknown[]`: the published content hashes that
       // aren't registered on chain yet (fresh chain, or one wiped between
       // sessions). Re-fire fingerprint.submit for each so the songs actually
@@ -119,6 +151,13 @@ class LibraryPublisher {
       b[i] = (x >> (8 * i)) & 0xFF;
     }
     return b;
+  }
+
+  /// Order-independent digest of the content-hash set (sorted + SHA-256),
+  /// used purely to detect whether the library changed since the last publish.
+  static String _digestOf(List<String> hashes) {
+    final sorted = List<String>.of(hashes)..sort();
+    return crypto.sha256.convert(utf8.encode(sorted.join())).toString();
   }
 
   static Uint8List _u32le(int x) {

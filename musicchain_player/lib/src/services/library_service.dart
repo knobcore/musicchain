@@ -43,6 +43,14 @@ class LibraryEntry {
   /// downloadToLibrary so the chain library "local" badge can find our
   /// downloaded copy by the chain's canonical hash.
   String canonicalHash;
+
+  /// The stable SONG identity used by DB2, discovery and playlists — the
+  /// chain's fingerprint-resolved canonical hash, which collapses every
+  /// encoding/format of a song to one id. Falls back to [contentHash] for a
+  /// song this device first-registered (where the two are equal). Use this,
+  /// not [contentHash], whenever you mean "which song" rather than "which file".
+  String get songId => canonicalHash.isNotEmpty ? canonicalHash : contentHash;
+
   String title;
   String artist;
   String album;

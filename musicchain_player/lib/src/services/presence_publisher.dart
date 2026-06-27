@@ -63,9 +63,9 @@ class PresencePublisher {
         timeout: const Duration(seconds: 10),
       );
 
-      final ok = (reply is Map) && (reply['ok'] == true);
+      final bound = (reply is Map) && (reply['bound'] == true);
       // ignore: avoid_print
-      print('[db2] presence.hello ts=$ts peer=$peerId ok=$ok');
+      print('[db2] presence.hello ts=$ts peer=$peerId bound=$bound');
     } catch (e) {
       // ignore: avoid_print
       print('[db2] presence.hello failed: $e');

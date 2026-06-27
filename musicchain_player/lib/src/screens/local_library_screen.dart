@@ -393,8 +393,10 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
     final String bottomTitle;
     if (isPlaylists) {
       if (selPlaylist != null) {
+        // Key by songId (canonical) — a playlist stores song identities, so a
+        // local variant resolves regardless of its file's content hash.
         final byHash = <String, LibraryEntry>{
-          for (final e in allEntries) e.contentHash: e
+          for (final e in allEntries) e.songId: e
         };
         selectedTracks = [
           for (final h in selPlaylist.songs)
@@ -618,7 +620,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
   /// Pick from the user's local library to add to [pl].
   void _addSongsSheet(Playlist pl) {
     final candidates = LibraryService.instance.entries
-        .where((e) => !pl.songs.contains(e.contentHash))
+        .where((e) => !pl.songs.contains(e.songId))
         .toList();
     showModalBottomSheet<void>(
       context: context,
@@ -636,7 +638,7 @@ class _LocalLibraryScreenState extends State<LocalLibraryScreen> {
                       e.title.isEmpty ? e.contentHash.substring(0, 12) : e.title),
                   subtitle: Text(e.artist),
                   onTap: () {
-                    PlaylistService.instance.addSong(pl, e.contentHash);
+                    PlaylistService.instance.addSong(pl, e.songId);
                     Navigator.pop(ctx);
                   },
                 );

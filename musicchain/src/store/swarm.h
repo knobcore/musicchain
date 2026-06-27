@@ -98,6 +98,12 @@ public:
     /// can swarm.hello_digest and skip the resync.
     void mark_peer_offline(const std::string& peer_id);
 
+    /// True iff this peer is currently in online_peers_ (i.e. the
+    /// librats transport / mini-node presence pipeline says it's
+    /// connected). Used by the DB2 discovery path (RatsApi) to filter
+    /// a wallet's library down to copies a live player is serving.
+    bool is_online(const std::string& peer_id) const;
+
     /// Hard-evict a peer: remove from online_peers_, drop every
     /// (canonical_hash → SwarmMember) entry where member.peer_id ==
     /// peer_id, and persist the removals to leveldb. Use when the

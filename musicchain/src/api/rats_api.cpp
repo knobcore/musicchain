@@ -189,10 +189,9 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
     auto* self = static_cast<RatsApi*>(user_data);
     if (self && peer_id && *peer_id) {
         // Hard evict instead of mark_peer_offline so dead-peer entries
-        // don't linger up to 20 minutes (kStaleAfterMs) in stream.open
-        // results when the transport says the peer is gone. The peer
-        // can re-announce on reconnect via swarm.hello — cheap, since
-        // the player ships a digest-based delta path.
+        // don't linger up to 20 minutes (kStaleAfterMs) when the transport
+        // says the peer is gone. The peer rebinds its wallet on reconnect
+        // via presence.hello and re-publishes its library via library.delta.
         self->swarm_.evict_peer(peer_id);
         if (self->propagator_) self->propagator_->on_peer_disconnected(peer_id);
         // Drop the mini-node wallet cache entry so a re-connect under a
@@ -201,6 +200,20 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
         {
             std::lock_guard<std::mutex> lk(self->peer_to_wallet_mu_);
             self->peer_to_wallet_.erase(peer_id);
+        }
+        // Drop the wallet-presence binding (DB2 discovery) for a directly-
+        // connected player that just dropped. Only erase the wallet→peer
+        // mapping if it still points at THIS peer (reconnect race: a fresh
+        // peer_id may have already rebound the wallet via presence.hello).
+        {
+            std::lock_guard<std::mutex> lk(self->wallet_presence_mu_);
+            auto it = self->peer_to_wallet_player_.find(peer_id);
+            if (it != self->peer_to_wallet_player_.end()) {
+                auto w = self->wallet_to_peer_.find(it->second);
+                if (w != self->wallet_to_peer_.end() && w->second == peer_id)
+                    self->wallet_to_peer_.erase(w);
+                self->peer_to_wallet_player_.erase(it);
+            }
         }
     }
     // NOTE: do NOT rats_string_free here. The disconnect callback wrapper
@@ -294,7 +307,55 @@ bool from_hex_fixed(const std::string& hex_in, uint8_t* out, size_t n) {
     }
     return true;
 }
+// Forward-declare put_le (defined in the DB2 anonymous namespace lower in
+// this file) so the presence.hello handler in handle_request can build the
+// little-endian ts field with the same helper the canonical builders use.
+void put_le(std::vector<uint8_t>& v, uint64_t x, int bytes);
 } // namespace
+
+// ---- DB2 discovery helpers (wallet-presence → live song availability) ----
+//
+// The discovery surface moved off the in-memory swarm index onto the DB2
+// LibraryStore. A song is "available" when SOME wallet that holds it in its
+// (wallet-signed, flooded) library currently has a live player bound via
+// presence.hello AND that player's librats peer_id is online. These two
+// helpers do the wallet ⇄ peer_id join under wallet_presence_mu_, then read
+// the LibraryStore (which has its own lock).
+std::vector<std::string> RatsApi::online_peers_for_song_(const Hash256& ch) {
+    std::vector<std::string> out;
+    // holders() consults LibraryStore's own lock; do it before/outside ours.
+    auto holders = library_.holders(ch);
+    std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+    for (const auto& w : holders) {
+        const std::string wh = crypto::to_hex(w.data(), w.size());
+        auto it = wallet_to_peer_.find(wh);
+        if (it == wallet_to_peer_.end()) continue;
+        const std::string& pid = it->second;
+        if (swarm_.is_online(pid)) out.push_back(pid);
+    }
+    return out;
+}
+
+std::unordered_set<std::string> RatsApi::online_library_hashes_() {
+    // Snapshot the (wallet_hex -> peer_id) bindings under the presence lock,
+    // then release it before touching LibraryStore to avoid holding two locks
+    // at once (lock-ordering safety: LibraryStore has its own mutex).
+    std::vector<std::pair<std::string, std::string>> bindings;
+    {
+        std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+        bindings.reserve(wallet_to_peer_.size());
+        for (const auto& [wh, pid] : wallet_to_peer_) bindings.emplace_back(wh, pid);
+    }
+    std::unordered_set<std::string> out;
+    for (const auto& [wh, pid] : bindings) {
+        if (!swarm_.is_online(pid)) continue;
+        Address addr{};
+        if (!from_hex_fixed(wh, addr.data(), addr.size())) continue;
+        for (const auto& h : library_.library(addr))
+            out.insert(crypto::to_hex(h.data(), h.size()));
+    }
+    return out;
+}
 
 void RatsApi::handle_request(const std::string& peer_id,
                              const std::string& body) {
@@ -387,27 +448,32 @@ void RatsApi::handle_request(const std::string& peer_id,
                          {"body",   std::move(body_out)}};
             }
         } else if (type == "songs.list") {
-            // Inject the live swarm size next to each chain entry so the
-            // client can hide songs nobody is currently serving. The
-            // raw HttpServer verb doesn't know about SwarmIndex, so we
-            // post-process the JSON here.
+            // DB2 discovery: a song is listed only when an online player's
+            // wallet library currently holds it (presence.hello binding +
+            // librats online). We drop everything else entirely so the
+            // Discover surface is strictly "online files only". swarm_size
+            // is the count of live holders so the client can still show it.
             auto [code, body_str] = http_.verb_songs_list();
             if (code == 200) {
                 try {
                     auto arr = nlohmann::json::parse(body_str);
                     if (arr.is_array()) {
+                        const auto online = online_library_hashes_();
+                        nlohmann::json filtered = nlohmann::json::array();
                         for (auto& s : arr) {
                             const std::string ch_hex =
                                 s.value("content_hash", "");
+                            if (online.count(ch_hex) == 0) continue; // skip
                             Hash256 ch;
                             if (crypto::parse_hash256(ch_hex, ch)) {
                                 s["swarm_size"] =
-                                    swarm_.members(ch).size();
+                                    online_peers_for_song_(ch).size();
                             } else {
                                 s["swarm_size"] = 0;
                             }
+                            filtered.push_back(std::move(s));
                         }
-                        body_str = arr.dump();
+                        body_str = filtered.dump();
                     }
                 } catch (const nlohmann::json::exception&) {/* keep raw */}
             }
@@ -542,11 +608,26 @@ void RatsApi::handle_request(const std::string& peer_id,
         else if (type == "library.delta") {
             const bool applied = ingest_library_delta(in.dump(),
                                                       /*broadcast_if_new=*/true);
+            // Report which `add` hashes the chain doesn't recognise so the
+            // player can re-register songs the chain lost (it follows up
+            // with fingerprint.submit for those). Computed regardless of
+            // `applied` so an idempotent re-publish still reports unknowns.
+            json unknown = json::array();
+            if (in.contains("add") && in["add"].is_array()) {
+                for (const auto& h : in["add"]) {
+                    if (!h.is_string()) continue;
+                    const std::string hex = h.get<std::string>();
+                    Hash256 ch{};
+                    if (!crypto::parse_hash256(hex, ch)) continue;
+                    if (!db_.get_content_height(ch)) unknown.push_back(hex);
+                }
+            }
             reply = {{"req_id", req_id},
                      {"status", applied ? "ok" : "rejected"},
                      {"body", {
                          {"applied", applied},
                          {"version", in.value("version", static_cast<uint64_t>(0))},
+                         {"unknown", unknown},
                      }}};
             if (!applied) reply["error"] = "bad signature or stale version";
         }
@@ -715,9 +796,71 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = {{"req_id", req_id}, {"status", "ok"},
                      {"body",   json::object()}};
         }
-        // ---- audio streaming (swarm only) -------------------------------
+        // ---- wallet presence (DB2 discovery binding) --------------------
+        //
+        // A player proves it controls a wallet AND declares its live
+        // librats peer_id so the DB2 LibraryStore (wallet-keyed) can be
+        // filtered down to copies a currently-online player is serving.
+        // The signed bytes mirror the library.delta canonical pattern:
+        //   "mcprs1"(6) || wallet(20 raw) || ts(8 LE) || peer_id(raw UTF-8,
+        //   no length prefix, runs to the end)
+        // SHA-256'd then ECDSA-signed by the player. We rebuild + verify.
+        //
+        // IMPORTANT: bind the SELF-DECLARED peer_id from the payload, not
+        // the transport `peer_id` — relayed players arrive via a mini-node
+        // so the transport id would be the mini-node's. This mirrors
+        // swarm.hello, which already trusts a self-declared peer_id.
+        else if (type == "presence.hello") {
+            const std::string peer_id_decl = in.value("peer_id", std::string());
+            const std::string w_in         = in.value("wallet",  std::string());
+            const std::string pk_in        = in.value("pubkey",  std::string());
+            const std::string sg_in        = in.value("sig",     std::string());
+            const uint64_t    ts           = in.value("ts", static_cast<uint64_t>(0));
+
+            Address  wallet{};
+            PubKey33 pubkey{};
+            Sig64    sig{};
+            if (!crypto::parse_address_checksummed(w_in, wallet) ||
+                !from_hex_fixed(pk_in, pubkey.data(), pubkey.size()) ||
+                !from_hex_fixed(sg_in, sig.data(), sig.size())) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error",  "bad wallet / pubkey / signature"}};
+            } else if (crypto::address_from_pubkey(pubkey) != wallet) {
+                reply = {{"req_id", req_id}, {"status", "rejected"},
+                         {"error",  "pubkey does not derive to wallet"}};
+            } else {
+                // Canonical signed bytes — must match the player byte-for-byte.
+                std::vector<uint8_t> b;
+                static const char tag[6] = {'m', 'c', 'p', 'r', 's', '1'};
+                b.insert(b.end(), tag, tag + 6);
+                b.insert(b.end(), wallet.begin(), wallet.end());
+                put_le(b, ts, 8);
+                b.insert(b.end(), peer_id_decl.begin(), peer_id_decl.end());
+                const Hash256 digest = crypto::sha256(b.data(), b.size());
+                if (!crypto::verify_ecdsa(digest, sig, pubkey)) {
+                    reply = {{"req_id", req_id}, {"status", "rejected"},
+                             {"error",  "signature did not verify"}};
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+                        const std::string wh =
+                            crypto::to_hex(wallet.data(), wallet.size());
+                        wallet_to_peer_[wh]              = peer_id_decl;
+                        peer_to_wallet_player_[peer_id_decl] = wh;
+                    }
+                    swarm_.mark_peer_online(peer_id_decl);
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"bound", true}}}};
+                    std::cout << "[rats-api] presence.hello: wallet "
+                              << w_in.substr(0, 10) << "… bound to peer "
+                              << peer_id_decl.substr(0, 12) << "\n";
+                }
+            }
+        }
+        // ---- audio streaming (DB2 discovery) ----------------------------
         // The full node never holds audio bytes under the post-pivot
-        // architecture. stream.open just resolves the swarm so the
+        // architecture. stream.open just resolves the live holders of the
+        // song from the DB2 LibraryStore + wallet-presence bindings so the
         // requester can reach out to a player that has the file.
         else if (type == "stream.open") {
             const std::string hash = in.value("content_hash", "");
@@ -735,8 +878,11 @@ void RatsApi::handle_request(const std::string& peer_id,
                 // row (this node is the broker), returned so the player
                 // threads it through the relay and reports receipt.
                 const std::string did_hex = mint_delivery(ch);
-                auto members = swarm_.members(ch);
-                if (members.empty()) {
+                // DB2 discovery: resolve the live player peer_ids that hold
+                // this canonical song (wallet library holders with a
+                // presence binding + online). No swarm index involved.
+                auto peers = online_peers_for_song_(ch);
+                if (peers.empty()) {
                     reply = {{"req_id", req_id},
                              {"status", "ok"},
                              {"body",   {
@@ -746,21 +892,17 @@ void RatsApi::handle_request(const std::string& peer_id,
                                  {"delivery_id",  did_hex},
                              }}};
                 } else {
-                    // Variant-aware peers list. Each entry carries the
-                    // member's *local* content_hash (the actual bytes it
-                    // will serve when stream.open'd), bitrate, and audio
-                    // format so the requester can pick a variant — the
-                    // streaming path defaults to the lowest bitrate;
-                    // download UI surfaces the full list so the user can
-                    // pick the quality to keep.
+                    // Each peer entry carries the requested canonical hash
+                    // (the player streams that hash). Bitrate / format are
+                    // unknown from DB2 alone, so they default; the player's
+                    // download UI can probe variants if it needs them.
                     nlohmann::json peers_j = nlohmann::json::array();
-                    for (const auto& m : members) {
+                    for (const auto& pid : peers) {
                         peers_j.push_back({
-                            {"peer_id",      m.peer_id},
-                            {"content_hash", crypto::to_hex(m.content_hash)},
-                            {"bitrate",      m.bitrate},
-                            {"audio_format", audio_format_to_string(
-                                                m.audio_format)},
+                            {"peer_id",      pid},
+                            {"content_hash", hash},
+                            {"bitrate",      0},
+                            {"audio_format", ""},
                         });
                     }
                     reply = {{"req_id", req_id},
@@ -768,7 +910,7 @@ void RatsApi::handle_request(const std::string& peer_id,
                              {"body",   {
                                  {"content_hash", hash},
                                  {"peers",        peers_j},
-                                 {"source",       "swarm"},
+                                 {"source",       "db2"},
                                  {"delivery_id",  did_hex},
                              }}};
                 }
@@ -1068,145 +1210,19 @@ void RatsApi::handle_request(const std::string& peer_id,
                 }
             }
         }
-        // ---- efficient swarm protocol ----------------------------------
+        // ---- swarm announce verbs REMOVED (DB2 discovery migration) -----
         //
-        // The pre-2026-06-13 path had every player rebroadcast every
-        // file's fingerprint at every launch — bandwidth scaled
-        // linearly with library size. The new verbs let the player
-        // send the chain-canonical content_hash set ONCE per session
-        // and then deltas, with a cheap "digest matches?" preflight
-        // so unchanged libraries cost a single 96-byte round-trip.
-        //
-        // * swarm.hello_digest { peer_id?, digest, count } →
-        //     {match: bool, peer_size}      // bool only; no list
-        // * swarm.hello       { peer_id?, hashes: [hex...] } →
-        //     {peer_size, unknown:[hex...]} // full node persists the
-        //                                   // new set; unknown is the
-        //                                   // hashes the chain hasn't
-        //                                   // seen yet — player still
-        //                                   // calls fingerprint.submit
-        //                                   // for those.
-        // * swarm.add    { peer_id?, hashes: [hex...] }   // delta
-        // * swarm.remove { peer_id?, hashes: [hex...] }   // delta
-        //
-        // peer_id is optional — the rats originator (or sender) is the
-        // default, same convention as fingerprint.submit.
-        else if (type == "swarm.hello_digest") {
-            const std::string my_pid = in.value("peer_id", "");
-            const std::string origin = env.value("originator_peer_id",
-                                                  std::string());
-            const std::string pid = !my_pid.empty() ? my_pid
-                                  : !origin.empty() ? origin
-                                                    : peer_id;
-            // Receipt of any swarm RPC proves the peer is online — the
-            // direct connect/disconnect callbacks above only fire for
-            // peers connected to us directly, but most players come in
-            // through a relay so their online-state has to be inferred
-            // from message arrival here.
-            swarm_.mark_peer_online(pid);
-            const std::string client_digest = in.value("digest", "");
-            const std::string server_digest = swarm_.peer_digest(pid);
-            const bool match = !client_digest.empty()
-                            && client_digest == server_digest;
-            reply = {{"req_id", req_id},
-                     {"status", "ok"},
-                     {"body", {
-                         {"match",         match},
-                         {"server_digest", server_digest},
-                         {"peer_size",     swarm_.peer_size(pid)},
-                     }}};
-            if (match) {
-                // Re-arm the TTL safety net so a clock-skew quirk
-                // doesn't expire a known-online peer's entries.
-                swarm_.touch_peer(pid);
-            }
-        }
-        else if (type == "swarm.hello") {
-            const std::string my_pid = in.value("peer_id", "");
-            const std::string origin = env.value("originator_peer_id",
-                                                  std::string());
-            const std::string pid = !my_pid.empty() ? my_pid
-                                  : !origin.empty() ? origin
-                                                    : peer_id;
-            swarm_.mark_peer_online(pid);
-            const auto& hashes_json = in.value("hashes", json::array());
-            std::vector<std::pair<Hash256, store::SwarmMember>> members;
-            std::vector<std::string> unknown;
-            members.reserve(hashes_json.is_array() ? hashes_json.size() : 0);
-            if (hashes_json.is_array()) {
-                for (const auto& h : hashes_json) {
-                    if (!h.is_string()) continue;
-                    const std::string hash_hex = h.get<std::string>();
-                    Hash256 ch{};
-                    if (!crypto::parse_hash256(hash_hex, ch)) continue;
-                    // Hashes the chain doesn't recognize are returned
-                    // to the player so it knows to follow up with
-                    // fingerprint.submit for the actual block ingest.
-                    if (!db_.get_content_height(ch)) {
-                        unknown.push_back(hash_hex);
-                        continue;
-                    }
-                    store::SwarmMember m;
-                    m.peer_id      = pid;
-                    m.content_hash = ch;
-                    members.emplace_back(ch, m);
-                }
-            }
-            const std::string new_digest = swarm_.replace_peer(pid, members);
-            reply = {{"req_id", req_id},
-                     {"status", "ok"},
-                     {"body", {
-                         {"peer_size",     swarm_.peer_size(pid)},
-                         {"server_digest", new_digest},
-                         {"unknown",       unknown},
-                     }}};
-            std::cout << "[rats-api] swarm.hello from "
-                      << pid.substr(0, 12) << " → " << members.size()
-                      << " known, " << unknown.size() << " unknown\n";
-        }
-        else if (type == "swarm.add" || type == "swarm.remove") {
-            const std::string my_pid = in.value("peer_id", "");
-            const std::string origin = env.value("originator_peer_id",
-                                                  std::string());
-            const std::string pid = !my_pid.empty() ? my_pid
-                                  : !origin.empty() ? origin
-                                                    : peer_id;
-            swarm_.mark_peer_online(pid);
-            const auto& hashes_json = in.value("hashes", json::array());
-            std::vector<std::string> unknown;
-            size_t applied = 0;
-            if (hashes_json.is_array()) {
-                for (const auto& h : hashes_json) {
-                    if (!h.is_string()) continue;
-                    Hash256 ch{};
-                    if (!crypto::parse_hash256(h.get<std::string>(), ch)) {
-                        continue;
-                    }
-                    if (type == "swarm.add") {
-                        if (!db_.get_content_height(ch)) {
-                            unknown.push_back(h.get<std::string>());
-                            continue;
-                        }
-                        store::SwarmMember m;
-                        m.peer_id      = pid;
-                        m.content_hash = ch;
-                        swarm_.announce(ch, m);
-                        ++applied;
-                    } else {
-                        swarm_.drop(ch, pid);
-                        ++applied;
-                    }
-                }
-            }
-            reply = {{"req_id", req_id},
-                     {"status", "ok"},
-                     {"body", {
-                         {"applied",       applied},
-                         {"unknown",       unknown},
-                         {"peer_size",     swarm_.peer_size(pid)},
-                         {"server_digest", swarm_.peer_digest(pid)},
-                     }}};
-        }
+        // The in-memory swarm index is no longer the discovery source.
+        // Song availability is now derived from the DB2 LibraryStore
+        // (wallet-keyed, signed, flooded) joined against live
+        // wallet-presence bindings (presence.hello). The old per-session
+        // announce verbs — swarm.hello / swarm.hello_digest / swarm.add /
+        // swarm.remove / swarm.leave — are gone; players bind their wallet
+        // once via presence.hello and publish their library via
+        // library.delta. The mini-node-forwarded presence lifecycle
+        // (swarm.peer_online / swarm.peer_offline) is kept below for
+        // relayed players.
+
         // Mini-node-forwarded notification that one of its connected
         // peers (a player, usually) is online via rats. Used both:
         //   * when a player first connects through a mini-node
@@ -1234,6 +1250,21 @@ void RatsApi::handle_request(const std::string& peer_id,
             const std::string offline_pid = in.value("peer_id", "");
             if (!offline_pid.empty()) {
                 swarm_.mark_peer_offline(offline_pid);
+                // Drop the wallet-presence binding for this player so its
+                // DB2 library stops surfacing on Discover / stream.open the
+                // instant it goes offline. Only erase the wallet→peer entry
+                // if it still points at THIS peer (a reconnect under a fresh
+                // peer_id may have already rebound the wallet).
+                {
+                    std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+                    auto it = peer_to_wallet_player_.find(offline_pid);
+                    if (it != peer_to_wallet_player_.end()) {
+                        auto w = wallet_to_peer_.find(it->second);
+                        if (w != wallet_to_peer_.end() && w->second == offline_pid)
+                            wallet_to_peer_.erase(w);
+                        peer_to_wallet_player_.erase(it);
+                    }
+                }
                 std::cout << "[rats-api] swarm.peer_offline "
                           << offline_pid.substr(0, 12)
                           << " (via " << peer_id.substr(0, 12) << ")\n";
@@ -1241,43 +1272,6 @@ void RatsApi::handle_request(const std::string& peer_id,
             reply = {{"req_id", req_id},
                      {"status", "ok"},
                      {"body", {{"peer_id", offline_pid}}}};
-        }
-        // ---- swarm leave -----------------------------------------------
-        // Inverse of fingerprint.submit's swarm join: when a player
-        // removes a file (folder un-added from My Library), they tell
-        // the full node to drop them from the swarm so requesters
-        // don't waste a round-trip to a peer that no longer has the bytes.
-        //
-        // Body: {content_hash, peer_id?}   peer_id falls back to envelope
-        //                                  originator → immediate sender.
-        // Reply: {body: {dropped: bool, content_hash, swarm_size}}
-        else if (type == "swarm.leave") {
-            const std::string hash_hex = in.value("content_hash", "");
-            const std::string my_pid   = in.value("peer_id",      "");
-            const std::string origin   = env.value("originator_peer_id",
-                                                   std::string());
-            const std::string leaver_pid =
-                !my_pid.empty() ? my_pid
-                : !origin.empty() ? origin
-                : peer_id;
-            Hash256 ch{};
-            if (!crypto::parse_hash256(hash_hex, ch)) {
-                reply = {{"req_id", req_id},
-                         {"status", "invalid"},
-                         {"error",  "content_hash not 32-byte hex"}};
-            } else {
-                swarm_.drop(ch, leaver_pid);
-                reply = {{"req_id", req_id},
-                         {"status", "ok"},
-                         {"body", {
-                             {"dropped",      true},
-                             {"content_hash", hash_hex},
-                             {"swarm_size",   swarm_.members(ch).size()},
-                         }}};
-                std::cout << "[rats-api] swarm.leave: "
-                          << leaver_pid.substr(0, 12) << " left "
-                          << hash_hex.substr(0, 12) << "\n";
-            }
         }
         // ---- Moderation log sync ----------------------------------------
         //

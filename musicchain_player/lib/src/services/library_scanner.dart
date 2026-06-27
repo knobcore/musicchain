@@ -10,7 +10,6 @@
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:crypto/crypto.dart' as crypto;
@@ -18,6 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'fingerprinter.dart';
 import 'library_publisher.dart';
+import 'presence_publisher.dart';
 import 'playlist_service.dart';
 import 'library_service.dart';
 import 'node_service.dart';
@@ -96,34 +96,29 @@ class LibraryScanner {
   /// "All files access" once instead of finding the picker empty.
   Future<void> ensureStoragePermissions() => _ensureStoragePermissions();
 
-  /// Tell the full node we no longer have the bytes for each
-  /// [contentHashes]. Uses the new `swarm.remove` delta verb (one
-  /// round-trip for the whole batch instead of N).
+  /// Tell the mesh we no longer have the bytes for each [contentHashes].
+  /// Removal now flows through DB2: LibraryService has already dropped the
+  /// rows, so a fresh `library.delta` snapshot (which lists exactly what we
+  /// still hold) carries the removal to the full node and, via flood, every
+  /// other node. The [contentHashes] arg is retained for call-site
+  /// compatibility but the snapshot is what's authoritative.
   Future<void> deannounce(List<String> contentHashes) async {
     if (contentHashes.isEmpty) return;
-    final rats = RatsClient.instance;
-    final homePid = await NodeService.getRatsPeerId(
-        waitFor: const Duration(seconds: 4));
-    if (homePid.isEmpty) return;
-    try {
-      await rats.request(homePid, 'swarm.remove', {
-        'peer_id': rats.ownPeerId,
-        'hashes':  contentHashes,
-      }, timeout: const Duration(seconds: 6));
-    } catch (_) {/* best effort */}
+    unawaited(LibraryPublisher.publishFull());
   }
 
-  /// Bring the full node's swarm picture of us back in sync with the
-  /// local library. Cheap when nothing changed: one digest preflight
-  /// fits in a single ~96-byte round-trip and the full node refreshes
-  /// our TTL without us listing a single hash. Falls through to a full
-  /// `swarm.hello` only when the digest mismatches.
+  /// Re-establish our standing with the full node on (re)connect. Declares the
+  /// wallet<->live-peer binding via signed `presence.hello`, then republishes
+  /// the wallet-signed library (DB2 / `library.delta`) and saved playlists.
   ///
-  /// Used by both the boot-time announce and the VPS-reconnect handler.
-  /// Replaces the old per-track `fingerprint.submit` loop that flooded
-  /// the network at every reconnect with one RPC per song.
+  /// Used by both the boot-time announce and the VPS-reconnect handler. The old
+  /// `swarm.hello`/digest membership round-trips are gone — the durable library
+  /// now lives in DB2 and floods to the rest of the mesh from the home node.
   Future<void> reAnnounce() async {
-    await syncSwarm();
+    // Presence — declare the wallet<->live-peer binding for this connection.
+    // Replaces the old swarm.hello library re-announce; the durable library now
+    // lives in DB2 (library.delta) and is republished just below.
+    await PresencePublisher.announce();
     // DB2 — also publish the wallet-signed library to the gossip-replicated
     // LibraryStore so the full node (and, via flood, every other node) has our
     // current list. Fire-and-forget; the node's version gate makes it idempotent.
@@ -133,10 +128,19 @@ class LibraryScanner {
     unawaited(PlaylistService.instance.republishAll());
   }
 
-  /// Compute the local canonical-hash set, send `swarm.hello_digest`,
-  /// and if the full node has us under a different set fall through to
-  /// `swarm.hello` with the full list. Returns silently on no-op.
-  Future<void> syncSwarm() async {
+  /// Re-fire `fingerprint.submit` for every local file whose content hash the
+  /// chain doesn't yet know. Called by [LibraryPublisher.publishFull] with the
+  /// `unknown[]` list the node returns on a `library.delta` reply (the hashes
+  /// in our published library that aren't registered on chain — either a fresh
+  /// chain or one wiped between sessions).
+  ///
+  /// This is the SAME resubmit the old `swarm.hello` reply path performed: it
+  /// maps each unknown hash back to a local file (by `contentHash` or
+  /// `canonicalHash`) and runs `_processFile(force: true)`, whose hash-only
+  /// preflight shortcuts when the chain DOES already have a match and
+  /// re-fingerprints + submits the full blob when it doesn't.
+  Future<void> resubmitUnknown(List<String> hashes) async {
+    if (hashes.isEmpty) return;
     final lib = LibraryService.instance;
     await lib.ensureLoaded();
     if (lib.entries.isEmpty) return;
@@ -145,157 +149,34 @@ class LibraryScanner {
         waitFor: const Duration(seconds: 8));
     if (homePid.isEmpty) return;
 
-    final sorted = _localHashSet(lib);
-    if (sorted.isEmpty) return;
-    final digest = _hashSetDigest(sorted);
-
-    // Preflight. When the full node already has our set cached with
-    // the same digest AND the chain still has at least one of those
-    // hashes registered as a song, fast-skip the full swarm.hello +
-    // resubmit. If the chain was wiped between sessions (heartbeats
-    // only, no song-bearing blocks) the swarm cache can still match
-    // because it lives in a separate leveldb prefix — in that case we
-    // MUST fall through and re-fire fingerprint.submit so the chain
-    // gets the songs back.
-    try {
-      final reply = await rats.request(homePid, 'swarm.hello_digest', {
-        'peer_id': rats.ownPeerId,
-        'digest':  digest,
-        'count':   sorted.length,
-      }, timeout: const Duration(seconds: 6));
-      if (reply is Map && reply['match'] == true) {
-        // Sanity-probe the chain: does it actually carry any of our
-        // local songs? `songs.get` always returns a stub object even
-        // for unknown content_hashes (play_count=0, discoverer=zeros),
-        // so the right signal is whether `discoverer` is non-zero —
-        // that's only set when the song was actually registered. A
-        // miss here with a non-empty local library means the chain
-        // was wiped between sessions while the server's swarm cache
-        // didn't expire; we fall through and re-fire fingerprint.submit.
-        bool chainHasOurSongs = false;
-        try {
-          final probe = await rats.request(homePid, 'songs.get',
-              {'content_hash': sorted.first},
-              timeout: const Duration(seconds: 5));
-          if (probe is Map) {
-            final disc = (probe['discoverer'] as String? ?? '')
-                .replaceAll('0', '');
-            chainHasOurSongs = disc.isNotEmpty;
-          }
-        } catch (_) { /* treat as missing */ }
-        if (chainHasOurSongs) {
-          // ignore: avoid_print
-          print('[scanner] swarm digest matched (${sorted.length} hashes)'
-                ' + chain confirmed — no resync needed');
-          return;
-        }
-        // ignore: avoid_print
-        print('[scanner] swarm digest matched BUT chain lost songs — '
-              'forcing full swarm.hello + resubmit');
+    // ignore: avoid_print
+    print('[scanner] re-submitting ${hashes.length} unknown hashes '
+          'to chain via fingerprint.submit');
+    final unknownSet = hashes.toSet();
+    for (final entry in lib.entries) {
+      if (!unknownSet.contains(entry.contentHash) &&
+          !unknownSet.contains(entry.canonicalHash)) {
+        continue;
       }
-    } catch (_) { /* fall through to full sync */ }
-
-    // Digest miss: send the full sorted list. The full node replaces
-    // our swarm membership wholesale and returns any hashes it doesn't
-    // recognize so we know to follow up with fingerprint.submit for
-    // those (the chain hasn't seen them yet).
-    try {
-      final reply = await rats.request(homePid, 'swarm.hello', {
-        'peer_id': rats.ownPeerId,
-        'hashes':  sorted,
-      }, timeout: const Duration(seconds: 30));
-      if (reply is Map) {
-        final unknown = (reply['unknown'] as List?)?.cast<String>()
-                       ?? const <String>[];
-        // ignore: avoid_print
-        print('[scanner] swarm.hello -> known=${reply['peer_size']}'
-              ' unknown=${unknown.length}');
-        // The chain doesn't know these `unknown` hashes (either fresh
-        // chain, or chain was wiped between sessions). Re-fire
-        // fingerprint.submit for each one so the songs actually land in
-        // the mempool and get minted — swarm.hello alone only registers
-        // membership in the swarm tracker, not the chain. We use
-        // _processFile(force: true) so the hash-only preflight inside
-        // it shortcuts when the chain DOES already have a match, and
-        // re-fingerprints + submits the full blob when it doesn't.
-        if (unknown.isNotEmpty) {
-          // ignore: avoid_print
-          print('[scanner] re-submitting ${unknown.length} unknown hashes '
-                'to chain via fingerprint.submit');
-          final unknownSet = unknown.toSet();
-          for (final entry in lib.entries) {
-            if (!unknownSet.contains(entry.contentHash) &&
-                !unknownSet.contains(entry.canonicalHash)) {
-              continue;
-            }
-            if (entry.filePath.isEmpty) continue;
-            final file = File(entry.filePath);
-            if (!await file.exists()) continue;
-            await _processFile(file, lib, rats, homePid, force: true);
-          }
-        }
-      }
-    } catch (_) {/* best effort — next sync will retry */}
+      if (entry.filePath.isEmpty) continue;
+      final file = File(entry.filePath);
+      if (!await file.exists()) continue;
+      await _processFile(file, lib, rats, homePid, force: true);
+    }
   }
 
-  /// Push a single hash add to the full node. Use when LibraryService
-  /// has just learned about a freshly-fingerprinted file — saves the
-  /// player from waiting until the next syncSwarm to be visible.
+  /// A freshly-fingerprinted file just landed in the library. Republish the
+  /// whole library to DB2 so the new content hash lands in the gossip-replicated
+  /// LibraryStore (and, via flood, on every node). The publish is a versioned
+  /// SNAPSHOT, so it naturally supersedes the previous list. Replaces the old
+  /// per-hash `swarm.add`.
   Future<void> announceAddition(LibraryEntry entry) async {
     if (!entry.isLocal) return;
     final hash = entry.canonicalHash.isNotEmpty
         ? entry.canonicalHash
         : entry.contentHash;
     if (hash.isEmpty) return;
-    final rats = RatsClient.instance;
-    final homePid = await NodeService.getRatsPeerId(
-        waitFor: const Duration(seconds: 4));
-    if (homePid.isEmpty) return;
-    try {
-      await rats.request(homePid, 'swarm.add', {
-        'peer_id': rats.ownPeerId,
-        'hashes':  [hash.toLowerCase()],
-      }, timeout: const Duration(seconds: 6));
-    } catch (_) {/* best effort — next sync covers it */}
-  }
-
-  // ---- Hash-set helpers ------------------------------------------------
-
-  List<String> _localHashSet(LibraryService lib) {
-    final seen = <String>{};
-    for (final e in lib.entries) {
-      if (!e.isLocal) continue;
-      final hash = e.canonicalHash.isNotEmpty
-          ? e.canonicalHash
-          : e.contentHash;
-      if (hash.isEmpty) continue;
-      seen.add(hash.toLowerCase());
-    }
-    final out = seen.toList()..sort();
-    return out;
-  }
-
-  String _hashSetDigest(List<String> sortedHexHashes) {
-    final out = BytesBuilder();
-    for (final h in sortedHexHashes) {
-      final raw = _hexToBytes(h);
-      if (raw == null) continue;
-      out.add(raw);
-    }
-    final bytes = out.toBytes();
-    if (bytes.isEmpty) return '';
-    return crypto.sha256.convert(bytes).toString();
-  }
-
-  Uint8List? _hexToBytes(String hex) {
-    if (hex.length % 2 != 0) return null;
-    final out = Uint8List(hex.length ~/ 2);
-    for (int i = 0; i < out.length; ++i) {
-      final v = int.tryParse(hex.substring(i * 2, i * 2 + 2), radix: 16);
-      if (v == null) return null;
-      out[i] = v;
-    }
-    return out;
+    unawaited(LibraryPublisher.publishFull());
   }
 
   bool _running = false;
@@ -379,22 +260,23 @@ class LibraryScanner {
         }
       }
       await drain();
-      // After every file has been (re-)submitted individually, push
-      // the consolidated digest to the full node so future boots can
-      // skip the per-track work entirely via swarm.hello_digest.
+      // After every file has been (re-)submitted individually, publish the
+      // updated library SNAPSHOT to DB2 so the full node (and, via flood, the
+      // rest of the mesh) converges on our current list. The node's reply may
+      // carry an `unknown[]` of hashes the chain doesn't yet know, which
+      // publishFull itself feeds back into resubmitUnknown → _processFile.
       //
-      // Must be awaited under the _running guard: syncSwarm can itself
-      // invoke _processFile(force: true) for any hashes the full node
-      // doesn't recognize, which mutates _scanned/_matched/_registered/
-      // _errors and calls lib.upsert. If we fire-and-forget here, the
-      // finally clears _running while syncSwarm is still in flight; the
-      // next scanOnce trigger (periodic background, user tap, VPS
-      // reconnect) will pass the `if (_running) return` gate, zero the
-      // counters mid-flight, and run _processFile concurrently with
-      // the still-running syncSwarm on overlapping files — double
-      // fingerprint.submit RPCs, lost counter updates, and racing
-      // lib.upsert writes on the same entry.
-      await syncSwarm();
+      // Awaited under the _running guard: publishFull → resubmitUnknown can
+      // invoke _processFile(force: true) for any hashes the chain doesn't
+      // recognize, which mutates _scanned/_matched/_registered/_errors and
+      // calls lib.upsert. If we fire-and-forget here, the finally clears
+      // _running while that resubmit is still in flight; the next scanOnce
+      // trigger (periodic background, user tap, VPS reconnect) would pass the
+      // `if (_running) return` gate, zero the counters mid-flight, and run
+      // _processFile concurrently with the still-running resubmit on
+      // overlapping files — double fingerprint.submit RPCs, lost counter
+      // updates, and racing lib.upsert writes on the same entry.
+      await LibraryPublisher.publishFull();
     } finally {
       _running = false;
       onProgress?.call();

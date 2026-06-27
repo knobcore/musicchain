@@ -275,6 +275,11 @@ void SwarmIndex::mark_peer_offline(const std::string& peer_id) {
     online_peers_.erase(peer_id);
 }
 
+bool SwarmIndex::is_online(const std::string& peer_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return online_peers_.count(peer_id) > 0;
+}
+
 void SwarmIndex::evict_peer(const std::string& peer_id) {
     if (peer_id.empty()) return;
     std::lock_guard<std::mutex> lk(mu_);

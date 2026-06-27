@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../providers/wallet_provider.dart';
+import 'library_scanner.dart';
 import 'library_service.dart';
 import 'node_service.dart';
 import 'rats_client.dart';
@@ -86,8 +87,24 @@ class LibraryPublisher {
       );
 
       final applied = (reply is Map) && (reply['applied'] == true);
+      // The node replies with `unknown[]`: the published content hashes that
+      // aren't registered on chain yet (fresh chain, or one wiped between
+      // sessions). Re-fire fingerprint.submit for each so the songs actually
+      // land in the mempool and get minted — library.delta alone only records
+      // off-chain library membership, not the chain. This is the resubmit the
+      // old swarm.hello reply path used to drive; it now rides on DB2.
+      final unknown = (reply is Map)
+          ? ((reply['unknown'] as List?)?.cast<String>() ?? const <String>[])
+          : const <String>[];
       // ignore: avoid_print
-      print('[db2] library.delta v$ts add=${hashes.length} applied=$applied');
+      print('[db2] library.delta v$ts add=${hashes.length} applied=$applied'
+            ' unknown=${unknown.length}');
+      if (unknown.isNotEmpty) {
+        // Released the in-flight guard in finally below; resubmit is awaited so
+        // its _processFile work completes before publishFull returns (matches
+        // the old scanOnce ordering under the scanner's _running guard).
+        await LibraryScanner.instance.resubmitUnknown(unknown);
+      }
     } catch (e) {
       // ignore: avoid_print
       print('[db2] publishFull failed: $e');

@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" { typedef void* rats_client_t; }
@@ -134,10 +135,30 @@ private:
     std::mutex                                  peer_to_wallet_mu_;
     std::unordered_map<std::string, Address>    peer_to_wallet_;
 
+    /// Wallet-presence binding (DB2 discovery): a player proves over
+    /// `presence.hello` that it controls a wallet AND declares its live
+    /// librats peer_id. We map wallet ⇄ peer_id so the DB2 LibraryStore
+    /// (wallet-keyed) can be filtered down to songs a currently-online
+    /// player is actually serving. Evicted when the player disconnects
+    /// (direct disconnect callback or mini-node-forwarded
+    /// swarm.peer_offline). wallet_hex is the lowercase 40-char hex of
+    /// the 20-byte address.
+    std::mutex                                       wallet_presence_mu_;
+    std::unordered_map<std::string, std::string>     wallet_to_peer_;        // wallet_hex(40) -> live player peer_id
+    std::unordered_map<std::string, std::string>     peer_to_wallet_player_; // peer_id -> wallet_hex(40)
+
     static void on_request_cb(void* user_data, const char* peer_id,
                               const char* message_data);
     void handle_request(const std::string& peer_id, const std::string& body);
     void send_reply(const std::string& peer_id, const std::string& reply_json);
+
+    /// DB2 discovery helpers (defined in rats_api.cpp). The first returns
+    /// the live player peer_ids serving a given canonical song (holders
+    /// of the hash that currently have a presence binding + are online);
+    /// the second returns the set of canonical-hash hex strings that any
+    /// currently-online wallet's library contains.
+    std::vector<std::string>      online_peers_for_song_(const Hash256& ch);
+    std::unordered_set<std::string> online_library_hashes_();
 
     /// DB2 gossip — receive a wallet-signed `library.delta` over the
     /// MC_LIBRARY_TYPE broadcast channel: verify the signature against the

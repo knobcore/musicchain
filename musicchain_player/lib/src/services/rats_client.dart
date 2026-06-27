@@ -939,18 +939,22 @@ class RatsClient {
     // — `_b.stop` halts librats's worker threads, which guarantees the
     // DHT layer won't fire another callback after this point.
     _b.stop(_handle);
+    _b.destroy(_handle);
+    // Close every NativeCallable ONLY after destroy(). stop() may merely
+    // SIGNAL the librats worker threads to wind down, but destroy() joins
+    // them — so this is the one point where no DHT / message / connection
+    // callback can still fire into a trampoline we're about to free. Closing
+    // them before destroy (as the old code did, trusting stop() alone) is the
+    // race behind "Callback invoked after it has been deleted".
     for (final cb in _dhtCallbacks.values) {
       try { cb.close(); } catch (_) {}
     }
-    // Retired (evicted) DHT callbacks: now safe to close — _b.stop has halted
-    // the worker threads, so no late peers-found batch can fire into them.
     for (final cb in _retiredDhtCallbacks) {
       try { cb.close(); } catch (_) {}
     }
     _retiredDhtCallbacks.clear();
     _dhtCallbacks.clear();
     _dhtResults.clear();
-    _b.destroy(_handle);
     _replyCallable.close();
     _requestCallable.close();
     _binaryCallable.close();

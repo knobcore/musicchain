@@ -34,7 +34,19 @@ void backgroundScannerDispatcher() {
       WidgetsFlutterBinding.ensureInitialized();
       await LibraryService.instance.ensureLoaded();
       await RatsClient.initialize();
-      await LibraryScanner.instance.scanOnce();
+      try {
+        await LibraryScanner.instance.scanOnce();
+      } finally {
+        // CRITICAL: this dispatcher runs in a short-lived workmanager isolate.
+        // RatsClient.initialize() started native librats worker threads (DHT,
+        // connections) that hold pointers to this isolate's NativeCallable
+        // trampolines. If we let the isolate be torn down without stopping the
+        // native client, those threads fire into freed trampolines and the VM
+        // aborts ("Callback invoked after it has been deleted") — the ~30-min
+        // crash. Dispose synchronously stops + destroys the native client
+        // (joining its threads) BEFORE the isolate ends, so nothing dangles.
+        try { RatsClient.instance.dispose(); } catch (_) {}
+      }
     } catch (_) {
       // Best-effort. Returning true tells workmanager not to retry; the
       // next periodic firing will pick up anything missed.

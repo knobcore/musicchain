@@ -76,7 +76,11 @@ class PieceDownloaderConfig {
     // pipe half-empty at 8 in-flight. The GLOBAL _cwnd still caps total
     // in-flight across all tracks, so this is per-track headroom, not 16x load.
     this.maxWorkers       = 16,
-    this.pieceTimeout     = const Duration(seconds: 15),
+    // 30s (was 15): on a slow uplink a 256 KB piece can legitimately take >15s
+    // to arrive; a 15s timeout pre-empts the in-flight reply and re-requests the
+    // piece, double-serving it (the over-fetch loop). 30s tolerates a slow-but-
+    // arriving reply so a piece is only re-requested when the source is truly stalled.
+    this.pieceTimeout     = const Duration(seconds: 30),
     this.perPeerRetryCap  = 8,
   });
 }
@@ -502,7 +506,13 @@ class PieceDownloader {
   // scales with mini-node count, so adding mini-nodes raises aggregate
   // throughput rather than just deepening one queue.
   static double _cwnd = 12.0;            // congestion window (pieces in flight)
-  static const double _cwndMin = 4.0;
+  // Floor of 1 (was 4): on a constrained uplink a floor of 4 (=1 MB in flight)
+  // keeps the link perpetually saturated, so piece replies never arrive within
+  // the timeout and get re-requested while still in flight — a double-serve loop
+  // that becomes ~95x over-fetch (344 MB to move a 3.5 MB mp3). Allowing the
+  // window to settle to a single in-flight piece lets the link actually drain so
+  // replies arrive and the loop converges; it grows straight back on a fast link.
+  static const double _cwndMin = 1.0;
   static int _relayInFlight = 0;
   static final List<Completer<void>> _relayWaiters = <Completer<void>>[];
   static double _cwndMax() =>

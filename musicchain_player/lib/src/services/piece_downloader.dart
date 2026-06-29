@@ -245,6 +245,22 @@ class PieceDownloader {
         throw NoPeerAvailableException(contentHash);
       }
 
+      // Swarm Transfer v2: when a manifest covers this download, take total_size
+      // from it and SKIP the sequential first-piece probe below — every piece
+      // (including 0) then fetches in PARALLEL from the start, so the song's
+      // workers fire immediately instead of after a serial probe round-trip (the
+      // "takes a little while to start each song"). Integrity is unchanged —
+      // per-piece manifest hashes on arrival + the whole-file hash at the end.
+      if (_totalSize == 0 &&
+          manifest != null &&
+          manifest!.pieceSize == config.pieceSize &&
+          manifest!.totalSize > 0) {
+        _totalSize = manifest!.totalSize;
+        _numPieces = _pieceCountFor(_totalSize);
+        await _openPartialAndBitmap();
+        await _writeMeta();
+      }
+
       // 3. Probe first piece if totalSize unknown. Walk every source so
       //    a single dead peer doesn't fail the whole download — the
       //    workers won't run until totalSize is set, so this round is

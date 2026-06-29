@@ -606,7 +606,7 @@ std::pair<int, std::string> HttpServer::post_session_heartbeat(
 }
 
 std::pair<int, std::string> HttpServer::post_session_complete(
-    const std::string& session_id, const std::string& /*body*/) {
+    const std::string& session_id, const std::string& body) {
     // BUG FIX: previously we set `it->second.completed = true` here
     // before applying the mint. When the mint failed (any gate
     // rejected, apply_mint returned false, db.write failed), the
@@ -838,15 +838,27 @@ std::pair<int, std::string> HttpServer::post_session_complete(
     proof.heartbeat_count      = (sess.heartbeat_count > 0xFFFFu)
         ? static_cast<uint16_t>(0xFFFF) : static_cast<uint16_t>(sess.heartbeat_count);
 
-    // Per-stream reward lanes (PlayProof v2). The seeder + mini-node addresses
-    // were reported by the player at session.start. Setting version=2 makes
-    // sign_message() + serialize() include them, so the node signature COVERS
-    // them (tamper-proof). compute_mint_outputs adds 1 token to each non-zero
-    // address and skips the seeder lane when it equals the listener (no
-    // self-seed double-dip). Legacy players that don't report them leave both
-    // zero, so the proof is still v2 but mints no extra lanes.
-    proof.seeder_address    = sess.seeder_address;
-    proof.mini_node_address = sess.mini_node_address;
+    // Per-stream reward lanes (PlayProof v2). The player reports the SEEDER +
+    // MINI-NODE here at COMPLETE (not start) because the serving peer isn't known
+    // until streaming has begun. 40-hex peer-ids == wallet addresses (lenient
+    // parse, no checksum); fall back to whatever session.start recorded. Setting
+    // version=2 makes sign_message()/serialize() include them so the node
+    // signature COVERS them (tamper-proof). compute_mint_outputs adds 1 token to
+    // each non-zero address and skips the seeder lane when it equals the listener
+    // (no self-seed double-dip).
+    Address seeder_addr = sess.seeder_address;
+    Address mini_addr   = sess.mini_node_address;
+    try {
+        auto jb = json::parse(body);
+        Address a{};
+        if (crypto::parse_address(jb.value("seeder_address", std::string()), a))
+            seeder_addr = a;
+        a = Address{};
+        if (crypto::parse_address(jb.value("mini_node_address", std::string()), a))
+            mini_addr = a;
+    } catch (...) { /* no body / not JSON -> use session.start values */ }
+    proof.seeder_address    = seeder_addr;
+    proof.mini_node_address = mini_addr;
     proof.version           = 2;
 
     // Node signs the proof

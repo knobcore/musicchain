@@ -2722,6 +2722,11 @@ class AudioStream {
   Stream<Uint8List> get bytes => _receiver.stream;
   Future<void>      get done  => _receiver.future.then((_) => null);
 
+  /// Seeder + relay (mini-node) peer-ids serving this stream (== wallet
+  /// addresses, single-identity), used to credit the per-stream reward lanes.
+  String get servingPeerId => _receiver.servingPeerId;
+  String get relayPeerId   => _receiver.relayPeerId;
+
   void _stopWatch() { _stallTimer?.cancel(); _stallTimer = null; }
 
   void cancel() {

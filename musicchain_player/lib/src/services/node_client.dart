@@ -659,8 +659,17 @@ class NodeClient {
     });
   }
 
-  Future<MintResult> completeSession(String sessionId) async {
-    final r = await _rpc('session.complete', {'session_id': sessionId});
+  Future<MintResult> completeSession(String sessionId,
+      {String seederAddress = '', String miniNodeAddress = ''}) async {
+    final r = await _rpc('session.complete', {
+      'session_id': sessionId,
+      // Per-stream reward lanes: the seeder (peer that served the bytes) and the
+      // mini-node (relay) for this play, as 40-hex peer-ids == wallet addresses.
+      // Reported HERE (not at start) because the serving peer isn't known until
+      // streaming begins. Empty for a cached play -> node skips those lanes.
+      if (seederAddress.isNotEmpty)   'seeder_address':    seederAddress,
+      if (miniNodeAddress.isNotEmpty) 'mini_node_address': miniNodeAddress,
+    });
     return MintResult.fromJson(Map<String, dynamic>.from(r as Map));
   }
 

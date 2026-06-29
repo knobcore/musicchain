@@ -36,6 +36,12 @@ class AudioStreamProxy {
   /// next track's stream.open goes out — see [cancelCurrent].
   AudioStream? _current;
 
+  /// Seeder + relay (mini-node) peer-ids of the currently-serving stream, for
+  /// the per-stream reward lanes (PlayProof v2). Empty for a cached/local play
+  /// (no peer served the bytes), so the node skips those lanes.
+  String get currentSeeder => _current?.servingPeerId ?? '';
+  String get currentRelay  => _current?.relayPeerId  ?? '';
+
   /// Idempotent. Binds a random loopback port on first call.
   Future<void> ensureStarted() async {
     if (_server != null) return;

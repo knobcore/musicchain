@@ -5,6 +5,7 @@ import 'package:media_kit/media_kit.dart';
 
 import '../models/song.dart';
 import '../models/session.dart';
+import '../services/audio_stream_proxy.dart';
 import '../services/node_client.dart';
 import '../services/node_service.dart';
 import '../services/heartbeat_service.dart';
@@ -16,6 +17,12 @@ class PlayerProvider extends ChangeNotifier {
   final NodeClient       _client    = NodeClient();
   late final HeartbeatService _heartbeat;
   final Player           _player    = Player();
+
+  // Per-stream reward lanes (PlayProof v2): seeder + relay peer-ids of the stream
+  // serving the current song, captured once streaming resolves and reported to
+  // the node at session.complete. Empty for a cached/local play (no peer served).
+  String _seederAddr = '';
+  String _relayAddr  = '';
 
   PlayerProvider() {
     // Share the same NodeClient so heartbeats use the same resolved URL
@@ -150,7 +157,9 @@ class PlayerProvider extends ChangeNotifier {
   Future<MintResult?> complete() async {
     if (currentSession == null) return null;
     try {
-      final result = await (await _getClient()).completeSession(currentSession!.sessionId);
+      final result = await (await _getClient()).completeSession(
+          currentSession!.sessionId,
+          seederAddress: _seederAddr, miniNodeAddress: _relayAddr);
       _heartbeat.stop();
       currentSession = null;
       state          = PlayerState.idle;
@@ -170,7 +179,8 @@ class PlayerProvider extends ChangeNotifier {
   /// short skips can't inflate play counts.
   Future<void> _completeSessionSilently(String sessionId) async {
     try {
-      await (await _getClient()).completeSession(sessionId);
+      await (await _getClient()).completeSession(sessionId,
+          seederAddress: _seederAddr, miniNodeAddress: _relayAddr);
       // Nudge the wallet to re-fetch — completeSession is the moment
       // the chain mints the discoverer + node + artist-escrow credits,
       // so the cached balance the wallet tab shows is stale RIGHT
@@ -221,6 +231,10 @@ class PlayerProvider extends ChangeNotifier {
       // then media_kit plays from disk. HTTP fallback returns the streaming
       // URL directly — only useful for nodes that aren't behind NAT.
       final mediaUri = await _client.fetchAudioToCache(song.contentHash);
+      // Capture who served THIS song (seeder + relay) now that the stream is
+      // resolved, to credit the per-stream reward lanes at session.complete.
+      _seederAddr = AudioStreamProxy.instance.currentSeeder;
+      _relayAddr  = AudioStreamProxy.instance.currentRelay;
       // `open` defaults to `play: true`, but pairing that with the
       // explicit `play()` below races libmpv on Android: the second play
       // call can land while the first is mid-startup, and mpv ends up

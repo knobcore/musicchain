@@ -2845,25 +2845,15 @@ void RatsApi::try_corroborate(const std::string& did_hex) {
         std::string(row_opt->begin(), row_opt->end()), nullptr, false);
     if (!row.is_object()) return;
     if ((row.value("flags", 0) & 7) != 7) return;   // brokered+reported+receipted
-    const uint64_t relayed  = row.value("relayed",  (uint64_t)0);
-    const uint64_t received = row.value("received", (uint64_t)0);
-    // 1 MC (1e8 internal units) per 10 MB ⇒ 10 internal units per byte.
-    constexpr uint64_t kUnitsPerByte = 10;
-    // Clamp BEFORE the multiply so a colluding mini+player can't report
-    // absurd byte counts that overflow u64 and wrap to a small/garbage
-    // credit (or worse). The per-tx caps downstream only see the product,
-    // so the guard has to live here. UINT64_MAX/10 bytes ≈ 1.8e18 — far
-    // above any real delivery, so honest traffic is never touched.
-    const uint64_t credited =
-        std::min<uint64_t>(std::min(relayed, received), UINT64_MAX / kUnitsPerByte);
-    auto a = crypto::from_hex(row.value("mw", std::string()));
-    if (a.size() == 20 && relay_tracker_ && credited > 0) {
-        Address mini{}; std::copy(a.begin(), a.end(), mini.begin());
-        relay_tracker_->increment(mini, credited * kUnitsPerByte);
-        std::cout << "[relay] corroborated delivery " << did_hex.substr(0, 12)
-                  << "… credited " << credited << "B → "
-                  << credited * kUnitsPerByte << " units\n";
-    }
+    // Per-byte relay reward RETIRED. The mini-node now earns a flat 1 token PER
+    // STREAM via the PlayProof v2 mini-node lane (FULL_MININODE_REWARD in
+    // compute_mint_outputs), not per relayed byte — so we no longer accumulate a
+    // RelayRewardTx here (relay_tracker_->increment removed). We still
+    // corroborate the 3 legs and retire the pd: row (single-use ⇒ replay-proof).
+    // The RelayRewardTx struct + Chain::apply_relay_reward are kept ONLY so
+    // historical blocks carrying old per-byte rewards still replay.
+    std::cout << "[relay] corroborated delivery " << did_hex.substr(0, 12)
+              << "… (per-byte reward retired; mini earns per-stream)\n";
     db_.del("pd:" + did_hex);   // single-use ⇒ replay-proof
 }
 

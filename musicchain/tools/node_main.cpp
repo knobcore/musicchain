@@ -426,14 +426,16 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
     std::cout << "[load] monitor started: max_bw="
               << g_load_cfg.max_bandwidth_bps << " bps, busy@"
               << g_load_cfg.busy_score_threshold << "\n";
+    // wallet-as-id: the rats/relay/discovery layer uses ONE identity — the
+    // wallet address — for BOTH the route node_id and the librats peer-id.
+    // cfg.node_id (SHA256) stays internal for consensus / play-proof minting
+    // (mint.cpp looks the validator up by it); it is never exposed to rats.
+    const std::string wallet_id_hex =
+        mc::crypto::to_hex(keypair.address.data(), keypair.address.size());
     mc::net::RatsLink rats(cfg.rats_port,
-                            mc::crypto::to_hex(cfg.node_id),
+                            wallet_id_hex,   // route node_id == wallet address
                             cfg.api_port,
-                            // wallet-as-id: pin the librats peer id to the node's
-                            // 20-byte wallet address (lowercase 40-hex) so it can
-                            // never drift on rebuild/key reload.
-                            mc::crypto::to_hex(keypair.address.data(),
-                                               keypair.address.size()));
+                            wallet_id_hex);  // librats peer-id == wallet address
     rats.set_load_monitor(&load_mon);
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
     // DeepAuditor (#4) at cmd_start scope, declared AFTER rats_api so it

@@ -385,37 +385,39 @@ class PieceDownloader {
         continue;
       }
 
-      // One ~4 Mbit/s flow per seeder: mark this source busy (process-globally,
-      // shared with streaming) so _nextSource routes the next range to a DIFFERENT
-      // seeder; released when the range settles (success or error).
+      // Hold ONE ~4 Mbit/s flow on this seeder only while the FETCH is in flight
+      // — release it the instant the bytes arrive, BEFORE the disk write, so
+      // another worker can start the next range on this seeder while we write.
+      // Holding the flow across the multi-fsync range write left the seeder idle
+      // between ranges (the "download stops and resumes"); releasing early
+      // pipelines fetch(N+1) over write(N) for continuous transfer.
       final sk = _keyFor(source);
       SeederFlows.instance.acquire(sk);
-
+      late final List<_PieceReply> pieces;
       try {
         // Race the range fetch against the terminal-error signal so a stalled
         // seeder doesn't pin this worker for the full timeout after another
-        // worker aborted the run. Writes happen AFTER the race in the awaited
-        // path, so an aborted fetch never writes into a closing file handle.
+        // worker aborted the run.
         final fetch  = _fetchRange(source, range);
         final signal = (_terminalSignal ??= Completer<void>()).future
             .then<List<_PieceReply>?>((_) => null);
-        final pieces = await Future.any([fetch, signal]);
-        if (pieces == null) {
+        final raced = await Future.any([fetch, signal]);
+        if (raced == null) {
           // Terminal error fired first. Swallow the dangling fetch's eventual
           // result/throw, drop the claim, and exit.
           unawaited(fetch.catchError((_) => <_PieceReply>[]));
           _releaseRange(range);
           return;
         }
-        for (final p in pieces) {
-          await _writePiece(p);
-        }
+        pieces = raced;
       } on _PeerStallException catch (_) {
         _releaseRange(range);
         _markPeerError(source);
+        continue;
       } on _PeerProtocolException catch (_) {
         _releaseRange(range);
         _bannedPeers.add(_keyFor(source));
+        continue;
       } on RatsRpcException catch (e) {
         _releaseRange(range);
         if (e.status == 'unknown_type') {
@@ -423,12 +425,24 @@ class PieceDownloader {
         } else {
           _markPeerError(source);
         }
+        continue;
       } catch (e) {
         _releaseRange(range);
         _failTerminal(e);
         return;
       } finally {
+        // Released as soon as the FETCH settles — NOT after the write — so the
+        // next range to this seeder overlaps our write (no idle gap).
         SeederFlows.instance.release(sk);
+      }
+      // Seeder already released; write off the critical path.
+      try {
+        for (final p in pieces) {
+          await _writePiece(p);
+        }
+      } catch (e) {
+        _failTerminal(e);
+        return;
       }
     }
   }

@@ -12,6 +12,7 @@ import 'audio_stream_proxy.dart';
 import 'device_fingerprint_service.dart';
 import 'library_service.dart';
 import 'piece_downloader.dart';
+import 'piece_manifest.dart';
 import 'rats_client.dart';
 import 'swarm_registry.dart';
 
@@ -521,6 +522,7 @@ class NodeClient {
     // get matching bytes back. Falling through here means the legacy
     // path will try again with its own probe.
     List<PeerSource> seeded = [];
+    PieceManifest? manifest;
     try {
       final reply = await rats.request(
         ratsPeerId!, 'stream.open',
@@ -529,6 +531,10 @@ class NodeClient {
       );
       if (reply is Map) {
         final m = reply.cast<String, dynamic>();
+        // Swarm Transfer v2: the full node serves the per-piece manifest next to
+        // the swarm peer list so the downloader can verify each chunk on arrival.
+        // Absent on older nodes → null → whole-file verification only.
+        manifest = PieceManifest.fromJson(m['manifest']);
         // Only `peers` array matters here — `source: local` would mean
         // the full node has bytes, which the post-pivot arch never does.
         final peers = m['peers'];
@@ -570,6 +576,7 @@ class NodeClient {
         cacheDir:       await _piecePartialDir(),
         finalCachePath: finalCachePath,
         extraSources:   seeded,
+        manifest:       manifest,
         onProgress:     onProgress,
       );
       return await downloader.run();

@@ -21,6 +21,7 @@ import 'presence_publisher.dart';
 import 'playlist_service.dart';
 import 'library_service.dart';
 import 'node_service.dart';
+import 'piece_manifest.dart';
 import 'rats_client.dart';
 
 /// Best-effort prompt for the storage permissions LibraryScanner needs.
@@ -348,6 +349,12 @@ class LibraryScanner {
       final contentHash =
           crypto.sha256.convert(bytes).toString();
 
+      // Swarm Transfer v2: per-piece SHA-256 manifest for trustless multi-source
+      // verification. Generated here (we already hold the full bytes) and
+      // submitted with the fingerprint so the full node persists it and serves
+      // it to downloaders via stream.open. Ignored by older nodes (harmless).
+      final pieceManifest = PieceManifest.generate(bytes);
+
       // Re-check by hash after the read — covers the case where the
       // file got copied/moved to a new path under the same library.
       final existing = lib.entryByHash(contentHash);
@@ -419,6 +426,7 @@ class LibraryScanner {
         'track_number':     trackNumber,
         'bitrate':          bitrate,
         'audio_format':     fmt,
+        'manifest':         pieceManifest.toJson(),
         if (_artistAddress.isNotEmpty) 'artist_address': _artistAddress,
       }, timeout: const Duration(seconds: 20));
 

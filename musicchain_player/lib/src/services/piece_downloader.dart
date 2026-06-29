@@ -38,6 +38,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
 
+import 'piece_manifest.dart';
 import 'rats_client.dart';
 import 'swarm_registry.dart';
 
@@ -120,6 +121,7 @@ class PieceDownloader {
     this.config = const PieceDownloaderConfig(),
     this.onProgress,
     this.extraSources = const [],
+    this.manifest,
   });
 
   /// 64-hex SHA-256 of the file (== chain's content_hash). Also the
@@ -145,6 +147,13 @@ class PieceDownloader {
   /// goes out. SwarmRegistry's DHT lookup runs in parallel and tops up
   /// the pool as more peers reply.
   final List<PeerSource> extraSources;
+
+  /// Optional per-piece SHA-256 manifest (Swarm Transfer v2). When present and
+  /// well-formed for this download, every fetched piece is verified against its
+  /// manifest hash on arrival — so a bad chunk from one source is caught and
+  /// refetched immediately instead of riding to the whole-file check at the end
+  /// (which can't say WHICH source lied). Null → whole-file verify only.
+  final PieceManifest? manifest;
 
   // ---- Internal state -------------------------------------------------
 
@@ -490,6 +499,17 @@ class PieceDownloader {
     }
   }
 
+  /// Whether a usable manifest covers this download. Computed lazily because
+  /// totalSize isn't known until after the first-piece probe. When false (no
+  /// manifest, or a manifest for a different piece size/total), per-piece
+  /// verification is skipped and the whole-file hash is the only integrity gate.
+  bool get _manifestActive {
+    final mf = manifest;
+    return mf != null &&
+        _totalSize > 0 &&
+        mf.isWellFormedFor(config.pieceSize, _totalSize);
+  }
+
   // ---- Per-piece RPC --------------------------------------------------
 
   // ---- Adaptive relay congestion window (audit #1 + #4) --------------------
@@ -618,6 +638,16 @@ class PieceDownloader {
     if (bytes.length != length) {
       throw _PeerProtocolException(
           'length mismatch: asked $length got ${bytes.length}');
+    }
+    // Swarm Transfer v2: per-piece integrity. When a well-formed manifest covers
+    // this download, reject any piece whose bytes don't match the manifest hash
+    // — treated as a protocol violation so the lying/corrupt source is banned
+    // and the piece is released for retry against a different source.
+    if (_manifestActive) {
+      final idx = offset ~/ config.pieceSize;
+      if (!manifest!.verifyPiece(idx, bytes)) {
+        throw _PeerProtocolException('piece $idx failed manifest hash');
+      }
     }
     final total = (m['total_size'] as num?)?.toInt() ?? 0;
     return _PieceReply(

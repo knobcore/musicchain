@@ -17,10 +17,11 @@ relay**, so the `RelayRewardTx`-per-byte economics stay intact.
    per forwarded byte. No direct P2P in this version.
 2. **Manifest is off-chain, signed by the seeder.** No block-format change. The
    on-chain whole-file `content_hash` remains the ultimate root of trust.
-3. **Burst limit = 4 Mbit/s per seeder→downloader flow.** Each seeder paces its
-   *own* upload to 4 Mbit/s (≈500 KB/s) — gentle on phone uplinks. A downloader
-   **aggregates N flows** via multi-source, so its speed = N × 4 Mbit/s, bounded
-   only by its downlink.
+3. **Burst cap = 4 Mbit/s per seeder→downloader flow** = 500 KB/s (named
+   constant `kSeederFlowCapBytesPerSec = 500000`). Each seeder pushes at the FULL
+   cap — not a polite fraction — and a downloader **aggregates N flows** via
+   multi-source, so its speed = N × 4 Mbit/s, bounded only by its downlink. No
+   per-stream "be nice" backoff.
 4. **No per-destination / global relay cap.** Monopolizing a mini-node is fine;
    scale by adding mini-nodes, not by throttling tenants. (Remove the existing
    server-side politeness pacing and the global congestion-window ceiling.)

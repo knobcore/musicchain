@@ -359,6 +359,24 @@ void CandidateManager::heartbeat_loop(Chain& chain, Database& db,
                     } else { ok = true; }
                     break;
                 }
+                case TxType::RELAY_REWARD: {
+                    // Founder-signed relay reward. The apply path (chain.cpp)
+                    // already handles RELAY_REWARD, but the candidate/mempool
+                    // gate had no case for it — so every reward was dropped here
+                    // as "unknown TxType" and mini-nodes never actually got
+                    // paid (their balance stayed 0). Validate like the others.
+                    RelayRewardTx tx;
+                    if (!RelayRewardTx::deserialize(raw.data(), raw.size(), tx)) {
+                        why = "RELAY_REWARD: deserialize failed";
+                    } else if (!tx.verify_signature()) {
+                        why = "RELAY_REWARD: verify_signature failed";
+                    } else {
+                        slot.sender = tx.issuer_address;
+                        slot.nonce  = tx.nonce;
+                        ok = true;
+                    }
+                    break;
+                }
                 default:
                     why = "unknown TxType";
                     ok = false;

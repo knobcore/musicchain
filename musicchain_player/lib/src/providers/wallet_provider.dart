@@ -169,12 +169,18 @@ class WalletProvider extends ChangeNotifier {
         }
       }
 
-      final msg = Uint8List(60);
+      // C++ TransferTx::sign_message() appends the 33-byte compressed from_pubkey
+      // AFTER the nonce (verify_signature cross-checks the inline pubkey against
+      // from_address), so we MUST sign over the same 93 bytes — signing only the
+      // first 60 would never verify and the transfer would be unmineable.
+      final pubBytes = hexToBytes(_info!.publicKey);   // 33-byte compressed
+      final msg = Uint8List(60 + pubBytes.length);
       writeU32LE(msg, 0, mcChainId);
       msg.setRange(4,  24, hexToBytes(_info!.address));
       msg.setRange(24, 44, hexToBytes(toAddress));
       writeU64LE(msg, 44, amount);
       writeU64LE(msg, 52, nonce);
+      msg.setRange(60, 60 + pubBytes.length, pubBytes);
 
       // Sign via FFI (mc_wallet_sign hashes internally then ECDSA signs)
       final sig = _service.sign(msg);
@@ -184,6 +190,7 @@ class WalletProvider extends ChangeNotifier {
         toAddress:   toAddress,
         amountStr:   amountStr,
         signature:   sig,
+        fromPubkey:  _info!.publicKey,
         nonce:       nonce,
       );
       await refreshBalance();

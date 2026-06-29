@@ -182,6 +182,7 @@ class NodeClient {
     required String toAddress,
     required String amountStr,
     required String signature,
+    required String fromPubkey,
     required int nonce,
   }) async {
     final r = await _rpc('wallet.transfer', {
@@ -190,6 +191,9 @@ class NodeClient {
       'amount':       amountStr,
       'nonce':        nonce,
       'signature':    signature,
+      // Required: the node's verify_signature carries the pubkey inline (no
+      // ECDSA recovery) and cross-checks address_from_pubkey == from_address.
+      'from_pubkey':  fromPubkey,
     });
     final tx = r is Map ? r['tx_hash'] as String? : null;
     if (tx == null) throw RatsRpcException('bad_reply', 'wallet.transfer missing tx_hash');

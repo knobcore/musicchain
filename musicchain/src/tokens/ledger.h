@@ -21,6 +21,12 @@ static constexpr uint64_t FULL_REWARD_THRESHOLD  = 10000ULL;
 static constexpr uint64_t FULL_ARTIST_REWARD     = 100000000ULL; // 1.00000000
 static constexpr uint64_t FULL_NODE_REWARD       = 100000000ULL;
 static constexpr uint64_t FULL_DISCOVERER_REWARD = 100000000ULL;
+// Per-stream lanes (PlayProof v2): the player that SERVED the bytes (seeder) and
+// the mini-node that RELAYED the stream each earn 1 token per qualifying play.
+// The mini-node lane replaces the old per-byte RelayRewardTx with a flat
+// per-stream credit.
+static constexpr uint64_t FULL_SEEDER_REWARD     = 100000000ULL; // 1.00000000
+static constexpr uint64_t FULL_MININODE_REWARD   = 100000000ULL; // 1.00000000
 
 // Inflation control:
 //   * SUPPLY_FLOOR — total minted at or below this triggers ZERO listener

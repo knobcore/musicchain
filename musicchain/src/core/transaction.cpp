@@ -82,6 +82,13 @@ std::vector<uint8_t> PlayProof::sign_message() const {
     write_u64le(msg, play_end_timestamp);
     write_u32le(msg, total_duration_ms);
     write_u16le(msg, heartbeat_count);
+    // v2: the seeder + mini-node lanes are covered by the node signature too, so
+    // they can't be tampered with after signing. Legacy (v1) proofs sign over the
+    // message WITHOUT these, which is why old signatures still verify.
+    if (version >= 2) {
+        write_bytes(msg, seeder_address.data(), 20);
+        write_bytes(msg, mini_node_address.data(), 20);
+    }
     return msg;
 }
 
@@ -98,6 +105,12 @@ std::vector<uint8_t> PlayProof::serialize() const {
     write_u32le(buf, total_duration_ms);
     write_u16le(buf, heartbeat_count);
     write_bytes(buf, node_signature.data(), 64);
+    // v2 trailing lanes (optional, like MintTx::burn_amount) — present only when
+    // version>=2, so a legacy proof serializes to the exact same 254 bytes.
+    if (version >= 2) {
+        write_bytes(buf, seeder_address.data(), 20);
+        write_bytes(buf, mini_node_address.data(), 20);
+    }
     return buf;
 }
 
@@ -115,6 +128,16 @@ bool PlayProof::deserialize(const uint8_t* data, size_t len, PlayProof& out) {
     if (!read_u32le(p, end, out.total_duration_ms)) return false;
     if (!read_u16le(p, end, out.heartbeat_count)) return false;
     if (!read_bytes(p, end, out.node_signature.data(), 64)) return false;
+    // Optional trailing seeder + mini-node addresses (backward-compat, mirrors
+    // MintTx::burn_amount). Present => version 2; absent => legacy version 1. The
+    // inferred version drives sign_message() so the right signature is verified.
+    if (p + 40 <= end) {
+        if (!read_bytes(p, end, out.seeder_address.data(), 20)) return false;
+        if (!read_bytes(p, end, out.mini_node_address.data(), 20)) return false;
+        out.version = 2;
+    } else {
+        out.version = 1;
+    }
     return true;
 }
 

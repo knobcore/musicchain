@@ -501,6 +501,17 @@ std::pair<int, std::string> HttpServer::post_session_start(const std::string& bo
         crypto::parse_hash256(session_id_hex, session.session_id);
         session.content_hash     = ch;
         session.player_address   = pl;
+        // Per-stream reward lanes (optional; PlayProof v2). The player reports the
+        // SEEDER (peer that served the bytes) and the MINI-NODE (relay) as 40-hex
+        // peer-ids, which ARE wallet addresses (single-identity). Lenient parse
+        // (no checksum); absent/invalid -> zero -> that lane is skipped in the mint.
+        {
+            Address sa{}, ma{};
+            if (crypto::parse_address(j.value("seeder_address", std::string()), sa))
+                session.seeder_address = sa;
+            if (crypto::parse_address(j.value("mini_node_address", std::string()), ma))
+                session.mini_node_address = ma;
+        }
         session.start_timestamp  = now_ms_api();
         session.last_heartbeat   = session.start_timestamp;
         session.heartbeat_count  = 0;
@@ -826,6 +837,17 @@ std::pair<int, std::string> HttpServer::post_session_complete(
         ? 0xFFFFFFFFu : static_cast<uint32_t>(duration_ms);
     proof.heartbeat_count      = (sess.heartbeat_count > 0xFFFFu)
         ? static_cast<uint16_t>(0xFFFF) : static_cast<uint16_t>(sess.heartbeat_count);
+
+    // Per-stream reward lanes (PlayProof v2). The seeder + mini-node addresses
+    // were reported by the player at session.start. Setting version=2 makes
+    // sign_message() + serialize() include them, so the node signature COVERS
+    // them (tamper-proof). compute_mint_outputs adds 1 token to each non-zero
+    // address and skips the seeder lane when it equals the listener (no
+    // self-seed double-dip). Legacy players that don't report them leave both
+    // zero, so the proof is still v2 but mints no extra lanes.
+    proof.seeder_address    = sess.seeder_address;
+    proof.mini_node_address = sess.mini_node_address;
+    proof.version           = 2;
 
     // Node signs the proof
     auto sign_msg = proof.sign_message();

@@ -96,6 +96,17 @@ struct PlayProof {
     uint16_t heartbeat_count;
     Sig64    node_signature;
 
+    // Per-stream reward lanes (proof version 2). The player that UPLOADED the
+    // bytes (seeder) and the mini-node that RELAYED the stream each earn 1 token
+    // per qualifying play. Legacy (v1) proofs omit these — they deserialize to
+    // zero, sign over the v1 message, and produce no extra reward lanes — so old
+    // blocks stay valid (no chain reset). `version` is INFERRED from serialized
+    // length on deserialize (v2 carries 40 trailing bytes) and set to 2 when a
+    // node builds a new proof; it is NOT itself serialized.
+    Address  seeder_address{};       // peer that served the bytes (v2)
+    Address  mini_node_address{};    // relay that carried the stream (v2)
+    uint8_t  version = 1;            // 1=legacy, 2=seeder+mini lanes
+
     std::vector<uint8_t> serialize() const;
     static bool deserialize(const uint8_t* data, size_t len, PlayProof& out);
 

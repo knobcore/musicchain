@@ -25,6 +25,11 @@ struct PlaySession {
     Hash256  content_hash;
     Hash256  block_hash;
     Address  player_address;
+    // Per-stream reward lanes (PlayProof v2): the peer that SERVED the bytes and
+    // the relay (mini-node) that carried the stream, reported by the player at
+    // session.start. Zero when the player didn't report them (legacy / direct).
+    Address  seeder_address{};
+    Address  mini_node_address{};
     uint64_t start_timestamp;
     uint64_t last_heartbeat;
     uint32_t heartbeat_count;
@@ -68,6 +73,12 @@ public:
     std::pair<int, std::string> verb_wallet_escrow_balance(const std::string& addr)
         { return get_escrow_balance(addr); }
     std::pair<int, std::string> verb_wallet_nonce(const std::string& addr)   { return get_wallet_nonce(addr); }
+    // Submit a SENDER-SIGNED TransferTx. Reuses post_transfer verbatim so the
+    // rats path has IDENTICAL security to the HTTP route: verify_signature
+    // (ECDSA + pubkey→from_address) + nonce replay check + balance, then mempool.
+    // The node never moves funds without the sender's signature.
+    std::pair<int, std::string> verb_wallet_transfer(const std::string& body)
+        { return post_transfer(body); }
     std::pair<int, std::string> verb_session_start(const std::string& body)
         { return post_session_start(body); }
     std::pair<int, std::string> verb_session_heartbeat(const std::string& sid,

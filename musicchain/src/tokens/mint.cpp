@@ -109,6 +109,20 @@ std::vector<MintOutput> compute_mint_outputs(const PlayProof& proof,
             outputs.push_back({serving_node_address, node_share});
     }
 
+    // Per-stream lanes (PlayProof v2) — apply to BOTH tiers. Legacy (v1) proofs
+    // carry zero addresses here, so these are skipped and old plays mint exactly
+    // as before.
+    //   * Seeder: the player that uploaded the bytes. Skipped when it equals the
+    //     listener (proof.player_address) so a player can't self-seed and
+    //     double-dip with the discoverer lane.
+    //   * Mini-node: the relay that carried the stream — a flat per-stream credit
+    //     that replaces the old per-byte RelayRewardTx.
+    if (proof.seeder_address != zero_addr &&
+        proof.seeder_address != proof.player_address)
+        outputs.push_back({proof.seeder_address, FULL_SEEDER_REWARD});
+    if (proof.mini_node_address != zero_addr)
+        outputs.push_back({proof.mini_node_address, FULL_MININODE_REWARD});
+
     return outputs;
 }
 

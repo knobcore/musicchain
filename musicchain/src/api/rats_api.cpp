@@ -727,6 +727,11 @@ void RatsApi::handle_request(const std::string& peer_id,
         } else if (type == "wallet.escrow_balance") {
             reply = wrap_handler_result(req_id,
                 http_.verb_wallet_escrow_balance(in.value("address", "")));
+        } else if (type == "wallet.transfer") {
+            // Sender-signed TransferTx submission. Delegates to the same secure
+            // path as the HTTP route (verify_signature + nonce + balance ->
+            // mempool); the node never moves funds without the sender's sig.
+            reply = wrap_handler_result(req_id, http_.verb_wallet_transfer(in.dump()));
         }
         // ---- account registration ---------------------------------------
         //

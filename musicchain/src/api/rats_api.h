@@ -10,6 +10,8 @@
 #include <nlohmann/json_fwd.hpp>   // nlohmann::json fwd-decl for #10 handlers
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -139,26 +141,54 @@ private:
     /// `presence.hello` that it controls a wallet AND declares its live
     /// librats peer_id. We map wallet ⇄ peer_id so the DB2 LibraryStore
     /// (wallet-keyed) can be filtered down to songs a currently-online
-    /// player is actually serving. Evicted when the player disconnects
-    /// (direct disconnect callback or mini-node-forwarded
-    /// swarm.peer_offline). wallet_hex is the lowercase 40-char hex of
-    /// the 20-byte address.
-    std::mutex                                       wallet_presence_mu_;
-    std::unordered_map<std::string, std::string>     wallet_to_peer_;        // wallet_hex(40) -> live player peer_id
-    std::unordered_map<std::string, std::string>     peer_to_wallet_player_; // peer_id -> wallet_hex(40)
+    /// player is actually serving. wallet_hex is the lowercase 40-char hex
+    /// of the 20-byte address.
+    ///
+    /// Signed-hello-only model: discovery trusts ONLY `last_verified_ms` — the
+    /// server-clock time of the wallet's last VALID signed presence.hello. A
+    /// wallet is discoverable while that is within kPresenceTtlMs. We do NOT
+    /// gate on swarm is_online, because for a relayed player that signal is
+    /// both flaky (a mini-node-forwarded swarm.peer_offline fires when a
+    /// download saturates the relay -> the "download kills the library" bug)
+    /// AND forgeable (peer_id is public, returned in stream.open replies, and
+    /// swarm.peer_online is unauthenticated, so is_online can be spoofed). The
+    /// player re-signs every ~30 s, so a live binding stays well inside the
+    /// window; a departed one falls out of discovery after kPresenceTtlMs and
+    /// an attacker cannot forge a signed hello to keep it alive. Replay of a
+    /// captured hello is blocked by a timestamp skew check + per-wallet ts
+    /// monotonicity (last_ts). A *direct* transport disconnect is authoritative
+    /// and still erases the binding immediately.
+    struct PresenceBinding {
+        std::string peer_id;              // live player librats peer_id
+        uint64_t    last_verified_ms = 0; // server-clock ms of last VALID signed hello
+        uint64_t    last_ts          = 0; // payload ts of last accepted hello (replay guard)
+    };
+    static constexpr uint64_t kPresenceTtlMs       = 180'000; // discoverable window after a signed hello (~6 beats) — survives a download saturating the relay
+    // ts is UTC epoch ms (timezone-independent): an NTP-synced device is within
+    // ms of our clock anywhere on Earth. This 2-min window only forgives a
+    // device whose wall clock is actually mis-set, and bounds hello replay.
+    static constexpr uint64_t kPresenceHelloSkewMs = 120'000;
+    // Keep a dead binding >= 2x the skew so per-wallet ts monotonicity blocks a
+    // replayed hello right up until the skew check rejects it, even if a
+    // player's clock ran up to one skew-window AHEAD of ours when it bound.
+    static constexpr uint64_t kPresenceReapMs      = 300'000;
+    std::mutex                                          wallet_presence_mu_;
+    std::unordered_map<std::string, PresenceBinding>    wallet_to_peer_;        // wallet_hex(40) -> binding
+    std::unordered_map<std::string, std::string>        peer_to_wallet_player_; // peer_id -> wallet_hex(40)
 
     static void on_request_cb(void* user_data, const char* peer_id,
                               const char* message_data);
     void handle_request(const std::string& peer_id, const std::string& body);
     void send_reply(const std::string& peer_id, const std::string& reply_json);
 
-    /// DB2 discovery helpers (defined in rats_api.cpp). The first returns
-    /// the live player peer_ids serving a given canonical song (holders
-    /// of the hash that currently have a presence binding + are online);
-    /// the second returns the set of canonical-hash hex strings that any
-    /// currently-online wallet's library contains.
+    /// DB2 discovery helper (defined in rats_api.cpp): returns the live
+    /// player peer_ids serving a given canonical song (holders of the hash
+    /// that currently have a presence binding + are online).
     std::vector<std::string>      online_peers_for_song_(const Hash256& ch);
-    std::unordered_set<std::string> online_library_hashes_();
+    /// Set of currently-live wallet hexes (presence-bound + within
+    /// kPresenceTtlMs), snapshotted under wallet_presence_mu_. Feeds the
+    /// single-pass songs.list snapshot (LibraryStore::online_snapshot).
+    std::unordered_set<std::string> live_wallets_();
 
     /// DB2 gossip — receive a wallet-signed `library.delta` over the
     /// MC_LIBRARY_TYPE broadcast channel: verify the signature against the
@@ -211,7 +241,26 @@ private:
     std::string mint_delivery(const Hash256& content_hash);
     bool handle_relay_report(const nlohmann::json& body);
     bool handle_relay_receipt(const nlohmann::json& body);
+    /// Caller MUST hold pd_mu_ (its only callers — handle_relay_report /
+    /// handle_relay_receipt — already do) so the read-modify-(credit)-delete of
+    /// a pd: row is atomic against the other leg's concurrent worker.
     void try_corroborate(const std::string& delivery_id_hex);
+    /// TTL-reap pd: pending-delivery rows whose 3-way corroboration never
+    /// completed (no matching relay.report + relay.receipt) within
+    /// kDeliveryTtlMs. Called from the prune thread so stream.open's
+    /// mint_delivery can't leak orphan rows. (#5)
+    void reap_stale_deliveries_();
+    static constexpr uint64_t kDeliveryTtlMs = 30ULL * 60ULL * 1000ULL; // 30 min
+    // Serialises the get->parse->mutate->put (and corroborate->credit->del) of
+    // a pending-delivery (pd:) row. Necessary now that handle_request runs on
+    // the RPC worker pool (#1): relay.report and relay.receipt for the SAME
+    // delivery_id can otherwise be processed by two workers at once, losing one
+    // leg's flag bit (credit never fires) or — worse — letting both pass the
+    // `(flags & 7)==7` check and double-credit the mini. Was implicitly safe
+    // when every RPC ran on the single librats io thread. LEAF mutex: held only
+    // around leveldb row ops + relay_tracker_->increment (its own lock); never
+    // across a librats send, never nested under peers_mutex_/io_mutex_/tx_mutex.
+    std::mutex pd_mu_;
 
     // #5 "accept + record": persist the latest device attestation level per
     // device (`dal:<device_id>` → "<level>|<ts_ms>") so a future verifier
@@ -248,6 +297,83 @@ private:
     /// [start], stopped in [stop].
     std::thread        prune_thread_;
     std::atomic<bool>  prune_running_{false};
+
+    // ---- RPC worker pool (off the librats io thread) ------------------
+    //
+    // librats runs accept + recv + decrypt + every on_message callback on a
+    // SINGLE io thread, and that same thread flushes relay-forward / outbound
+    // sends. Running handle_request (fuzzy-fingerprint scan, ECIES, leveldb,
+    // play_proof replay) inline on it starves the flush -> relay-expire +
+    // stream.open timeouts. on_request_cb instead enqueues (peer_id, message)
+    // here and returns immediately; a small bounded pool of workers runs
+    // handle_request (which calls send_reply -> rats_send_message itself).
+    //
+    // Thread-safety: the work queue has its OWN mutex (rpc_mu_), independent of
+    // and never nested inside librats' peers_mutex_/io_mutex_ or the per-cipher
+    // tx_mutex — a worker takes rpc_mu_ only to pop, then RELEASES it before
+    // touching anything else, so it never holds rpc_mu_ across a librats send.
+    // handle_request's own shared state (swarm_, library_, wallet_presence_mu_,
+    // peer_to_wallet_mu_, leveldb) is already internally synchronised and was
+    // already reachable concurrently (broadcast handlers run on the io thread
+    // too); moving it to N workers only widens that existing concurrency, it
+    // introduces no new lock-order edge. Replies may now interleave across
+    // verbs, but every reply carries its req_id so the player already matches
+    // responses to requests out of order — no per-peer ordering is required.
+    // A job is either an inbound RPC envelope (kRpc: run handle_request) or a
+    // freshly-connected peer's anti-entropy handshake (kConnect: run
+    // do_peer_connect_handshake_). Both are off-io-thread work that share the
+    // one bounded pool, so a connect storm and an RPC flood draw from the same
+    // budget instead of each spawning unbounded io-thread work.
+    enum class RpcKind { kRpc, kConnect };
+    struct RpcJob { RpcKind kind; std::string peer_id; std::string message; };
+    std::mutex                       rpc_mu_;
+    std::condition_variable          rpc_cv_;
+    std::deque<RpcJob>               rpc_queue_;
+    std::vector<std::thread>         rpc_workers_;
+    bool                             rpc_running_ = false;   // guarded by rpc_mu_
+    // Backpressure: if a flood outpaces the workers we drop the OLDEST queued
+    // job (a stale request whose caller has likely already timed out) rather
+    // than grow unbounded. Sized for the single-VPS relay fan-in.
+    static constexpr size_t          kRpcQueueMax = 1024;
+    void rpc_worker_loop_();
+    void enqueue_rpc_(std::string peer_id, std::string message);
+    // Returns true iff the kConnect job was actually queued; false if it was
+    // refused (worker pool stopped) or dropped at insertion by the drop-oldest
+    // backpressure. The caller (on_peer_connected_cb) uses this to stamp the
+    // debounce timestamp ONLY on a real enqueue (#3), so a dropped handshake
+    // doesn't suppress the retry for the full kConnectDebounceMs window.
+    bool enqueue_connect_handshake_(std::string peer_id);
+
+    // ---- on-connect anti-entropy cache + per-device debounce ----------
+    //
+    // on_peer_connected_cb used to walk the WHOLE library + playlist store and
+    // fire 3 sends on EVERY connect — a reconnect storm amplifier. We instead:
+    //  (a) cache the db2.sync {key -> version} summary as a pre-dumped JSON
+    //      string, rebuilt lazily only after an actual library/playlist change
+    //      (db2_summary_dirty_ set by the ingest paths); and
+    //  (b) debounce per device: a peer reconnecting within kConnectDebounceMs
+    //      skips the full handshake (its prior summary push is still current
+    //      unless something changed, in which case the flood already reached it).
+    // The connect work itself is dispatched onto the rpc worker pool so the io
+    // thread's connection callback stays non-blocking.
+    std::mutex                       db2_summary_mu_;
+    std::string                      db2_sync_body_cache_;          // cached {lib,pl} object json
+    bool                             db2_summary_dirty_ = true;     // rebuild on next use
+    void mark_db2_summary_dirty_();                                 // ingest paths call this
+    std::string db2_sync_body_();                                   // cached, rebuilds if dirty
+
+    std::mutex                                   connect_debounce_mu_;
+    std::unordered_map<std::string, uint64_t>    last_connect_handshake_ms_;
+    static constexpr uint64_t kConnectDebounceMs = 15'000;
+    void do_peer_connect_handshake_(const std::string& peer_id);   // runs on a worker
+
+    // ---- diagnostics gate --------------------------------------------
+    //
+    // The per-RPC std::cout traces (recv type=…, stream.open …, fuzzy probe …)
+    // are useful while a relay path is being stabilised but are pure overhead
+    // (and lock contention on std::cout) on a busy node. Gate them behind
+    // MC_RATS_DEBUG=1 in the environment, read once at start().
+    std::atomic<bool>  debug_log_{false};
 };
 
 } // namespace mc::api

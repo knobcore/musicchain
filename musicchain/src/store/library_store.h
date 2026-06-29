@@ -35,6 +35,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mc { class Database; }
@@ -83,6 +85,22 @@ public:
     /// query — "who has this song?".
     std::vector<Address> holders(const Hash256& ch) const;
     size_t               holder_count(const Hash256& ch) const;
+
+    /// Discovery snapshot for songs.list. Given the set of currently-LIVE
+    /// wallets (presence-bound + within TTL, resolved by the caller under its
+    /// own presence lock), do ONE walk under this store's lock that builds
+    /// BOTH outputs at once:
+    ///   * `online_hashes`: the hex content_hash of every song held by any
+    ///     live wallet (the "is this song online at all?" filter), and
+    ///   * `holder_counts`: hex content_hash -> number of LIVE wallets holding
+    ///     it (the per-song "swarm size" the UI shows).
+    /// Replaces the old O(N_songs x N_holders) per-song double-mutex loop in
+    /// songs.list with a single pass. `live_wallets` is keyed by the 40-char
+    /// lowercase wallet hex (matching the presence map's keys).
+    void online_snapshot(
+        const std::unordered_set<std::string>& live_wallets,
+        std::unordered_set<std::string>& online_hashes,
+        std::unordered_map<std::string, size_t>& holder_counts) const;
 
     // ---- playlists (ordered lists; many per wallet) -----------------------
     //

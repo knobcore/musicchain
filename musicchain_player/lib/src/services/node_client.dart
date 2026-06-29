@@ -235,8 +235,21 @@ class NodeClient {
       throw StateError('fetchAudioToCache: no rats peer configured');
     }
     final rats   = _rats!;
-    final ids    = rats.validatedPeerIds;
-    final vpsPid = ids.isNotEmpty ? ids.first : null;
+    // RELAY-ANCHOR: the vpsPeerId we hand into streamFromSwarm is used as the
+    // relay through which player.locate runs and per-peer relay.forward is
+    // routed. It MUST be a mini-node — `validatedPeerIds.first` may be a FULL
+    // NODE (or another player) that has no relay.forward handler, so the
+    // relayed request bounces back as "no handler for type=relay.forward" and
+    // no chunk ever flows. Prefer the load-aware mini-node, then the first
+    // identified one; if no mini-node is connected leave it null so we skip the
+    // locate/relay setup entirely and request() re-resolves the live relay.
+    final vpsPid = rats.bestMiniNodePeerId ?? rats.firstMiniNodePeerId;
+
+    // (M1) Cancel the previously-playing stream BEFORE opening the new one, so
+    // its serving peer is told to stop pushing (stream.cancel) and the new
+    // stream.open doesn't fight the leaked push on the single relay link — the
+    // root of the "play track 1, skip to track 2, it hangs ~30 s" bug.
+    AudioStreamProxy.instance.cancelCurrent();
 
     // Streaming path: open the swarm stream and hand media_kit a loopback
     // HTTP URL right away. libmpv starts pulling bytes the moment the
@@ -251,8 +264,12 @@ class NodeClient {
       );
       await AudioStreamProxy.instance.ensureStarted();
       final url = AudioStreamProxy.instance.serve(stream);
+      // ignore: avoid_print
+      print('[stream-diag] PUSH ok: ${stream.totalBytes}B via proxy');
       return Uri.parse(url);
     } on RatsRpcException catch (e) {
+      // ignore: avoid_print
+      print('[stream-diag] streamFromSwarm FAILED: $e');  // full msg incl. per-peer lastError
       // (DHT un-nerf P1) Streaming discovers sources ONLY via the full
       // node's VPS-mediated swarm. When that's empty/offline the stream
       // throws no_swarm / swarm_exhausted — fall back to the piece
@@ -332,8 +349,12 @@ class NodeClient {
       throw StateError('downloadToLibrary: no rats peer configured');
     }
     final rats   = _rats!;
-    final ids    = rats.validatedPeerIds;
-    final vpsPid = ids.isNotEmpty ? ids.first : null;
+    // RELAY-ANCHOR (see fetchAudioToCache): the relay anchor handed to the
+    // swarm fetch must be a mini-node, never `validatedPeerIds.first` (which
+    // can be a full node with no relay.forward handler). Null when no mini-node
+    // is connected — downloadFromSwarm then skips locate/relay and request()
+    // re-resolves the relay live on each RPC.
+    final vpsPid = rats.bestMiniNodePeerId ?? rats.firstMiniNodePeerId;
 
     // The bytes we end up with hash to either the canonical contentHash
     // (legacy single-variant chain entry) or to variant.contentHash if

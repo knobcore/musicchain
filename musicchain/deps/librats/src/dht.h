@@ -374,12 +374,43 @@ public:
 #endif // RATS_SEARCH_FEATURES
     
     /**
-     * Get default BitTorrent DHT bootstrap nodes.
+     * Get the configured bootstrap nodes for this PRIVATE overlay.
+     *
+     * NOTE: musicchain runs a private DHT overlay that speaks the standard KRPC/DHT
+     * wire protocol (so packets are indistinguishable from BitTorrent DHT — that is
+     * the camouflage) but deliberately does NOT bootstrap off the public mainline
+     * routers (router.bittorrent.com, dht.transmissionbt.com, …). Talking to those
+     * would join the real swarm and leak announces into it.
+     *
+     * Instead the application populates a private bootstrap list (its own VPS) via
+     * set_bootstrap_nodes(). This getter returns THAT list — and returns an EMPTY
+     * vector when nothing has been configured. It never returns the public routers.
+     *
      * Hostnames are resolved per-family at send time, so the same list serves both
      * IPv4 and IPv6 (nodes without an AAAA record are simply skipped on IPv6).
-     * @return Vector of bootstrap nodes
+     * @return Vector of bootstrap nodes (empty if none configured)
      */
     static std::vector<Peer> get_default_bootstrap_nodes();
+
+    /**
+     * Set the PRIVATE bootstrap node list for the overlay (process-wide).
+     *
+     * Replaces any previously configured list. musicchain calls this from its own
+     * config with the VPS host:port before start_dht_discovery(). The list is shared
+     * by all DhtClient instances (IPv4 + IPv6); per-family resolution happens at send
+     * time. Pass an empty vector to clear it (the overlay then never bootstraps off
+     * anything — it will only learn nodes that contact it directly).
+     *
+     * Thread-safe: guarded by an internal mutex independent of all per-instance DHT
+     * locks (it touches no instance state), so it is safe to call before or after start().
+     */
+    static void set_bootstrap_nodes(const std::vector<Peer>& nodes);
+
+    /**
+     * Append a single PRIVATE bootstrap node to the overlay list (convenience for the
+     * common "one VPS" case). See set_bootstrap_nodes() for semantics.
+     */
+    static void add_bootstrap_node(const std::string& host, uint16_t port);
 
     /**
      * Address family this DHT node operates on.

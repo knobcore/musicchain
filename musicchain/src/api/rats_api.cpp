@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>   // std::getenv for the MC_RATS_DEBUG diagnostics gate (#6)
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -50,6 +51,11 @@ constexpr const char* MC_MOD_TYPE     = "musicchain.mod";
 constexpr const char* MC_LIBRARY_TYPE = "musicchain.library";  // DB2 delta gossip
 constexpr const char* MC_PLAYLIST_TYPE = "musicchain.playlist"; // DB2 playlist gossip
 
+// Server-side wall-clock ms (defined in the anonymous namespace lower down).
+// Forward-declared here so start()/on_peer_connected_cb — which precede that
+// definition — can stamp/compare presence + debounce timestamps with it.
+namespace { uint64_t presence_now_ms(); }
+
 RatsApi::RatsApi(HttpServer& http,
                  Chain& chain, CandidateManager& candidates,
                  net::NetworkManager& network, Database& db,
@@ -69,6 +75,26 @@ RatsApi::RatsApi(HttpServer& http,
 void RatsApi::start(rats_client_t client) {
     if (client_) return;
     client_ = client;
+
+    // Diagnostics gate (#6): the per-RPC std::cout traces are opt-in. Read the
+    // env once here so the hot path is just an atomic-bool load.
+    if (const char* dbg = std::getenv("MC_RATS_DEBUG"))
+        debug_log_.store(dbg[0] != '\0' && dbg[0] != '0');
+
+    // RPC worker pool (#1): handle_request does heavy work (fuzzy-fingerprint
+    // scan, ECIES, leveldb, play_proof replay) that must NOT run on librats'
+    // single io thread (it also flushes relay-forward). on_request_cb enqueues
+    // here; these workers drain the queue and run handle_request (which sends
+    // its own reply). Small fixed pool — the bottleneck is leveldb/CPU, not
+    // thread count, and the single-VPS fan-in is modest.
+    {
+        std::lock_guard<std::mutex> lk(rpc_mu_);
+        rpc_running_ = true;
+    }
+    const unsigned n_workers = 3;
+    for (unsigned i = 0; i < n_workers; ++i)
+        rpc_workers_.emplace_back([this] { rpc_worker_loop_(); });
+
     rats_on_message(client_, MC_REQUEST_TYPE,
                     &RatsApi::on_request_cb, this);
     rats_on_message(client_, MC_MOD_TYPE,
@@ -101,6 +127,56 @@ void RatsApi::start(rats_client_t client) {
             }
             if (!prune_running_) return;
             swarm_.prune_stale();
+            // (#2) Lazy persistence: touch_peer now only bumps last_seen_ms in
+            // memory on the hot inbound-RPC path; the freshened timestamps get
+            // written here, off that path. Cheap no-op when nothing's dirty.
+            swarm_.flush_dirty();
+            // (#5) Reap pending-delivery (pd:) rows whose corroboration never
+            // completed within the TTL. Without this a stream.open that never
+            // gets a matching relay.report + relay.receipt leaves an orphan
+            // row forever. try_corroborate already retires a completed row.
+            reap_stale_deliveries_();
+            // (#3) Drop debounce entries older than the debounce window so the
+            // per-device reconnect map can't grow unbounded over a long uptime.
+            {
+                const uint64_t now = presence_now_ms();
+                std::lock_guard<std::mutex> lk(connect_debounce_mu_);
+                for (auto it = last_connect_handshake_ms_.begin();
+                     it != last_connect_handshake_ms_.end(); ) {
+                    if (now - it->second >= kConnectDebounceMs)
+                        it = last_connect_handshake_ms_.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            // Reap presence bindings that are truly dead — not even ping-
+            // revivable: BOTH the seen-TTL and the verify-TTL have lapsed, so
+            // discovery already ignores them and no ping can refresh them.
+            // Without this, wallet_to_peer_/peer_to_wallet_player_ would grow
+            // one orphan per relayed reconnect (swarm.peer_offline no longer
+            // erases, by design — it's the transient-blip false signal).
+            {
+                const uint64_t now = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now()
+                            .time_since_epoch()).count());
+                std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+                for (auto it = wallet_to_peer_.begin();
+                     it != wallet_to_peer_.end(); ) {
+                    const uint64_t vage = now >= it->second.last_verified_ms
+                        ? now - it->second.last_verified_ms : 0;
+                    // Keep a dead binding kPresenceReapMs (> the hello skew
+                    // horizon) so per-wallet ts monotonicity keeps blocking a
+                    // replayed hello right up until the skew check itself starts
+                    // rejecting it — no reap-then-replay window.
+                    if (vage >= kPresenceReapMs) {
+                        peer_to_wallet_player_.erase(it->second.peer_id);
+                        it = wallet_to_peer_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
         }
     });
 }
@@ -108,6 +184,17 @@ void RatsApi::start(rats_client_t client) {
 void RatsApi::stop() {
     prune_running_ = false;
     if (prune_thread_.joinable()) prune_thread_.join();
+    // Tear down the RPC worker pool: flip the run flag under the queue lock,
+    // wake every worker, then join. Workers re-check rpc_running_ after each
+    // wait, so any in-flight handle_request finishes before its worker exits.
+    {
+        std::lock_guard<std::mutex> lk(rpc_mu_);
+        rpc_running_ = false;
+    }
+    rpc_cv_.notify_all();
+    for (auto& t : rpc_workers_)
+        if (t.joinable()) t.join();
+    rpc_workers_.clear();
     client_ = nullptr;
 }
 
@@ -119,70 +206,187 @@ void RatsApi::on_request_cb(void* user_data, const char* peer_id,
         if (message_data) rats_string_free(message_data);
         return;
     }
-    // librats_c.cpp strdup's both args; we free explicitly after handling.
-    self->handle_request(peer_id, message_data);
+    // (#1) This callback runs on librats' single io thread, which also flushes
+    // relay-forward. Do NOT run handle_request here — it does heavy work and
+    // would starve the flush (relay-expire + stream.open timeouts). Copy the
+    // args into std::strings, hand them to the worker pool, and return at once.
+    // librats_c.cpp strdup's both args; we own + free them here after copying.
+    self->enqueue_rpc_(std::string(peer_id), std::string(message_data));
     rats_string_free(peer_id);
     rats_string_free(message_data);
+}
+
+void RatsApi::enqueue_rpc_(std::string peer_id, std::string message) {
+    {
+        std::lock_guard<std::mutex> lk(rpc_mu_);
+        if (!rpc_running_) return;   // shutting down — drop
+        // Bounded queue: if workers fall behind a flood, drop the OLDEST job
+        // (its caller has most likely already timed out) so memory stays
+        // bounded and the freshest requests still get served.
+        if (rpc_queue_.size() >= kRpcQueueMax)
+            rpc_queue_.pop_front();
+        rpc_queue_.push_back(RpcJob{RpcKind::kRpc,
+                                    std::move(peer_id), std::move(message)});
+    }
+    rpc_cv_.notify_one();
+}
+
+bool RatsApi::enqueue_connect_handshake_(std::string peer_id) {
+    {
+        std::lock_guard<std::mutex> lk(rpc_mu_);
+        if (!rpc_running_) return false;          // pool stopped — job refused
+        if (rpc_queue_.size() >= kRpcQueueMax)
+            rpc_queue_.pop_front();               // drop OLDEST, keep ours
+        rpc_queue_.push_back(RpcJob{RpcKind::kConnect,
+                                    std::move(peer_id), std::string()});
+    }
+    rpc_cv_.notify_one();
+    // NOTE: this reports only that OUR job survived insertion. A *later*
+    // enqueue can still drop it as the oldest if the queue stays saturated;
+    // that residual is accepted (#3) — presence.hello re-sign + BlockPropagator
+    // reconnect recover convergence on the next non-debounced connect.
+    return true;
+}
+
+void RatsApi::rpc_worker_loop_() {
+    for (;;) {
+        RpcJob job;
+        {
+            std::unique_lock<std::mutex> lk(rpc_mu_);
+            rpc_cv_.wait(lk, [this] {
+                return !rpc_running_ || !rpc_queue_.empty();
+            });
+            if (!rpc_running_ && rpc_queue_.empty()) return;
+            job = std::move(rpc_queue_.front());
+            rpc_queue_.pop_front();
+        }   // RELEASE rpc_mu_ before doing any work or any librats send — the
+            // queue lock is a leaf and is never held across handle_request /
+            // the connect handshake.
+        try {
+            if (job.kind == RpcKind::kConnect)
+                do_peer_connect_handshake_(job.peer_id);
+            else
+                handle_request(job.peer_id, job.message);
+        } catch (const std::exception& e) {
+            std::cerr << "[rats-api] worker job threw: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[rats-api] worker job threw (unknown)\n";
+        }
+    }
 }
 
 void RatsApi::on_peer_connected_cb(void* user_data, const char* peer_id) {
     auto* self = static_cast<RatsApi*>(user_data);
     if (self && peer_id && *peer_id) {
+        // mark_peer_online is a single in-memory set insert — cheap, keep it
+        // on the io thread so availability flips the instant we connect.
         self->swarm_.mark_peer_online(peer_id);
 
-        // Ask the freshly-connected peer to push us any moderation
-        // envelopes newer than our latest known timestamp. Player peers
-        // won't have any (they don't register the handler) and will
-        // reply unknown_type / no-op; other full nodes will replay the
-        // diff so this node converges to the same hide state.
-        if (self->client_) {
-            const uint64_t since = self->db_.latest_mod_log_ts();
-            nlohmann::json req = {
-                {"req_id", std::string("mod-sync-")
-                              + std::to_string(moderation::now_ms())},
-                {"type",   "mod.sync_since"},
-                {"body",   {{"since_ts_ms", since}}},
-            };
-            rats_send_message(self->client_, peer_id,
-                              MC_REQUEST_TYPE, req.dump().c_str());
-
-            // DB2 anti-entropy: send the peer our library/playlist summary
-            // ({key -> version}) so it can push back every record we're behind
-            // on. Both sides do this on connect, so they converge. Players /
-            // mini-nodes don't handle db2.sync and just no-op.
-            {
-                nlohmann::json lib = nlohmann::json::object();
-                self->library_.for_each_library_payload(
-                    [&](const Address& w, uint64_t ver, const std::string&) {
-                        lib[crypto::to_hex(w.data(), w.size())] = ver;
-                    });
-                nlohmann::json pl = nlohmann::json::object();
-                self->library_.for_each_playlist_payload(
-                    [&](const Address& w, const std::array<uint8_t, 16>& id,
-                        uint64_t ver, const std::string&) {
-                        pl[crypto::to_hex(w.data(), w.size()) +
-                           crypto::to_hex(id.data(), id.size())] = ver;
-                    });
-                nlohmann::json sreq = {
-                    {"req_id", std::string("db2-sync-") +
-                                  std::to_string(moderation::now_ms())},
-                    {"type",   "db2.sync"},
-                    {"body",   {{"lib", lib}, {"pl", pl}}},
-                };
-                rats_send_message(self->client_, peer_id,
-                                  MC_REQUEST_TYPE, sreq.dump().c_str());
-            }
+        // (#3) Everything else here used to walk the WHOLE library + playlist
+        // store and fire 3 sends on EVERY connect, synchronously on the io
+        // thread — a reconnect-storm amplifier. Per-device debounce: a peer
+        // that reconnected within kConnectDebounceMs skips the full handshake
+        // (its prior summary is still current; any change since then already
+        // flooded to it). Otherwise we hand the work to the RPC worker pool so
+        // the io thread's connection callback returns immediately.
+        const uint64_t now = presence_now_ms();
+        bool do_handshake = false;
+        {
+            std::lock_guard<std::mutex> lk(self->connect_debounce_mu_);
+            auto it = self->last_connect_handshake_ms_.find(peer_id);
+            do_handshake = (it == self->last_connect_handshake_ms_.end() ||
+                            now - it->second >= kConnectDebounceMs);
         }
-
-        // Block-distribution handshake: send block.hello so the new
-        // peer learns our tip. If they're a full node and we're behind,
-        // they'll respond with their tip + we'll fire block.getblocks
-        // through the existing handle_request path.
-        if (self->propagator_) {
-            self->propagator_->on_peer_connected(peer_id);
+        // (#3) Stamp the debounce timestamp ONLY after the kConnect job is
+        // actually queued. Stamping before enqueue (as we used to) meant a job
+        // dropped by the worker-pool backpressure silently suppressed the
+        // anti-entropy handshake for the full kConnectDebounceMs window. This
+        // runs on the single librats io thread, so there's no concurrent
+        // callback for the same peer to race the check->enqueue->stamp gap.
+        if (do_handshake) {
+            std::string pid(peer_id);
+            if (self->enqueue_connect_handshake_(std::move(pid))) {
+                std::lock_guard<std::mutex> lk(self->connect_debounce_mu_);
+                self->last_connect_handshake_ms_[peer_id] = now;
+            }
         }
     }
     if (peer_id) rats_string_free(peer_id);
+}
+
+// Runs on an RPC worker (off the io thread). Sends the mod-sync request, the
+// cached DB2 anti-entropy summary, and the block.hello handshake to a freshly-
+// connected peer. Separated out of the io-thread callback (#3) so the heavy
+// store walk / sends never block librats' accept+recv+flush loop.
+void RatsApi::do_peer_connect_handshake_(const std::string& peer_id) {
+    if (!client_) return;
+
+    // Ask the peer to push us moderation envelopes newer than ours. Player
+    // peers don't handle it and no-op; full nodes replay the diff.
+    {
+        const uint64_t since = db_.latest_mod_log_ts();
+        nlohmann::json req = {
+            {"req_id", std::string("mod-sync-")
+                          + std::to_string(moderation::now_ms())},
+            {"type",   "mod.sync_since"},
+            {"body",   {{"since_ts_ms", since}}},
+        };
+        rats_send_message(client_, peer_id.c_str(),
+                          MC_REQUEST_TYPE, req.dump().c_str());
+    }
+
+    // DB2 anti-entropy: send the peer our cached library/playlist summary
+    // ({key -> version}) so it can push back every record we're behind on.
+    // The summary is rebuilt lazily only after an actual library/playlist
+    // change (db2_summary_dirty_), so a reconnect storm reuses one dump
+    // instead of re-walking the whole store per connect.
+    {
+        nlohmann::json sreq = {
+            {"req_id", std::string("db2-sync-") +
+                          std::to_string(moderation::now_ms())},
+            {"type",   "db2.sync"},
+            {"body",   nlohmann::json::parse(db2_sync_body_())},
+        };
+        rats_send_message(client_, peer_id.c_str(),
+                          MC_REQUEST_TYPE, sreq.dump().c_str());
+    }
+
+    // Block-distribution handshake: send block.hello so the peer learns our
+    // tip and we converge if behind. on_peer_connected only touches the
+    // propagator's own (internally-locked) state.
+    if (propagator_) propagator_->on_peer_connected(peer_id);
+}
+
+void RatsApi::mark_db2_summary_dirty_() {
+    std::lock_guard<std::mutex> lk(db2_summary_mu_);
+    db2_summary_dirty_ = true;
+}
+
+std::string RatsApi::db2_sync_body_() {
+    std::lock_guard<std::mutex> lk(db2_summary_mu_);
+    if (db2_summary_dirty_ || db2_sync_body_cache_.empty()) {
+        // Rebuild the {lib:{walletHex:ver}, pl:{walletHex+idHex:ver}} summary
+        // by walking the stored payloads ONCE, then cache the dumped JSON. The
+        // LibraryStore for_each_* take their own lock; db2_summary_mu_ is a
+        // leaf taken only around this rebuild + the dirty flag, never nested
+        // under the store lock, so there's no lock-order edge with it.
+        nlohmann::json lib = nlohmann::json::object();
+        library_.for_each_library_payload(
+            [&](const Address& w, uint64_t ver, const std::string&) {
+                lib[crypto::to_hex(w.data(), w.size())] = ver;
+            });
+        nlohmann::json pl = nlohmann::json::object();
+        library_.for_each_playlist_payload(
+            [&](const Address& w, const std::array<uint8_t, 16>& id,
+                uint64_t ver, const std::string&) {
+                pl[crypto::to_hex(w.data(), w.size()) +
+                   crypto::to_hex(id.data(), id.size())] = ver;
+            });
+        db2_sync_body_cache_ =
+            nlohmann::json{{"lib", std::move(lib)}, {"pl", std::move(pl)}}.dump();
+        db2_summary_dirty_ = false;
+    }
+    return db2_sync_body_cache_;
 }
 
 void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
@@ -210,7 +414,7 @@ void RatsApi::on_peer_disconnected_cb(void* user_data, const char* peer_id) {
             auto it = self->peer_to_wallet_player_.find(peer_id);
             if (it != self->peer_to_wallet_player_.end()) {
                 auto w = self->wallet_to_peer_.find(it->second);
-                if (w != self->wallet_to_peer_.end() && w->second == peer_id)
+                if (w != self->wallet_to_peer_.end() && w->second.peer_id == peer_id)
                     self->wallet_to_peer_.erase(w);
                 self->peer_to_wallet_player_.erase(it);
             }
@@ -311,6 +515,15 @@ bool from_hex_fixed(const std::string& hex_in, uint8_t* out, size_t n) {
 // this file) so the presence.hello handler in handle_request can build the
 // little-endian ts field with the same helper the canonical builders use.
 void put_le(std::vector<uint8_t>& v, uint64_t x, int bytes);
+
+// Server-side wall-clock milliseconds for the presence TTL model. We stamp
+// last_seen / last_verified with OUR clock, never the client-supplied `ts`,
+// so a player can't backdate/forward-date its way around the TTL windows.
+uint64_t presence_now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
 } // namespace
 
 // ---- DB2 discovery helpers (wallet-presence → live song availability) ----
@@ -325,34 +538,40 @@ std::vector<std::string> RatsApi::online_peers_for_song_(const Hash256& ch) {
     std::vector<std::string> out;
     // holders() consults LibraryStore's own lock; do it before/outside ours.
     auto holders = library_.holders(ch);
+    const uint64_t now = presence_now_ms();
     std::lock_guard<std::mutex> lk(wallet_presence_mu_);
     for (const auto& w : holders) {
         const std::string wh = crypto::to_hex(w.data(), w.size());
         auto it = wallet_to_peer_.find(wh);
         if (it == wallet_to_peer_.end()) continue;
-        const std::string& pid = it->second;
-        if (swarm_.is_online(pid)) out.push_back(pid);
+        const std::string& pid = it->second.peer_id;
+        // Discovery trusts ONLY the signed hello: a holder counts as live while
+        // its last VALID presence.hello is within kPresenceTtlMs. is_online is
+        // NOT consulted — for a relayed peer it's both flaky (a transient
+        // swarm.peer_offline from a download saturating the relay) and forgeable
+        // (unauthenticated swarm.peer_online on a public peer_id). See header.
+        const bool live = (now >= it->second.last_verified_ms
+                              ? now - it->second.last_verified_ms : 0)
+                              < kPresenceTtlMs;
+        if (live) out.push_back(pid);
     }
     return out;
 }
 
-std::unordered_set<std::string> RatsApi::online_library_hashes_() {
-    // Snapshot the (wallet_hex -> peer_id) bindings under the presence lock,
-    // then release it before touching LibraryStore to avoid holding two locks
-    // at once (lock-ordering safety: LibraryStore has its own mutex).
-    std::vector<std::pair<std::string, std::string>> bindings;
-    {
-        std::lock_guard<std::mutex> lk(wallet_presence_mu_);
-        bindings.reserve(wallet_to_peer_.size());
-        for (const auto& [wh, pid] : wallet_to_peer_) bindings.emplace_back(wh, pid);
-    }
+std::unordered_set<std::string> RatsApi::live_wallets_() {
+    // Snapshot the live wallet-hex set under the presence lock only; the
+    // LibraryStore walk happens in online_snapshot under ITS lock, so the two
+    // locks are never held simultaneously (lock-ordering safety).
+    const uint64_t now = presence_now_ms();
     std::unordered_set<std::string> out;
-    for (const auto& [wh, pid] : bindings) {
-        if (!swarm_.is_online(pid)) continue;
-        Address addr{};
-        if (!from_hex_fixed(wh, addr.data(), addr.size())) continue;
-        for (const auto& h : library_.library(addr))
-            out.insert(crypto::to_hex(h.data(), h.size()));
+    std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+    out.reserve(wallet_to_peer_.size());
+    for (const auto& [wh, b] : wallet_to_peer_) {
+        // Signed-hello-only liveness — see online_peers_for_song_.
+        const bool live =
+            (now >= b.last_verified_ms ? now - b.last_verified_ms : 0)
+                < kPresenceTtlMs;
+        if (live) out.insert(wh);
     }
     return out;
 }
@@ -382,11 +601,14 @@ void RatsApi::handle_request(const std::string& peer_id,
 
     // Diagnostic: print verb + originator hint so we can tell whether the
     // VPS is actually attaching `originator_peer_id` on relayed envelopes.
-    // Remove once the streaming relay path is stable.
-    std::cout << "[rats-api] recv type=" << type
-              << " from " << peer_id.substr(0, 12)
-              << " originator=\""
-              << env.value("originator_peer_id", std::string()) << "\"\n";
+    // (#6) Gated behind MC_RATS_DEBUG — this fired on EVERY RPC and the
+    // std::cout lock contention adds up across the worker pool on a busy node.
+    if (debug_log_.load()) {
+        std::cout << "[rats-api] recv type=" << type
+                  << " from " << peer_id.substr(0, 12)
+                  << " originator=\""
+                  << env.value("originator_peer_id", std::string()) << "\"\n";
+    }
 
     // Any traffic from this peer is proof of life — refresh last_seen
     // on every SwarmMember for this peer_id so the prune cycle doesn't
@@ -458,19 +680,22 @@ void RatsApi::handle_request(const std::string& peer_id,
                 try {
                     auto arr = nlohmann::json::parse(body_str);
                     if (arr.is_array()) {
-                        const auto online = online_library_hashes_();
+                        // Single snapshot pass (was O(N_songs x N_holders) with a
+                        // per-song double mutex). One presence lock for the live
+                        // wallet set, then one LibraryStore walk that builds BOTH
+                        // the online-hash set AND the hash->live-holder-count map.
+                        const auto live = live_wallets_();
+                        std::unordered_set<std::string> online;
+                        std::unordered_map<std::string, size_t> holder_counts;
+                        library_.online_snapshot(live, online, holder_counts);
                         nlohmann::json filtered = nlohmann::json::array();
                         for (auto& s : arr) {
                             const std::string ch_hex =
                                 s.value("content_hash", "");
                             if (online.count(ch_hex) == 0) continue; // skip
-                            Hash256 ch;
-                            if (crypto::parse_hash256(ch_hex, ch)) {
-                                s["swarm_size"] =
-                                    online_peers_for_song_(ch).size();
-                            } else {
-                                s["swarm_size"] = 0;
-                            }
+                            auto hc = holder_counts.find(ch_hex);
+                            s["swarm_size"] =
+                                hc == holder_counts.end() ? 0 : hc->second;
                             filtered.push_back(std::move(s));
                         }
                         body_str = filtered.dump();
@@ -875,22 +1100,78 @@ void RatsApi::handle_request(const std::string& peer_id,
                     reply = {{"req_id", req_id}, {"status", "rejected"},
                              {"error",  "signature did not verify"}};
                 } else {
-                    {
-                        std::lock_guard<std::mutex> lk(wallet_presence_mu_);
-                        const std::string wh =
-                            crypto::to_hex(wallet.data(), wallet.size());
-                        wallet_to_peer_[wh]              = peer_id_decl;
-                        peer_to_wallet_player_[peer_id_decl] = wh;
+                    // Signature is valid. Now guard against REPLAY: a hello
+                    // transits mini-nodes as plaintext JSON, so a captured one
+                    // is a bearer token unless we (a) reject stale timestamps
+                    // and (b) enforce per-wallet monotonicity. `ts` is already
+                    // folded into the signed digest above, so neither check
+                    // needs a wire change. Without this a replayed hello could
+                    // re-arm the ping window and overwrite a live binding with
+                    // a dead peer_id (binding-hijack-to-stale-target).
+                    const uint64_t now  = presence_now_ms();
+                    const uint64_t skew = now >= ts ? now - ts : ts - now;
+                    if (skew > kPresenceHelloSkewMs) {
+                        reply = {{"req_id", req_id}, {"status", "rejected"},
+                                 {"error",  "stale timestamp"}};
+                    } else {
+                        bool replay = false;
+                        {
+                            std::lock_guard<std::mutex> lk(wallet_presence_mu_);
+                            const std::string wh =
+                                crypto::to_hex(wallet.data(), wallet.size());
+                            auto ex = wallet_to_peer_.find(wh);
+                            if (ex != wallet_to_peer_.end() &&
+                                ts <= ex->second.last_ts) {
+                                // Non-increasing ts for this wallet — a replay
+                                // (or a badly out-of-order device). Reject so a
+                                // captured hello can't resurrect or overwrite.
+                                replay = true;
+                            } else {
+                                // Rebinding to a NEW peer_id: drop the prior
+                                // peer's reverse entry so peer_to_wallet_player_
+                                // stays 1:1 with live bindings (no orphan leak).
+                                if (ex != wallet_to_peer_.end() &&
+                                    ex->second.peer_id != peer_id_decl) {
+                                    peer_to_wallet_player_.erase(
+                                        ex->second.peer_id);
+                                }
+                                // Full signed hello stamps last_verified
+                                // (server clock) and records the accepted ts.
+                                // This is the ONLY signal discovery trusts, so a
+                                // live player must keep re-signing (~30 s) to
+                                // stay discoverable — and only the wallet's true
+                                // key can produce it.
+                                wallet_to_peer_[wh] = PresenceBinding{
+                                    peer_id_decl, now, ts};
+                                peer_to_wallet_player_[peer_id_decl] = wh;
+                            }
+                        }
+                        if (replay) {
+                            reply = {{"req_id", req_id}, {"status", "rejected"},
+                                     {"error",  "out-of-order timestamp"}};
+                        } else {
+                            swarm_.mark_peer_online(peer_id_decl);
+                            reply = {{"req_id", req_id}, {"status", "ok"},
+                                     {"body", {{"bound", true}}}};
+                            // (#6) Fires every ~30 s per online player — gate it.
+                            if (debug_log_.load()) {
+                                std::cout << "[rats-api] presence.hello: wallet "
+                                          << w_in.substr(0, 10)
+                                          << "… bound to peer "
+                                          << peer_id_decl.substr(0, 12) << "\n";
+                            }
+                        }
                     }
-                    swarm_.mark_peer_online(peer_id_decl);
-                    reply = {{"req_id", req_id}, {"status", "ok"},
-                             {"body", {{"bound", true}}}};
-                    std::cout << "[rats-api] presence.hello: wallet "
-                              << w_in.substr(0, 10) << "… bound to peer "
-                              << peer_id_decl.substr(0, 12) << "\n";
                 }
             }
         }
+        // NOTE: there is deliberately NO lightweight presence.ping keepalive.
+        // A signature-less refresh is forgeable for a relayed player — the
+        // {wallet, peer_id} tuple is public (peer_id is returned in stream.open
+        // replies) — so it can't be trusted to keep a binding discoverable
+        // without re-introducing a "dead peer stays listed" vector. Discovery
+        // trusts ONLY the signed presence.hello above; the player re-signs
+        // every ~30 s, which is cheap at this scale.
         // ---- audio streaming (DB2 discovery) ----------------------------
         // The full node never holds audio bytes under the post-pivot
         // architecture. stream.open just resolves the live holders of the
@@ -904,28 +1185,57 @@ void RatsApi::handle_request(const std::string& peer_id,
                          {"status", "invalid"},
                          {"error",  "content_hash not 32-byte hex"}};
             } else if (!db_.get_content_height(ch)) {
+                if (debug_log_.load()) {
+                    std::cout << "[rats-api] stream.open ch="
+                              << hash.substr(0, 16)
+                              << "… NOT minted on chain => unknown\n";
+                }
                 reply = {{"req_id", req_id},
                          {"status", "unknown"},
                          {"error",  "song not on chain"}};
             } else {
-                // #10 triangulation: mint a delivery_id + pending-delivery
-                // row (this node is the broker), returned so the player
-                // threads it through the relay and reports receipt.
-                const std::string did_hex = mint_delivery(ch);
-                // DB2 discovery: resolve the live player peer_ids that hold
-                // this canonical song (wallet library holders with a
-                // presence binding + online). No swarm index involved.
+                // (#5) Resolve holders FIRST; only mint a pending-delivery row
+                // when there is actually a peer to deliver from. The old code
+                // minted unconditionally, so every no_swarm stream.open leaked
+                // a pd: row that could never corroborate (no peer => no relay
+                // => no report/receipt) and sat until the new TTL reaper.
+                // DB2 discovery: live player peer_ids that hold this canonical
+                // song (wallet library holders with a fresh presence binding).
+                // DIAGNOSTIC: db2_holders = wallets that PUBLISHED this exact
+                // hash in their library; online = those also presence-fresh.
+                // db2_holders==0 -> the requested hash isn't a library key
+                // (content<->canonical mismatch); db2_holders>0 && online==0
+                // -> a presence/TTL gap.
+                const size_t db2_holders = library_.holders(ch).size();
                 auto peers = online_peers_for_song_(ch);
                 if (peers.empty()) {
+                    if (debug_log_.load()) {
+                        std::cout << "[rats-api] stream.open ch="
+                                  << hash.substr(0, 16)
+                                  << "… db2_holders=" << db2_holders
+                                  << " online=0 => no_swarm (no delivery minted)\n";
+                    }
                     reply = {{"req_id", req_id},
                              {"status", "ok"},
                              {"body",   {
                                  {"content_hash", hash},
                                  {"peers",        nlohmann::json::array()},
                                  {"source",       "no_swarm"},
-                                 {"delivery_id",  did_hex},
+                                 {"delivery_id",  std::string()},
                              }}};
                 } else {
+                    // #10 triangulation: mint a delivery_id + pending-delivery
+                    // row (this node is the broker), returned so the player
+                    // threads it through the relay and reports receipt. Minted
+                    // only now that we know there's a peer to deliver from.
+                    const std::string did_hex = mint_delivery(ch);
+                    if (debug_log_.load()) {
+                        std::cout << "[rats-api] stream.open ch="
+                                  << hash.substr(0, 16)
+                                  << "… db2_holders=" << db2_holders
+                                  << " online=" << peers.size()
+                                  << " => db2 (minted=1)\n";
+                    }
                     // Each peer entry carries the requested canonical hash
                     // (the player streams that hash). Bitrate / format are
                     // unknown from DB2 alone, so they default; the player's
@@ -1092,10 +1402,12 @@ void RatsApi::handle_request(const std::string& peer_id,
                             }
                             if (found) break;
                         }
-                        std::cout << "[rats-api] fuzzy probe: "
-                                  << n_candidates << " candidates, best="
-                                  << best.second << " (threshold "
-                                  << kSimThreshold << ")\n";
+                        if (debug_log_.load()) {
+                            std::cout << "[rats-api] fuzzy probe: "
+                                      << n_candidates << " candidates, best="
+                                      << best.second << " (threshold "
+                                      << kSimThreshold << ")\n";
+                        }
                         if (best.second >= kSimThreshold) {
                             match = best.first;
                             std::cout << "[rats-api] fuzzy match: sim="
@@ -1284,24 +1596,21 @@ void RatsApi::handle_request(const std::string& peer_id,
             const std::string offline_pid = in.value("peer_id", "");
             if (!offline_pid.empty()) {
                 swarm_.mark_peer_offline(offline_pid);
-                // Drop the wallet-presence binding for this player so its
-                // DB2 library stops surfacing on Discover / stream.open the
-                // instant it goes offline. Only erase the wallet→peer entry
-                // if it still points at THIS peer (a reconnect under a fresh
-                // peer_id may have already rebound the wallet).
-                {
-                    std::lock_guard<std::mutex> lk(wallet_presence_mu_);
-                    auto it = peer_to_wallet_player_.find(offline_pid);
-                    if (it != peer_to_wallet_player_.end()) {
-                        auto w = wallet_to_peer_.find(it->second);
-                        if (w != wallet_to_peer_.end() && w->second == offline_pid)
-                            wallet_to_peer_.erase(w);
-                        peer_to_wallet_player_.erase(it);
-                    }
+                // Do NOT touch the wallet-presence binding here. swarm.peer_offline
+                // is mini-node-forwarded and fires on transient drops (a relayed
+                // download saturating the relay, a brief network blip), and it's
+                // unauthenticated/forgeable — so it must not affect a wallet's
+                // discoverability at all. Discovery ignores is_online entirely
+                // and trusts only the signed presence.hello (last_verified within
+                // kPresenceTtlMs); a live player's ~30 s re-sign keeps it visible
+                // straight through the blip. Authoritative DIRECT transport
+                // disconnects still erase the binding in on_peer_disconnected_cb.
+                if (debug_log_.load()) {
+                    std::cout << "[rats-api] swarm.peer_offline "
+                              << offline_pid.substr(0, 12)
+                              << " (via " << peer_id.substr(0, 12)
+                              << ") — binding kept (TTL)\n";
                 }
-                std::cout << "[rats-api] swarm.peer_offline "
-                          << offline_pid.substr(0, 12)
-                          << " (via " << peer_id.substr(0, 12) << ")\n";
             }
             reply = {{"req_id", req_id},
                      {"status", "ok"},
@@ -2174,6 +2483,9 @@ bool RatsApi::ingest_library_delta(const std::string& payload_json,
     // the signed payload so a node can re-send it during anti-entropy.
     if (!library_.set_library(wallet, add, version)) return false;
     library_.store_library_payload(wallet, version, payload_json);
+    // A library record actually changed -> the cached db2.sync summary is
+    // stale; rebuild it lazily on the next on-connect handshake (#3).
+    mark_db2_summary_dirty_();
 
     if (broadcast_if_new && client_)
         rats_broadcast_message(client_, MC_LIBRARY_TYPE, payload_json.c_str());
@@ -2255,6 +2567,8 @@ bool RatsApi::ingest_playlist(const std::string& payload_json,
         : library_.set_playlist(wallet, pid, name, songs, version);
     if (!applied) return false;
     library_.store_playlist_payload(wallet, pid, version, payload_json);
+    // Playlist record changed -> invalidate the cached db2.sync summary (#3).
+    mark_db2_summary_dirty_();
 
     if (broadcast_if_new && client_)
         rats_broadcast_message(client_, MC_PLAYLIST_TYPE, payload_json.c_str());
@@ -2418,6 +2732,9 @@ bool RatsApi::handle_relay_report(const nlohmann::json& body) {
     const std::string pk_hex  = body.value("mini_pubkey",  std::string());
     const std::string sig_hex = body.value("sig",          std::string());
     if (did_hex.size() != 32) return false;
+    // Serialise the pd: row RMW (+ try_corroborate at the tail) against the
+    // receipt leg's worker — see pd_mu_ in the header. (#1 worker-pool fix)
+    std::lock_guard<std::mutex> pdlk(pd_mu_);
     auto row_opt = db_.get("pd:" + did_hex);
     if (!row_opt) return false;                 // we didn't broker it — drop
     auto pk = crypto::from_hex(pk_hex); if (pk.size() != 33) return false;
@@ -2460,6 +2777,9 @@ bool RatsApi::handle_relay_receipt(const nlohmann::json& body) {
     const std::string pk_hex  = body.value("player_pubkey",  std::string());
     const std::string sig_hex = body.value("sig",            std::string());
     if (did_hex.size() != 32 || ch_hex.size() != 64) return false;
+    // Serialise the pd: row RMW (+ try_corroborate at the tail) against the
+    // report leg's worker — see pd_mu_ in the header. (#1 worker-pool fix)
+    std::lock_guard<std::mutex> pdlk(pd_mu_);
     auto row_opt = db_.get("pd:" + did_hex);
     if (!row_opt) return false;
     auto row = nlohmann::json::parse(
@@ -2518,6 +2838,52 @@ void RatsApi::try_corroborate(const std::string& did_hex) {
                   << credited * kUnitsPerByte << " units\n";
     }
     db_.del("pd:" + did_hex);   // single-use ⇒ replay-proof
+}
+
+void RatsApi::reap_stale_deliveries_() {
+    const uint64_t now = presence_now_ms();
+    // Two-pass: collect the dead keys under the leveldb iterator, then delete
+    // outside it (don't mutate the store mid-iteration). A pd: row is dead when
+    // its broker-stamped `created` ms is older than kDeliveryTtlMs; a row whose
+    // 3 legs all landed is already retired by try_corroborate, so anything
+    // still here past the TTL is an abandoned half-delivery.
+    std::vector<std::string> dead;
+    db_.for_each_with_prefix("pd:", [&](const std::string& key,
+                                        const std::string& val) {
+        auto row = nlohmann::json::parse(val, nullptr, /*allow_exceptions=*/false);
+        uint64_t created = 0;
+        if (row.is_object()) created = row.value("created", (uint64_t)0);
+        // A row with no/garbage `created` is treated as stale (created==0 is
+        // always older than now - TTL), so malformed rows get swept too.
+        if (now > created && now - created >= kDeliveryTtlMs)
+            dead.push_back(key);
+        return true;
+    });
+    // Delete under pd_mu_, re-reading each candidate so we never race a
+    // concurrent report/receipt worker: if a leg landed between the unlocked
+    // scan and here, the row may now be retired (try_corroborate del'd it) or
+    // freshly mutated — re-confirm it's still present AND still past the TTL
+    // before deleting, so we can't reap a delivery that just corroborated.
+    size_t reaped = 0;
+    {
+        std::lock_guard<std::mutex> pdlk(pd_mu_);
+        for (const auto& k : dead) {
+            auto cur = db_.get(k);
+            if (!cur) continue;                       // already retired
+            auto row = nlohmann::json::parse(
+                std::string(cur->begin(), cur->end()), nullptr, false);
+            uint64_t created = 0;
+            if (row.is_object()) created = row.value("created", (uint64_t)0);
+            if (now > created && now - created >= kDeliveryTtlMs) {
+                db_.del(k);
+                ++reaped;
+            }
+        }
+    }
+    if (reaped && debug_log_.load()) {
+        std::cout << "[rats-api] reaped " << reaped
+                  << " stale pd: delivery row(s)\n";
+    }
 }
 
 void RatsApi::record_attestation_level(const std::string& device_id,

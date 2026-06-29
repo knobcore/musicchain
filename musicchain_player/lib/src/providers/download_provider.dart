@@ -52,10 +52,17 @@ class DownloadProvider extends ChangeNotifier {
   DownloadProvider._();
   static final DownloadProvider instance = DownloadProvider._();
 
-  /// Hard ceiling on parallel downloads — small enough that one slow
-  /// swarm peer can't starve the rest by hogging the VPS relay path
-  /// (each download holds a stream_id on the full node).
-  static const int _maxConcurrent = 2;
+  /// Hard ceiling on parallel TRACK downloads. Each track itself fans out up to
+  /// `maxWorkers` (8) concurrent piece requests, so an album already runs
+  /// _maxConcurrent × 8 in-flight requests through the relay. Bumped 2→4 to
+  /// better fill the mini-node relay's burst bucket (~50 MB) and spread tracks
+  /// across mini-nodes via request()'s load-balanced failover ("more mini-nodes
+  /// ⇒ more album throughput"). Kept bounded because everything still funnels
+  /// through ONE relay link per mini-node (4×8=32 in-flight already saturates
+  /// it) and the seeding peer (often a phone) must serve every concurrent piece.
+  /// Safe to raise now that dead_route/relay_timeout fail over instead of
+  /// wedging the batch on one slow/stale peer.
+  static const int _maxConcurrent = 4;
 
   final Queue<DownloadJob> _queue   = Queue();
   final Map<String, DownloadJob> _active = {};

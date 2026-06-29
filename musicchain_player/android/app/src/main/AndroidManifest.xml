@@ -32,10 +32,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- allowBackup=false: the wallet mnemonic lives in flutter_secure_storage,
+         encrypted by a NON-exportable Android Keystore key. Android Auto-Backup
+         would copy the encrypted blob to the cloud and restore it on reinstall,
+         but the Keystore key never comes back — so the restored blob is
+         undecryptable (BadPaddingException) and used to wedge the wallet gate on
+         boot. Disabling backup keeps the encrypted blob and its key on the same
+         device, so they live and die together. The mnemonic the user wrote down
+         is the real recovery path; on-device data is intentionally ephemeral. -->
     <application
         android:label="musicchain_player"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"

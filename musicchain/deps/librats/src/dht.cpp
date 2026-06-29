@@ -381,40 +381,73 @@ size_t DhtClient::get_active_announces_count() const {
     return count;
 }
 
+// ── PRIVATE overlay bootstrap list ──────────────────────────────────────────
+// musicchain runs a private DHT overlay: it speaks the exact KRPC/DHT wire
+// protocol (camouflage — packets look like BitTorrent DHT) but must NEVER bootstrap
+// off the public mainline routers, which would join the real swarm and leak
+// announces into it. The application supplies its own bootstrap nodes (its VPS) via
+// set_bootstrap_nodes(); get_default_bootstrap_nodes() returns ONLY that list and is
+// empty until configured. Guarded by its own mutex (independent of all per-instance
+// DHT locks — it touches no instance state, so it never participates in their lock order).
+static std::mutex g_private_bootstrap_mutex;
+static std::vector<Peer> g_private_bootstrap;  // empty until set_bootstrap_nodes()
+
+void DhtClient::set_bootstrap_nodes(const std::vector<Peer>& nodes) {
+    std::lock_guard<std::mutex> lock(g_private_bootstrap_mutex);
+    g_private_bootstrap = nodes;
+    LOG_DHT_INFO("Private DHT bootstrap list set (" << g_private_bootstrap.size() << " node(s))");
+}
+
+void DhtClient::add_bootstrap_node(const std::string& host, uint16_t port) {
+    std::lock_guard<std::mutex> lock(g_private_bootstrap_mutex);
+    g_private_bootstrap.push_back({host, port});
+    LOG_DHT_INFO("Added private DHT bootstrap node " << host << ":" << port
+                 << " (" << g_private_bootstrap.size() << " total)");
+}
+
 std::vector<Peer> DhtClient::get_default_bootstrap_nodes() {
-    // Hostnames are resolved to the instance's family at send time (A for IPv4, AAAA for
-    // IPv6). dht.libtorrent.org publishes an AAAA record, giving the IPv6 network a
-    // reliable bootstrap entry point.
-    return {
-        {"router.bittorrent.com", 6881},
-        {"dht.transmissionbt.com", 6881},
-        {"router.utorrent.com", 6881},
-        {"dht.libtorrent.org", 25401},
-        {"dht.aelitis.com", 6881}
-    };
+    // PRIVATE overlay: return ONLY the application-configured nodes. Never the public
+    // mainline routers. Empty until set_bootstrap_nodes() is called. Hostnames are
+    // resolved to the instance's family at send time (A for IPv4, AAAA for IPv6).
+    std::lock_guard<std::mutex> lock(g_private_bootstrap_mutex);
+    return g_private_bootstrap;
 }
 
 void DhtClient::network_loop() {
     LOG_DHT_DEBUG("Network loop started");
-    
+
+    // How long select() blocks waiting for the first datagram of a batch. The socket is
+    // non-blocking, so this only bounds shutdown latency — it is NOT a per-packet rate
+    // limit. Previously the loop processed at most one datagram per ~10ms fixed sleep,
+    // which serialized DHT responses and stretched an announce traversal out to ~52s.
+    static constexpr int DHT_RECV_WAIT_MS = 100;
+
     while (running_) {
         Peer sender;
-        auto data = receive_udp_data(socket_, 1500, sender, -1);  // MTU size, blocking
-        
-        if (!data.empty()) {
+        // Block (with a bounded timeout) until the socket is readable, then receive the
+        // first datagram. timeout_ms == 0 on an empty queue returns immediately.
+        auto data = receive_udp_data(socket_, 1500, sender, DHT_RECV_WAIT_MS);
+
+        // Drain ALL queued datagrams this wake: keep reading non-blocking until the
+        // kernel buffer is empty (recvfrom -> EWOULDBLOCK, surfaced as empty data).
+        // Without this, bursts of get_peers/find_node replies were processed one per
+        // wake, throttling traversal. We cap the burst so a flood can't starve the
+        // shutdown check (running_ is still observed every DHT_RECV_WAIT_MS otherwise).
+        int drained = 0;
+        static constexpr int MAX_DRAIN_PER_WAKE = 256;
+        while (!data.empty()) {
             LOG_DHT_DEBUG("Received " << data.size() << " bytes from " << sender.ip << ":" << sender.port);
             handle_message(data, sender);
-        }
-        
-        // Use conditional variable for responsive shutdown
-        {
-            std::unique_lock<std::mutex> lock(shutdown_mutex_);
-            if (shutdown_cv_.wait_for(lock, std::chrono::milliseconds(10), [this] { return !running_.load(); })) {
-                break;
-            }
+
+            if (!running_) break;
+            if (++drained >= MAX_DRAIN_PER_WAKE) break;
+
+            // Non-blocking pull of the next queued datagram (timeout 0). Returns empty
+            // when the socket would block, ending the drain.
+            data = receive_udp_data(socket_, 1500, sender, 0);
         }
     }
-    
+
     LOG_DHT_DEBUG("Network loop stopped");
 }
 

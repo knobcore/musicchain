@@ -66,6 +66,15 @@ set(RATS_STATIC_LIBRARY OFF CACHE BOOL "" FORCE)
 set(RATS_VERSION_OVERRIDE "1.0.0" CACHE STRING "" FORCE)
 add_subdirectory("${LIBRATS_DIR}" librats_build)
 
+# The librats CMake target is named `rats`, whose default output is
+# `librats.so`. But the Dart FFI loads `libmc_rats.so` (see rats_client.dart
+# _loadLibrary). Without this rename the build produced librats.so while the app
+# loaded a STALE prebuilt jniLibs/libmc_rats.so — so none of the freshly-built
+# transport ever reached the device. Force the output name so the compiled
+# librats IS what gets loaded. (The musicchain root CMakeLists does the same for
+# the desktop/node builds; the player builds librats directly so must repeat it.)
+set_target_properties(rats PROPERTIES OUTPUT_NAME mc_rats)
+
 # ---- chromaprint JNI bridge ------------------------------------------
 #
 # Lets Kotlin call chromaprint_new/start/feed/finish/get_fingerprint

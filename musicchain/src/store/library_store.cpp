@@ -278,6 +278,62 @@ size_t LibraryStore::holder_count(const Hash256& ch) const {
     return it == p_->holders.end() ? 0 : static_cast<size_t>(it->second.cardinality());
 }
 
+namespace {
+// Lowercase-hex of n bytes (no 0x). Local so library_store.cpp keeps its
+// minimal dependency surface (it deliberately doesn't pull in crypto/hash.h).
+std::string to_hex_local(const uint8_t* d, size_t n) {
+    static const char* k = "0123456789abcdef";
+    std::string s; s.resize(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        s[2 * i]     = k[(d[i] >> 4) & 0xF];
+        s[2 * i + 1] = k[d[i] & 0xF];
+    }
+    return s;
+}
+// Decode a 40-char wallet hex into the 20-byte raw key used by libs/wallet
+// maps. Returns false on any malformed input (skips that wallet).
+bool wallet_hex_to_raw(const std::string& hex, std::string& out) {
+    if (hex.size() != 40) return false;
+    out.resize(20);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < 20; ++i) {
+        int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<char>((hi << 4) | lo);
+    }
+    return true;
+}
+} // namespace
+
+void LibraryStore::online_snapshot(
+        const std::unordered_set<std::string>& live_wallets,
+        std::unordered_set<std::string>& online_hashes,
+        std::unordered_map<std::string, size_t>& holder_counts) const {
+    std::lock_guard<std::mutex> lk(p_->mu);
+    // Single pass over ONLY the live wallets' forward libraries — not every
+    // song crossed with every holder. For each live wallet we walk its Roaring
+    // id set once, map id -> content_hash hex, and bump the per-hash live
+    // holder count (presence in the map also serves as the online-hash set).
+    std::string wraw;
+    for (const auto& whex : live_wallets) {
+        if (!wallet_hex_to_raw(whex, wraw)) continue;
+        auto lit = p_->libs.find(wraw);
+        if (lit == p_->libs.end()) continue;
+        for (uint32_t id : lit->second) {
+            if (id >= p_->id_to_hash.size()) continue;
+            const Hash256& h = p_->id_to_hash[id];
+            std::string hhex = to_hex_local(h.data(), h.size());
+            ++holder_counts[hhex];
+            online_hashes.insert(std::move(hhex));
+        }
+    }
+}
+
 size_t LibraryStore::wallet_count() const {
     std::lock_guard<std::mutex> lk(p_->mu);
     return p_->libs.size();

@@ -14,6 +14,11 @@ typedef RatsClient = Pointer<Void>;
 typedef _NativeCreate     = RatsClient Function(Int32);
 typedef _DartCreate       = RatsClient Function(int);
 
+// wallet-as-id: create a client with a forced 40-hex peer id (the wallet
+// address). Optional symbol — older shipped libs may not export it.
+typedef _NativeCreateWithId = RatsClient Function(Int32, Pointer<Utf8>);
+typedef _DartCreateWithId   = RatsClient Function(int, Pointer<Utf8>);
+
 typedef _NativeVoidPtr    = Void Function(RatsClient);
 typedef _DartVoidPtr      = void Function(RatsClient);
 
@@ -68,6 +73,15 @@ typedef _NativeStartDht =
     Int32 Function(RatsClient, Int32);
 typedef _DartStartDht   =
     int Function(RatsClient, int);
+
+// rats_dht_set_bootstrap(client, host, port) — point the DHT at our PRIVATE
+// bootstrap (the VPS) instead of the public mainline BitTorrent routers. The DHT
+// still speaks KRPC (so the wire looks like BitTorrent), but it only ever talks
+// to our own infrastructure. Returns rats_error_t (int).
+typedef _NativeDhtSetBootstrap =
+    Int32 Function(RatsClient, Pointer<Utf8>, Int32);
+typedef _DartDhtSetBootstrap   =
+    int Function(RatsClient, Pointer<Utf8>, int);
 
 typedef _NativeIsDht =
     Int32 Function(RatsClient);
@@ -133,6 +147,9 @@ typedef _NativeMessageCb = NativeMessageCb;
 class RatsBindings {
   RatsBindings(DynamicLibrary lib)
       : create          = lib.lookupFunction<_NativeCreate,         _DartCreate>('rats_create'),
+        createWithId    = lib.providesSymbol('rats_create_with_id')
+                            ? lib.lookupFunction<_NativeCreateWithId, _DartCreateWithId>('rats_create_with_id')
+                            : null,
         destroy         = lib.lookupFunction<_NativeVoidPtr,        _DartVoidPtr>('rats_destroy'),
         start           = lib.lookupFunction<_NativeIntPtr,         _DartIntPtr>('rats_start'),
         stop            = lib.lookupFunction<_NativeVoidPtr,        _DartVoidPtr>('rats_stop'),
@@ -151,6 +168,9 @@ class RatsBindings {
         sendBinary      = lib.lookupFunction<_NativeSendBinary,     _DartSendBinary>('rats_send_binary'),
         getValidatedPeerIds = lib.lookupFunction<_NativeGetPeerIds, _DartGetPeerIds>('rats_get_validated_peer_ids'),
         startDhtDiscovery  = lib.lookupFunction<_NativeStartDht,     _DartStartDht>('rats_start_dht_discovery'),
+        dhtSetBootstrap    = lib.providesSymbol('rats_dht_set_bootstrap')
+                               ? lib.lookupFunction<_NativeDhtSetBootstrap, _DartDhtSetBootstrap>('rats_dht_set_bootstrap')
+                               : null,
         stopDhtDiscovery   = lib.lookupFunction<_NativeVoidPtr,      _DartVoidPtr>('rats_stop_dht_discovery'),
         isDhtRunning       = lib.lookupFunction<_NativeIsDht,        _DartIsDht>('rats_is_dht_running'),
         announceForHash    = lib.lookupFunction<_NativeAnnounce,     _DartAnnounce>('rats_announce_for_hash'),
@@ -159,6 +179,7 @@ class RatsBindings {
         disconnectPeerById = lib.lookupFunction<_NativeDisconnectPeer,_DartDisconnectPeer>('rats_disconnect_peer_by_id');
 
   final _DartCreate         create;
+  final _DartCreateWithId?  createWithId;  // null if loaded lib predates wallet-as-id
   final _DartVoidPtr        destroy;
   final _DartIntPtr         start;
   final _DartVoidPtr        stop;
@@ -177,6 +198,7 @@ class RatsBindings {
   final _DartSendBinary     sendBinary;
   final _DartGetPeerIds     getValidatedPeerIds;
   final _DartStartDht       startDhtDiscovery;
+  final _DartDhtSetBootstrap? dhtSetBootstrap;
   final _DartVoidPtr        stopDhtDiscovery;
   final _DartIsDht          isDhtRunning;
   final _DartAnnounce       announceForHash;

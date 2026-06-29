@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../providers/wallet_provider.dart';
@@ -19,6 +21,44 @@ import 'rats_client.dart';
 /// The native wallet signer SHA-256s these bytes and ECDSA-signs the digest; the
 /// node rebuilds + verifies the same way.
 class PresencePublisher {
+  static Timer? _heartbeat;
+  static final math.Random _rng = math.Random();
+
+  /// Start the presence heartbeat: a SIGNED presence.hello every ~30 s so the
+  /// wallet<->peer binding stays fresh and re-establishes after the node
+  /// restarts or a relayed download blips our connection. We sign every beat
+  /// (not a sig-less keepalive) because the node trusts ONLY the signature for
+  /// discoverability -- a lighter ping would be forgeable on the public
+  /// {wallet, peer_id} tuple. The ECDSA cost is trivial at this scale. No-op
+  /// without a wallet / own peer-id / reachable node, so it's safe to start at
+  /// boot. Idempotent: a second call is ignored.
+  static void startHeartbeat() {
+    if (_heartbeat != null) return;
+    _scheduleNextBeat();
+  }
+
+  static void _scheduleNextBeat() {
+    // Base 30 s with +/-8 s jitter so a fleet of players doesn't phase-align
+    // into synchronized presence spikes at the node. Well under the node's
+    // kPresenceTtlMs (180 s), so several missed beats (e.g. a download
+    // saturating the relay) don't drop us out of other players' Discover.
+    final ms = 30000 + _rng.nextInt(16001) - 8000; // 22-38 s
+    _heartbeat = Timer(Duration(milliseconds: ms), () async {
+      try {
+        await announce();
+      } catch (_) {
+        // best effort -- next beat retries
+      }
+      if (_heartbeat != null) _scheduleNextBeat();
+    });
+  }
+
+  /// Cancel the heartbeat (used on full sign-out / teardown).
+  static void stopHeartbeat() {
+    _heartbeat?.cancel();
+    _heartbeat = null;
+  }
+
   /// Announce the active wallet's binding to its current librats peer-id. No-op
   /// without a wallet, a reachable home node, or our own peer-id yet. Wrapped in
   /// try/catch — best effort; the next reconnect retries.

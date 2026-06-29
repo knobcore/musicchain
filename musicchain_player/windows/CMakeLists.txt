@@ -120,7 +120,12 @@ install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
 # Old rats.dll / librats build is removed — see lib/src/services/rats_client.dart
 # which only ever loads `mc_rats.dll`. The legacy `native/build_win/librats_build`
 # tree is left on disk but no longer wired into the bundle.
-set(MUSICCHAIN_RELEASE_DIR "C:/Users/lain/tracker/Release/node-windows")
+# Corrected DLL source: the old node-windows staging dir shipped a musicchain.dll
+# with the LEGACY wallet API (no mc_bip39_generate_12 / mc_wallet_from_mnemonic),
+# which broke recovery-phrase generation + wallet creation. This staging dir
+# holds the build-win64 musicchain.dll (current wallet API) + the same vendored
+# ffmpeg/openssl/mc_rats DLLs.
+set(MUSICCHAIN_RELEASE_DIR "C:/Users/lain/blockchain/musicchain/player-win-dlls")
 file(GLOB MUSICCHAIN_DLLS "${MUSICCHAIN_RELEASE_DIR}/*.dll")
 # Filter out any stale rats.dll that might be lingering in the staging dir.
 list(FILTER MUSICCHAIN_DLLS EXCLUDE REGEX ".*[/\\\\]rats\\.dll$")

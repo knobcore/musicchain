@@ -6,7 +6,6 @@
 //   int         mc_bip39_validate(const char* mnemonic);
 //   mc_wallet_t mc_wallet_from_mnemonic(const char* mnemonic,
 //                                       const char* passphrase);
-//   char*       mc_wallet_get_eth_address(mc_wallet_t wallet);
 //
 // Keeping this in a separate file means a future ffigen regeneration
 // of bindings.dart doesn't clobber these or vice versa.
@@ -30,10 +29,6 @@ typedef _WalletFromTwoCharPtrsC  =
     Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _WalletFromTwoCharPtrsDart =
     Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
-typedef _CharRetFromWalletPtrC   =
-    Pointer<Utf8> Function(Pointer<Void>);
-typedef _CharRetFromWalletPtrDart =
-    Pointer<Utf8> Function(Pointer<Void>);
 
 class WalletMnemonicBindings {
   /// Generate a fresh 12-word BIP39 mnemonic. Caller frees with mc_free.
@@ -81,20 +76,6 @@ class WalletMnemonicBindings {
       calloc.free(m);
       calloc.free(p);
     }
-  }
-
-  /// 0x-prefixed EIP-55-checksummed 40-hex Ethereum / Base address.
-  /// Caller does NOT free — we handle that internally.
-  static String? walletGetEthAddress(Pointer<Void> wallet) {
-    final fn = _lookupSym<_CharRetFromWalletPtrC, _CharRetFromWalletPtrDart>(
-        'mc_wallet_get_eth_address',
-        (ptr) => ptr.asFunction<_CharRetFromWalletPtrDart>());
-    if (fn == null) return null;
-    final ptr = fn(wallet);
-    if (ptr.address == 0) return null;
-    final s = ptr.toDartString();
-    _mcFree(ptr.cast());
-    return s;
   }
 
   // ---- Internals --------------------------------------------------

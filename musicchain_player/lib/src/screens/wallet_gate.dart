@@ -44,17 +44,30 @@ class _WalletGateState extends State<WalletGate> {
     //      → home.
     //   3. Otherwise → login (user types password or re-enters
     //      mnemonic).
-    final hasSaved = await _walletService.hasSavedWallet();
-    if (!hasSaved) {
+    //
+    // Everything is wrapped so a storage/init failure can NEVER leave the gate
+    // stuck on the loading spinner. Historically an undecryptable secure-storage
+    // blob (Keystore key destroyed by uninstall, blob restored by Auto-Backup)
+    // threw BadPaddingException out of hasSavedWallet(), this future rejected,
+    // and the gate spun forever ("wheel of doom"). WalletService now swallows +
+    // purges that, but we defend here too: any error → first-launch.
+    try {
+      final hasSaved = await _walletService.hasSavedWallet();
+      if (!hasSaved) {
+        if (mounted) setState(() => _state = _GateState.firstLaunch);
+        return;
+      }
+      final auto = await _walletService.tryAutoLoad();
+      if (auto != null) {
+        if (mounted) setState(() => _state = _GateState.home);
+        return;
+      }
+      if (mounted) setState(() => _state = _GateState.login);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[wallet-gate] _decide failed ($e) — falling back to first-launch');
       if (mounted) setState(() => _state = _GateState.firstLaunch);
-      return;
     }
-    final auto = await _walletService.tryAutoLoad();
-    if (auto != null) {
-      if (mounted) setState(() => _state = _GateState.home);
-      return;
-    }
-    if (mounted) setState(() => _state = _GateState.login);
   }
 
   void _onLoggedIn() {

@@ -53,7 +53,8 @@ public:
     /// `own_api_port`    – HTTP API port (what other nodes / players will use).
     RatsLink(uint16_t listen_port,
              std::string node_id_hex,
-             uint16_t    own_api_port);
+             uint16_t    own_api_port,
+             std::string wallet_addr_hex = "");  // 40-hex wallet address -> forced librats peer id (wallet-as-id)
     ~RatsLink();
 
     bool start();
@@ -92,6 +93,7 @@ private:
     uint16_t       listen_port_;
     std::string    node_id_hex_;
     uint16_t       own_api_port_;
+    std::string    wallet_addr_hex_;   // wallet-as-id: forced librats peer id (empty = auto)
     rats_client_t  client_ = nullptr;
     std::atomic<bool> running_{false};
     mutable std::mutex pub_mu_;

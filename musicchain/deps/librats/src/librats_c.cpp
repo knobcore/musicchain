@@ -97,6 +97,21 @@ rats_client_t rats_create(int listen_port) {
     }
 }
 
+// Wallet-as-id: create a client whose librats peer id is FORCED to peer_id
+// (the 40-hex wallet address). Empty/null peer_id behaves like rats_create().
+// Pins transport identity to the wallet so it can never drift on rebuild.
+rats_client_t rats_create_with_id(int listen_port, const char* peer_id) {
+    try {
+        rats_client_wrapper* wrap = new rats_client_wrapper();
+        wrap->client = std::make_unique<RatsClient>(
+            listen_port, 10, std::string(),
+            peer_id ? std::string(peer_id) : std::string());
+        return static_cast<rats_client_t>(wrap);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 void rats_destroy(rats_client_t handle) {
     if (!handle) return;
     rats_client_wrapper* wrap = static_cast<rats_client_wrapper*>(handle);
@@ -372,9 +387,32 @@ int rats_broadcast_json(rats_client_t handle, const char* json_str) {
 }
 
 // DHT Discovery
+rats_error_t rats_dht_set_bootstrap(rats_client_t handle, const char* host, int port) {
+    if (!handle) return RATS_ERROR_INVALID_HANDLE;
+    rats_client_wrapper* wrap = static_cast<rats_client_wrapper*>(handle);
+    // host==NULL or port<=0 clears the private bootstrap list (overlay starts isolated).
+    if (!host || port <= 0) {
+        wrap->client->set_dht_bootstrap_nodes({});
+        return RATS_SUCCESS;
+    }
+    wrap->client->set_dht_bootstrap_nodes({ Peer(std::string(host), static_cast<uint16_t>(port)) });
+    return RATS_SUCCESS;
+}
+
 rats_error_t rats_start_dht_discovery(rats_client_t handle, int dht_port) {
     if (!handle) return RATS_ERROR_INVALID_HANDLE;
     rats_client_wrapper* wrap = static_cast<rats_client_wrapper*>(handle);
+    return wrap->client->start_dht_discovery(dht_port) ? RATS_SUCCESS : RATS_ERROR_OPERATION_FAILED;
+}
+
+rats_error_t rats_start_dht_discovery_bootstrap(rats_client_t handle, const char* bootstrap_host,
+                                                int bootstrap_port, int dht_port) {
+    if (!handle) return RATS_ERROR_INVALID_HANDLE;
+    rats_client_wrapper* wrap = static_cast<rats_client_wrapper*>(handle);
+    if (bootstrap_host && bootstrap_port > 0) {
+        wrap->client->set_dht_bootstrap_nodes(
+            { Peer(std::string(bootstrap_host), static_cast<uint16_t>(bootstrap_port)) });
+    }
     return wrap->client->start_dht_discovery(dht_port) ? RATS_SUCCESS : RATS_ERROR_OPERATION_FAILED;
 }
 
@@ -581,16 +619,24 @@ rats_error_t rats_send_message(rats_client_t handle, const char* peer_id,
     if (!handle || !peer_id || !message_type || !data) return RATS_ERROR_INVALID_PARAMETER;
     rats_client_wrapper* wrap = static_cast<rats_client_wrapper*>(handle);
     
+    // The void send(peer_id,type,data,callback) reports peer-not-found /
+    // handshake-not-completed / send-failed ONLY through its SendCallback, which
+    // it invokes SYNCHRONOUSLY before returning. Without capturing it this
+    // wrapper used to always return RATS_SUCCESS, so the mini-node's relay.forward
+    // could not tell a black-holed send from a delivered one -> it never evicted
+    // the dead route nor replied dead_route, and players hung until a restart
+    // (the "decapitation" wedge). Capture the result and surface a real error.
+    bool ok = false;
+    auto cb = [&ok](bool success, const std::string&) { ok = success; };
     try {
         nlohmann::json json_data = nlohmann::json::parse(data);
-        wrap->client->send(std::string(peer_id), std::string(message_type), json_data);
-        return RATS_SUCCESS;
+        wrap->client->send(std::string(peer_id), std::string(message_type), json_data, cb);
     } catch (const nlohmann::json::exception&) {
         // If not valid JSON, send as string value
         nlohmann::json string_data = std::string(data);
-        wrap->client->send(std::string(peer_id), std::string(message_type), string_data);
-        return RATS_SUCCESS;
+        wrap->client->send(std::string(peer_id), std::string(message_type), string_data, cb);
     }
+    return ok ? RATS_SUCCESS : RATS_ERROR_OPERATION_FAILED;
 }
 
 rats_error_t rats_broadcast_message(rats_client_t handle, const char* message_type, const char* data) {

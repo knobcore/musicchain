@@ -8,6 +8,23 @@ namespace librats {
 // Peer Discovery Methods
 // =========================================================================
 
+void RatsClient::set_dht_bootstrap_nodes(const std::vector<Peer>& nodes) {
+    // Private overlay: forward to the process-wide DHT bootstrap list. get_default_bootstrap_nodes()
+    // (used by start_dht_discovery below and by spider re-bootstrap) returns exactly this list.
+    DhtClient::set_bootstrap_nodes(nodes);
+}
+
+void RatsClient::add_dht_bootstrap_node(const std::string& host, uint16_t port) {
+    DhtClient::add_bootstrap_node(host, port);
+}
+
+bool RatsClient::start_dht_discovery(const std::vector<Peer>& bootstrap_nodes, int dht_port) {
+    // Configure the private bootstrap list first, then start normally. The overload
+    // exists so callers can pass the VPS host:port through in a single call.
+    DhtClient::set_bootstrap_nodes(bootstrap_nodes);
+    return start_dht_discovery(dht_port);
+}
+
 bool RatsClient::start_dht_discovery(int dht_port) {
     if (dht_client_ && dht_client_->is_running()) {
         LOG_CLIENT_WARN("DHT discovery is already running");
@@ -18,6 +35,13 @@ bool RatsClient::start_dht_discovery(int dht_port) {
                    (bind_address_.empty() ? "" : " bound to " + bind_address_));
 
     auto bootstrap_nodes = DhtClient::get_default_bootstrap_nodes();
+    if (bootstrap_nodes.empty()) {
+        // Private overlay with no configured bootstrap: the DHT still starts (and will
+        // accept nodes that contact it directly) but cannot reach out to anyone. The
+        // node/player is expected to call set_dht_bootstrap_nodes() (the VPS) first.
+        LOG_CLIENT_WARN("Starting DHT with no private bootstrap nodes configured — "
+                        "overlay will not bootstrap (set_dht_bootstrap_nodes() not called?)");
+    }
 
     // IPv4 DHT (also shared with the BitTorrent subsystem) - required.
     dht_client_ = std::make_unique<DhtClient>(dht_port, bind_address_, data_directory_, AddressFamily::IPv4);
@@ -388,8 +412,17 @@ void RatsClient::announce_rats_peer() {
 
 std::string RatsClient::get_discovery_hash() const {
     std::lock_guard<std::mutex> lock(protocol_config_mutex_);
-    // Generate discovery hash based on current protocol configuration
-    std::string discovery_string = custom_protocol_name_ + "_peer_discovery_v" + custom_protocol_version_;
+    // Generate discovery hash based on current protocol configuration.
+    //
+    // Private-overlay salt: this is the ONE info_hash librats DERIVES itself (the
+    // automatic rats-peer-discovery announce). Namespace it with a musicchain-specific
+    // constant so it lands in a region of the 160-bit key space that cannot collide
+    // with a real BitTorrent torrent's info_hash. Content hashes that the application
+    // passes in (find_peers_by_hash / announce_for_hash) are NOT salted here — that
+    // salting is the node/player's responsibility (see cross_subsystem_flags).
+    static constexpr const char* MUSICCHAIN_DHT_SALT = "musicchain/overlay/v1:";
+    std::string discovery_string = std::string(MUSICCHAIN_DHT_SALT) +
+                                   custom_protocol_name_ + "_peer_discovery_v" + custom_protocol_version_;
     return SHA1::hash(discovery_string);
 }
 

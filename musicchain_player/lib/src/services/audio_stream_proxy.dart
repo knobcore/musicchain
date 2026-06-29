@@ -31,6 +31,11 @@ class AudioStreamProxy {
   int         _nextTicket = 1;
   final Map<String, AudioStream> _pending = {};
 
+  /// The stream most recently handed to media_kit (the currently-playing
+  /// track). Tracked so a track switch can cancel it synchronously BEFORE the
+  /// next track's stream.open goes out — see [cancelCurrent].
+  AudioStream? _current;
+
   /// Idempotent. Binds a random loopback port on first call.
   Future<void> ensureStarted() async {
     if (_server != null) return;
@@ -47,9 +52,23 @@ class AudioStreamProxy {
   /// should open. The ticket is single-use: the handler pulls the stream
   /// out of `_pending` on first GET and serves it; a refresh would 404.
   String serve(AudioStream stream) {
+    _current = stream;
     final id = '${DateTime.now().millisecondsSinceEpoch}-${_nextTicket++}';
     _pending[id] = stream;
     return 'http://127.0.0.1:$_port/$id';
+  }
+
+  /// Cancel the currently-serving stream (the playing track), if any. Called at
+  /// the top of a new play so the previous track's serving peer is told to stop
+  /// pushing (AudioStream.cancel → stream.cancel RPC) BEFORE the next track's
+  /// stream.open goes out — otherwise the leaked push starves the new stream on
+  /// the single relay link (the "skip → next track hangs ~30 s" bug).
+  void cancelCurrent() {
+    final c = _current;
+    _current = null;
+    if (c != null) {
+      try { c.cancel(); } catch (_) {/* teardown must never throw */}
+    }
   }
 
   Future<void> _handle(HttpRequest req) async {

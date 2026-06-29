@@ -25,6 +25,34 @@ bool RatsClient::load_configuration() {
     
     LOG_CLIENT_INFO("Loading configuration from " << get_config_file_path());
     
+    // Wallet-as-id override: if the embedder forced a peer id (the wallet
+    // address), it is the canonical identity. Apply it unconditionally —
+    // overriding BOTH the generate-new branch and the load-from-file branch —
+    // so the librats id can never drift from the wallet across rebuilds or key
+    // reloads. Persist best-effort; never fail startup over the config file.
+    if (!forced_peer_id_.empty()) {
+        std::string fid = forced_peer_id_;
+        for (char& c : fid) { if (c >= 'A' && c <= 'F') c = static_cast<char>(c + 32); }
+        bool ok = (fid.size() == 40);
+        if (ok) {
+            for (char c : fid) {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ok = false; break; }
+            }
+        }
+        if (ok) {
+            our_peer_id_ = fid;
+            LOG_CLIENT_INFO("Using forced (wallet-derived) peer ID: " << our_peer_id_);
+            nlohmann::json config;
+            config["peer_id"]     = our_peer_id_;
+            config["version"]     = RATS_PROTOCOL_VERSION;
+            config["listen_port"] = listen_port_;
+            config["max_peers"]   = max_peers_;
+            create_file(get_config_file_path(), config.dump(4)); // best-effort
+            return true;
+        }
+        LOG_CLIENT_WARN("Forced peer ID is not 40 hex chars; using generated/persisted id");
+    }
+
     // Check if config file exists
     if (!file_or_directory_exists(get_config_file_path())) {
         LOG_CLIENT_INFO("No existing configuration found, generating new peer ID");

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace rats {
@@ -96,9 +97,22 @@ public:
     
     /* Rekey the cipher state */
     void rekey();
-    
+
     /* Clear sensitive data */
     void clear();
+
+    /*
+     * Per-cipher send-serialization lock. The transport send_cipher is shared
+     * (shared_ptr) by every code path that sends to a given peer — the io
+     * thread's relay forward, RPC replies, and the broadcast loops. Because
+     * encrypt_with_ad() mutates the nonce in place AND the resulting frames
+     * must be enqueued in nonce order, concurrent senders to one peer would
+     * otherwise race the nonce / interleave frames out of order, the receiver's
+     * AEAD would fail, and the link would be torn down. Holders lock this across
+     * BOTH encrypt and enqueue. shared_ptr<mutex> (not a bare mutex) keeps
+     * NoiseCipherState copyable/movable. Lock order: tx_mutex -> peers_mutex_.
+     */
+    std::shared_ptr<std::mutex> tx_mutex = std::make_shared<std::mutex>();
 
 private:
     uint8_t key_[NOISE_KEY_SIZE];

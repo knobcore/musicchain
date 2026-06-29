@@ -197,19 +197,46 @@ void SwarmIndex::touch_peer(const std::string& peer_id) {
     std::lock_guard<std::mutex> lk(mu_);
     auto pit = peer_to_hashes_.find(peer_id);
     if (pit == peer_to_hashes_.end()) return;
+    bool bumped = false;
     for (const auto& hash_hex : pit->second) {
         auto mit = map_.find(hash_hex);
         if (mit == map_.end()) continue;
         for (auto& m : mit->second) {
             if (m.peer_id != peer_id) continue;
+            // IN-MEMORY ONLY: no synchronous leveldb put here. touch_peer runs
+            // on every inbound RPC; persisting one record per announced hash
+            // per request was a write storm that starved the relay flush. The
+            // on-disk last_seen_ms is only consulted when the peer is OFFLINE
+            // (prune_stale skips online peers entirely), so deferring the write
+            // to flush_dirty (prune thread) loses nothing.
             m.last_seen_ms = now;
-            if (db_) {
+            bumped = true;
+        }
+    }
+    if (bumped) dirty_peers_.insert(peer_id);
+}
+
+size_t SwarmIndex::flush_dirty() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!db_ || dirty_peers_.empty()) { dirty_peers_.clear(); return 0; }
+    size_t written = 0;
+    for (const auto& peer_id : dirty_peers_) {
+        auto pit = peer_to_hashes_.find(peer_id);
+        if (pit == peer_to_hashes_.end()) continue;   // peer dropped meanwhile
+        for (const auto& hash_hex : pit->second) {
+            auto mit = map_.find(hash_hex);
+            if (mit == map_.end()) continue;
+            for (const auto& m : mit->second) {
+                if (m.peer_id != peer_id) continue;
                 const std::string ev = encode_value(m);
                 db_->put(make_key(hash_hex, peer_id),
                          std::vector<uint8_t>(ev.begin(), ev.end()));
+                ++written;
             }
         }
     }
+    dirty_peers_.clear();
+    return written;
 }
 
 size_t SwarmIndex::prune_stale() {

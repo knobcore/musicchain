@@ -61,9 +61,22 @@ public:
     void drop(const Hash256& canonical_hash, const std::string& peer_id);
 
     /// Refresh last_seen_ms for every entry this peer holds — called
-    /// on session.start / session.heartbeat / session.complete so an
-    /// actively-playing peer doesn't time out of its own swarm.
+    /// on every inbound RPC (proof-of-life). This is an IN-MEMORY-ONLY
+    /// update: it no longer does a synchronous per-announced-hash leveldb
+    /// put, because it runs on the hot inbound-RPC path and that write
+    /// amplification (one put per hash the peer holds, per request) was
+    /// starving the relay flush. The peer is flagged dirty and the
+    /// freshened last_seen_ms is persisted lazily from [flush_dirty],
+    /// called by the periodic prune thread. last_seen_ms only matters for
+    /// offline TTL pruning, so a delayed flush is harmless: an online
+    /// peer is never pruned regardless of its on-disk timestamp.
     void touch_peer(const std::string& peer_id);
+
+    /// Persist the last_seen_ms of every peer that [touch_peer] freshened
+    /// since the last flush. Cheap no-op when nothing is dirty. Called
+    /// from the periodic prune thread so the hot RPC path stays write-free.
+    /// Returns the number of entries written.
+    size_t flush_dirty();
 
     /// Walk every song and drop members whose last_seen_ms is older
     /// than [kStaleAfterMs]. Returns the number of entries pruned.
@@ -140,6 +153,9 @@ private:
     /// Reverse index for O(1) peer-wide operations (touch/drop/digest).
     /// Stores the set of canonical_hash hex strings each peer claims.
     std::unordered_map<std::string, std::unordered_set<std::string>> peer_to_hashes_;
+    /// Peers whose in-memory last_seen_ms was bumped by [touch_peer] but
+    /// not yet persisted. Drained by [flush_dirty] on the prune thread.
+    std::unordered_set<std::string> dirty_peers_;
     /// Set of peer_ids currently online via librats. Entries owned by
     /// peers NOT in this set are filtered out of members() / song_count.
     std::unordered_set<std::string> online_peers_;

@@ -17,6 +17,7 @@ import 'src/services/swarm_registry.dart';
 import 'src/services/audio_stream_proxy.dart';
 import 'src/services/library_service.dart';
 import 'src/services/library_scanner.dart';
+import 'src/services/presence_publisher.dart';
 import 'src/services/chat_service.dart';
 import 'src/services/background_scanner.dart';
 import 'src/services/wallet_service.dart';
@@ -26,6 +27,7 @@ import 'src/services/offline_play_log/sensor_capture.dart';
 import 'src/services/offline_play_log/offline_submit_service.dart';
 import 'src/screens/home_screen.dart';
 import 'src/screens/wallet_gate.dart';
+import 'src/smoke_test.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -48,8 +50,21 @@ void main() async {
     print('[library] init failed: $e');
   }
 
+  // wallet-as-id: load the wallet BEFORE rats so its librats peer id can be
+  // pinned to the wallet's chain address (stable identity across restarts).
+  // First run (no wallet yet) falls back to a generated id this session and
+  // pins to the wallet on the next launch once the wallet gate creates one.
+  String? walletAddr;
   try {
-    final rats = await RatsClient.initialize();
+    final wi = await WalletService().tryAutoLoad();
+    walletAddr = wi?.address;
+  } catch (e) {
+    // ignore: avoid_print
+    print('[wallet] pre-rats load failed: $e');
+  }
+
+  try {
+    final rats = await RatsClient.initialize(walletAddress: walletAddr);
     // ignore: avoid_print
     print('[rats] connected; own_peer_id=${rats.ownPeerId} '
           'public=${rats.publicAddress}');
@@ -109,6 +124,15 @@ void main() async {
       print('[rats] VPS reconnected — re-announcing library to full node');
       unawaited(LibraryScanner.instance.reAnnounce());
     };
+
+    // Keep the wallet<->peer presence binding alive with a periodic
+    // presence.hello. onVpsReconnected only fires on connection transitions, so
+    // a presence eviction that DIDN'T drop the VPS handshake (e.g. the node
+    // restarting, or a relayed download saturating the mini-node) would leave us
+    // bound-less — our 474 songs vanishing from every other player's Discover —
+    // until something re-triggered reAnnounce. The heartbeat rebinds within one
+    // ~25 s tick regardless. Cheap (~150 B) and a no-op until a wallet loads.
+    PresencePublisher.startHeartbeat();
   } catch (e) {
     // ignore: avoid_print
     print('[rats] init failed: $e');
@@ -127,6 +151,16 @@ void main() async {
   }
 
   runApp(const MusicChainApp());
+
+  // Headless network-stack smoke test. Compiled in; only runs with
+  // --dart-define=SMOKE_TEST=true. Scheduled post-first-frame so the provider
+  // tree (LibratsDiscovery, which populates the full-node readiness signal) has
+  // constructed before readiness polling. runSmokeTest() ends with exit(0|1).
+  if (const bool.fromEnvironment('SMOKE_TEST')) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(runSmokeTest());
+    });
+  }
 }
 
 class MusicChainApp extends StatelessWidget {

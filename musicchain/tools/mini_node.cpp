@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>   // sender-thread work queue (#6)
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -43,9 +44,12 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <functional>           // std::function tasks for the sender queue (#6)
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <queue>                // sender-thread work queue (#6)
+#include <random>               // seed new_relay_req_id from a random base (#4)
 #include <sstream>
 #include <string>
 #include <thread>
@@ -77,21 +81,47 @@ constexpr const char* kMiniHelloType = "mini.hello";
 struct PendingRelay {
     std::string originator_peer_id;
     std::string original_req_id;
-    uint64_t    created_ms;
+    uint64_t    created_ms;        // monotonic stamp (#8) for the TTL sweep
+    // (#4 reply correlation) the peer we forwarded TO. on_relay_reply requires
+    // the reply's transport sender == this before matching, so a stray reply
+    // from some other peer carrying a guessed/collided req_id can't hijack the
+    // originator's channel.
+    std::string target_peer_id;
 };
 
 std::mutex                                       g_relay_mu;
 std::unordered_map<std::string, PendingRelay>    g_pending_relays;
 // (#1 instability fix) g_pending_relays must be reaped: an entry leaks for
 // every relay.forward whose target never replies (full-node restart, dropped
-// link, fire-and-forget inner verb, player abandoning its 15s request).
-// Nothing matched it before, so a busy VPS grew it without bound → slow OOM
-// + rising g_relay_mu hash-probe cost mesh-wide. TTL is comfortably past the
-// player's 15s RPC timeout so a real in-flight reply is never dropped early.
-constexpr uint64_t kPendingRelayTtlMs = 30'000;
+// link, fire-and-forget inner verb, player abandoning its request). Nothing
+// matched it before, so a busy VPS grew it without bound → slow OOM + rising
+// g_relay_mu hash-probe cost mesh-wide.
+//
+// The TTL is intentionally tight: 9s sits just past the player's 8s stream
+// timeout (so an in-flight chunk reply is never dropped early) yet well under
+// its 15s RPC timeout, so the synthetic fail-fast `relay_timeout` reply lands
+// BEFORE the player's own timer trips. The sweep that uses it runs on a 1s
+// cadence (pending_sweep_loop), decoupled from the 30s route reaper, so the
+// reply isn't stuck behind the slower route-cleanup tick. created_ms is a
+// monotonic stamp (#8) — see the relay.forward handler.
+constexpr uint64_t kPendingRelayTtlMs = 9'000;
+// Cadence of the dedicated pending-relay sweeper. 1s keeps the fail-fast reply
+// punctual relative to kPendingRelayTtlMs without busy-spinning the CPU.
+constexpr int      kPendingSweepIntervalMs = 1'000;
+std::atomic<bool>  g_pending_sweep_running{false};
+std::thread        g_pending_sweep_thread;
 
 std::string new_relay_req_id() {
-    static std::atomic<uint64_t> counter{1};
+    // (#4) Seed from a random 64-bit base instead of 1 so req_ids minted after
+    // a restart don't collide with ids the peer mesh saw from a prior process
+    // (a reused id could let a late reply for an old forward match a brand-new
+    // pending entry). std::random_device seeds a 64-bit splitmix-style mixer
+    // once; the per-call increment keeps ids unique within this process.
+    static std::atomic<uint64_t> counter{[]() -> uint64_t {
+        std::random_device rd;
+        uint64_t hi = rd(), lo = rd();
+        return (hi << 32) ^ lo ^ 0x9E3779B97F4A7C15ULL;
+    }()};
     char buf[40];
     std::snprintf(buf, sizeof(buf), "relay-%016llx",
                   (unsigned long long)counter.fetch_add(1));
@@ -435,10 +465,25 @@ std::mutex             g_events_mu;
 std::deque<EventEntry> g_events;
 std::atomic<int>       g_peer_count{0};
 
+// Wall-clock milliseconds. ONLY for on-the-wire timestamps (route `ts`,
+// chat ts_ms, event-log display) where the value crosses process / host
+// boundaries and must be comparable against another machine's clock. NOT
+// for interval / TTL / refill math — a wall-clock step (NTP slew, manual
+// set, leap) would either expire pending relays early or stall the reaper.
 uint64_t now_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// (#8) Monotonic milliseconds since an arbitrary epoch. Used for every
+// duration comparison in this file (route TTL, pending-relay TTL, token-
+// bucket refill, delivery-idle flush, mini.hello heartbeat). steady_clock
+// never goes backwards, so these never mis-fire on a wall-clock jump.
+uint64_t mono_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 void on_signal(int) { g_running = false; }
@@ -606,7 +651,11 @@ std::string routes_json() {
            << "\"cpu_load\":"         << r.cpu_load      << ","
            << "\"net_bps\":"          << r.net_bps       << ","
            << "\"is_busy\":"          << (r.is_busy ? "true" : "false") << ","
-           << "\"last_seen_ms\":"     << r.received_at_ms
+           // received_at_ms is monotonic (#8) — not comparable to a player's
+           // wall clock. Convert the monotonic age back to a wall-clock
+           // last-seen so the on-the-wire field stays meaningful cross-host.
+           << "\"last_seen_ms\":"
+           << (now_ms() - (mono_ms() - r.received_at_ms))
            << "}";
     }
     ss << "]}";
@@ -630,7 +679,7 @@ void mark_reachability(const std::string& node_id, Reachability r) {
     auto it = g_routes.find(node_id);
     if (it == g_routes.end()) return;
     it->second.reachability             = r;
-    it->second.reachability_tested_at_ms = now_ms();
+    it->second.reachability_tested_at_ms = mono_ms(); // (#8) interval clock
     if (!g_quiet) {
         push_event("reach", it->second.node_id, reachability_str(r));
     }
@@ -643,6 +692,10 @@ void mark_reachability(const std::string& node_id, Reachability r) {
 // stays Unknown and ingest_route's staleness check re-probes it later.
 std::atomic<int> g_active_probes{0};
 constexpr int    kMaxConcurrentProbes = 8;
+// wallet-as-id: monotonic counter for per-probe throwaway librats ids (see
+// probe_reachability) so a reachability probe can never share — and thus evict —
+// the mini's wallet-derived hub identity.
+std::atomic<uint64_t> g_probe_seq{0};
 
 void probe_reachability(std::string node_id, std::string public_address) {
     if (g_active_probes.fetch_add(1) >= kMaxConcurrentProbes) {
@@ -661,7 +714,19 @@ void probe_reachability(std::string node_id, std::string public_address) {
         try { port = std::stoi(public_address.substr(colon + 1)); }
         catch (...) { return; }
 
-        rats_client_t probe = rats_create(0); // ephemeral port
+        // Distinct throwaway identity per probe so it can NEVER share the mini's
+        // wallet-derived hub id — otherwise librats would evict the hub's real
+        // connection to the node in favour of this short-lived probe socket
+        // (self-inflicted decapitation). 24 hex of our wallet namespaces it
+        // per-mini; a 16-hex monotonic counter makes it unique per probe.
+        std::ostringstream probe_tail;
+        probe_tail << std::hex << std::setw(16) << std::setfill('0')
+                   << g_probe_seq.fetch_add(1);
+        const std::string probe_id =
+            (g_wallet_address_raw.size() == 40 ? g_wallet_address_raw.substr(0, 24)
+                                               : std::string(24, '0'))
+            + probe_tail.str();
+        rats_client_t probe = rats_create_with_id(0, probe_id.c_str()); // ephemeral port, distinct id
         if (!probe) { mark_reachability(node_id, Reachability::Unknown); return; }
 
         std::atomic<bool> handshook{false};
@@ -697,6 +762,9 @@ void ingest_route(const std::string& body, const char* peer_id);
 // Mini-node mesh helpers — defined further down once g_client is in scope.
 // Declared here because ingest_route uses them to fan a freshly-received
 // route out to every other mini-node we know about.
+// (#6) ingest_route enqueues its fan-outs onto the off-io sender queue, whose
+// definition lives just below g_client — forward-declare it here.
+void enqueue_send_task(std::function<void()> task);
 void send_mini_hello(const std::string& peer_id);
 void replicate_routes_to_peer(const std::string& peer_id);
 void replicate_route_to_mininodes(const std::string& route_json,
@@ -721,7 +789,7 @@ void ingest_route(const std::string& body, const char* peer_id) {
     e.public_address = json_get_string(body, "public_address");
     e.api_port       = static_cast<int>(json_get_uint(body, "api_port"));
     e.ts             = json_get_uint(body, "ts");
-    e.received_at_ms = now_ms();
+    e.received_at_ms = mono_ms(); // (#8) drives the route TTL — monotonic
     // Load fields — present in routes from the new full-node build.
     // Parse via nlohmann::json so floats and bools work, the
     // hand-rolled json_get_string used above is string-only.
@@ -775,10 +843,14 @@ void ingest_route(const std::string& body, const char* peer_id) {
 
     // Replicate to other mini-nodes UNLESS the sender is itself a
     // mini-node — that means we got this route as a forward and
-    // re-forwarding would loop.
+    // re-forwarding would loop. (#6) The replicate fan-out runs on the
+    // sender thread so ingest (on the io thread) returns promptly.
     const std::string source = peer_id ? peer_id : "";
     if (!peer_is_mininode(source)) {
-        replicate_route_to_mininodes(body, source);
+        std::string body_copy = body, src_copy = source;
+        enqueue_send_task([body_copy, src_copy]() {
+            replicate_route_to_mininodes(body_copy, src_copy);
+        });
     }
 
     // Full node just (re)published its route to us, which means it
@@ -787,9 +859,13 @@ void ingest_route(const std::string& body, const char* peer_id) {
     // waiting up to 5 minutes for each player's next swarm.hello tick.
     // Only fires for direct sources — relayed routes (from another
     // mini-node) don't have the full node directly available to us.
+    // (#6) Replay loops over every g_players entry → off-io.
     if (!source.empty() && !peer_is_mininode(source)) {
         if (!e.rats_peer_id.empty()) {
-            replay_online_players_to_home(e.rats_peer_id);
+            std::string full_pid = e.rats_peer_id;
+            enqueue_send_task([full_pid]() {
+                replay_online_players_to_home(full_pid);
+            });
         }
     }
 }
@@ -845,10 +921,13 @@ void on_peer_disconnected(void* /*ud*/, const char* peer_id) {
         g_mininode_load.erase(peer_id);
     }
     // Drop the player record so the next route-publish from a home
-    // node doesn't replay an offline peer back as "online".
+    // node doesn't replay an offline peer back as "online". (#7) Capture
+    // whether this peer was actually a registered PLAYER — the erase return
+    // is the authoritative signal, since only player.announce inserts here.
+    bool was_player = false;
     if (peer_id && !was_mininode) {
         std::lock_guard<std::mutex> lk(g_players_mu);
-        g_players.erase(peer_id);
+        was_player = g_players.erase(peer_id) > 0;
     }
     // Drop any chat watch subscriptions this peer held so the watcher map
     // stays bounded to currently-connected players.
@@ -856,12 +935,18 @@ void on_peer_disconnected(void* /*ud*/, const char* peer_id) {
         std::lock_guard<std::mutex> lk(g_chat_watchers_mu);
         g_chat_watchers.erase(peer_id);
     }
-    // Non-mini-node disconnects need to propagate to the full nodes —
-    // they otherwise have no signal that a relayed player went offline
-    // and would keep that player's songs visible. Skip mini-node peers
-    // (the mesh handles those via direct rats reconnection and mini.hello).
-    if (peer_id && *peer_id && !was_mininode) {
-        broadcast_swarm_peer_offline(peer_id);
+    // (#7 symmetric gating) Only broadcast peer_offline for a peer we
+    // previously broadcast ONLINE — i.e. a registered player. Firing for
+    // every non-mini-node disconnect (full nodes, half-open connections,
+    // never-announced peers) sent the full nodes spurious "offline" events
+    // for peer_ids they never saw as "online", and let a transient full-node
+    // blip evict relayed players' visibility. The mesh handles mini-node
+    // churn via reconnect + mini.hello, so they're excluded too.
+    if (peer_id && *peer_id && was_player) {
+        // (#6) off-io: the broadcast loops over every validated peer; running
+        // it inline would stall the io thread mid-disconnect-callback.
+        std::string pid(peer_id);
+        enqueue_send_task([pid]() { broadcast_swarm_peer_offline(pid); });
     }
     // (#1 instability fix) Purge any pending relay forwards owned by the
     // departed originator — its reply would be black-holed anyway (the
@@ -889,6 +974,64 @@ rats_client_t g_client = nullptr;
 void send_reply(const char* peer_id, const std::string& reply_json) {
     if (!g_client || !peer_id) return;
     rats_send_message(g_client, peer_id, kReplyType, reply_json.c_str());
+}
+
+// ---- Off-io sender work queue (#6) ----------------------------------
+//
+// CRITICAL: librats runs accept + recv + decrypt + every on_* callback on a
+// SINGLE io thread. The swarm broadcasts and replicate/replay fan-outs below
+// each loop over every validated peer doing a synchronous rats_send_message;
+// run inline from on_peer_disconnected / on_relay_reply / ingest_route they
+// stall that io thread (and thus ALL peers' recv) for the whole fan-out.
+//
+// So we hand each fan-out to this single-consumer queue, drained by ONE
+// dedicated sender thread. The task is a std::function that performs the
+// actual rats_send_* loop off the io thread.
+//
+// LOCK ORDER: g_send_q_mu is a LEAF mutex — held only to push/pop the deque,
+// never while any rats_send_* call or any other g_* lock is held. The sender
+// thread takes a task, RELEASES g_send_q_mu, THEN runs the task (which may
+// take g_routes_mu / g_mininodes_mu / g_players_mu and call rats_send_*).
+// This keeps it strictly below tx_mutex -> peers_mutex_ -> io_mutex_ and the
+// data-structure mutexes; it never sits above any of them.
+std::mutex                         g_send_q_mu;
+std::condition_variable            g_send_q_cv;
+std::deque<std::function<void()>>  g_send_q;
+std::atomic<bool>                  g_sender_running{false};
+std::thread                        g_sender_thread;
+// Bound the queue so a pathological burst of disconnects can't grow it without
+// limit. Past the cap we drop the OLDEST task (the fan-outs are best-effort
+// catch-up; the swarm re-converges on the next periodic tick anyway).
+constexpr size_t kMaxSendQueue = 4096;
+
+void enqueue_send_task(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lk(g_send_q_mu);
+        if (g_send_q.size() >= kMaxSendQueue) {
+            g_send_q.pop_front();
+        }
+        g_send_q.push_back(std::move(task));
+    }
+    g_send_q_cv.notify_one();
+}
+
+void sender_loop() {
+    std::unique_lock<std::mutex> lk(g_send_q_mu);
+    while (g_sender_running.load()) {
+        g_send_q_cv.wait(lk, [] {
+            return !g_sender_running.load() || !g_send_q.empty();
+        });
+        while (!g_send_q.empty()) {
+            std::function<void()> task = std::move(g_send_q.front());
+            g_send_q.pop_front();
+            // Release the leaf lock before running the task — the task takes
+            // other g_* locks and calls rats_send_*; holding g_send_q_mu across
+            // that would invert the leaf ordering and serialize producers.
+            lk.unlock();
+            try { task(); } catch (...) { /* never let one task kill the loop */ }
+            lk.lock();
+        }
+    }
 }
 
 // ---- Mini-node mesh helpers -----------------------------------------
@@ -1452,13 +1595,16 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         }
         if (added) {
             // First time we've heard from this mini-node — kick off a
-            // route snapshot so their cache catches up to ours.
+            // route snapshot so their cache catches up to ours. (#6) route it
+            // through the sender thread instead of spawning a detached thread
+            // per join (the snapshot loops over every route → off-io).
             const std::string pid_copy = pid;
-            std::thread([pid_copy]() {
+            enqueue_send_task([pid_copy]() {
                 replicate_routes_to_peer(pid_copy);
-            }).detach();
+            });
             // And echo a mini.hello so the other side adds us too in
-            // case they connected first.
+            // case they connected first. Single send — fine inline on the
+            // io thread.
             send_mini_hello(pid);
         }
         // (#3 instability fix) g_routes.size() must be read under g_routes_mu
@@ -1879,7 +2025,9 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         // player's app comes up, without waiting for the next
         // swarm.hello tick to ripple through.
         if (first_seen) {
-            broadcast_swarm_peer_online(std::string(peer_id));
+            // (#6) off-io: fan-out to every full node runs on the sender thread.
+            std::string pid(peer_id);
+            enqueue_send_task([pid]() { broadcast_swarm_peer_online(pid); });
         }
         nlohmann::json body{{"public_address", addr},
                             {"player_count",   static_cast<uint64_t>(
@@ -2023,12 +2171,14 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
             return;
         }
 
-        // Store the mapping so we can route the eventual reply back.
+        // Store the mapping so we can route the eventual reply back. created_ms
+        // is monotonic (#8) for the TTL sweep; target is recorded so
+        // on_relay_reply can require the reply to come FROM this peer (#4).
         const std::string fresh = new_relay_req_id();
         {
             std::lock_guard<std::mutex> lk(g_relay_mu);
             g_pending_relays[fresh] = PendingRelay{
-                std::string(peer_id), req_id, now_ms()
+                std::string(peer_id), req_id, mono_ms(), target
             };
         }
         const std::string originator_pid = peer_id ? std::string(peer_id)
@@ -2064,12 +2214,20 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
         const auto fwd_rc = rats_send_message(g_client, target.c_str(),
                                               kRequestType, fwd.dump().c_str());
         if (fwd_rc != RATS_SUCCESS) {
+            // (#3 pending-entry leak) erase the pending entry we just recorded.
+            // The forward never left the box, so no reply can ever match
+            // `fresh`; leaving it would let the 1s sweep fire a spurious
+            // relay_timeout for the SAME originator we're about to answer with
+            // dead_route below (a confusing duplicate fail reply). The req_id is
+            // random-seeded now (#4) so it won't be deterministically reused
+            // either — removing it explicitly is the only safe option.
+            {
+                std::lock_guard<std::mutex> lk(g_relay_mu);
+                g_pending_relays.erase(fresh);
+            }
             // Evict every route entry whose rats_peer_id matches the
-            // unreachable target. Note: the pending relay we just
-            // recorded above will never be matched, but it'll be
-            // overwritten the next time the same fresh id is minted
-            // (counter increments) so leaving it is harmless and
-            // erasing it would race the (impossible) reply path.
+            // unreachable target so the player stops hitting the same offline
+            // node for the next TTL window.
             {
                 std::lock_guard<std::mutex> lk(g_routes_mu);
                 for (auto it = g_routes.begin(); it != g_routes.end(); ) {
@@ -2113,6 +2271,17 @@ void on_rpc_request(void* /*ud*/, const char* peer_id, const char* message_data)
 // Catches every `musicchain.reply` directed at the mini-node, checks whether
 // the req_id is one we minted while forwarding, and if so routes the reply
 // back to the original requester with the original req_id substituted in.
+
+// (#4) A reply only counts when it arrives from the peer we forwarded to.
+// An empty recorded target (shouldn't happen for relay.forward entries, but
+// be defensive so a missing field doesn't black-hole an otherwise-valid
+// reply) accepts any sender. `sender` is the transport peer_id librats handed
+// us for this reply.
+inline bool rec_target_matches(const std::string& recorded_target,
+                               const char* sender) {
+    if (recorded_target.empty()) return true;
+    return sender && recorded_target == sender;
+}
 
 void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data) {
     // librats_c.cpp strdup's both args; free at every return path.
@@ -2166,14 +2335,23 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
         std::lock_guard<std::mutex> lk(g_relay_mu);
         auto it = g_pending_relays.find(req_id);
         if (it != g_pending_relays.end()) {
-            rec = it->second;
-            g_pending_relays.erase(it);
-            matched = true;
+            // (#4 reply correlation) only accept the reply if it actually came
+            // from the peer we forwarded TO. An entry with an empty target (a
+            // mini.hello / chat / swarm broadcast minted via new_relay_req_id
+            // that happens to share the req_id space) or a reply from some other
+            // peer must NOT erase + claim this originator's channel. Leave the
+            // pending entry in place so the real target's reply can still match.
+            if (rec_target_matches(it->second.target_peer_id, peer_id)) {
+                rec = it->second;
+                g_pending_relays.erase(it);
+                matched = true;
+            }
         }
     }
     if (!matched) {
-        // Not one of our forwarded relay replies — nothing else claims
-        // this channel now that the browser gateway is gone. Drop.
+        // Not one of our forwarded relay replies (or a mismatched sender) —
+        // nothing else claims this channel now that the browser gateway is
+        // gone. Drop.
         rats_string_free(peer_id);
         rats_string_free(message_data);
         return;
@@ -2223,6 +2401,48 @@ void on_relay_reply(void* /*ud*/, const char* peer_id, const char* message_data)
 // regular binary callback — no awareness of the relay needed.
 
 constexpr uint8_t kRelayBinaryTag = 'F';
+
+// (#2 binary NACK) When we can't forward an 'F'-frame — either rats_send_binary
+// to the target failed, or the sender's rate-limit bucket is empty — we send a
+// tiny control frame straight back to the SENDER so its serving player
+// retransmits that one chunk immediately, instead of the receiver waiting out
+// its multi-second stream stall for a chunk that never arrives.
+//
+// Wire format (binary, 9 bytes):
+//   byte 0     : 'N' (relay-NACK marker, 0x4E)  — distinct from 'F'
+//   bytes 1..4 : stream_id (u32 LE)   } parsed from the FORWARDED payload's
+//   bytes 5..8 : seq       (u32 LE)   } librats chunk header (see below)
+//
+// The forwarded payload (the bytes after our 1+40+16 relay header) starts with
+// the librats audio-chunk layout: stream_id LE(4) + seq LE(4) + eof(1) + data.
+// CROSS-SUBSYSTEM: the serving player must recognise a 9-byte 'N'-tagged binary
+// frame and re-send (stream_id, seq). See the change-list note.
+constexpr uint8_t kRelayNackTag = 'N';
+
+inline uint32_t rd_u32_le(const uint8_t* p) {
+    return  (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+// Emit the NACK back to `sender_pid` for the chunk identified by the first 8
+// bytes of `fwd_payload` (stream_id + seq). `fwd_payload_size` must be >= 8 or
+// we can't name the chunk and skip (the player will fall back to its timeout).
+void send_relay_nack(const std::string& sender_pid,
+                     const uint8_t* fwd_payload, size_t fwd_payload_size) {
+    if (!g_client || sender_pid.empty() || fwd_payload_size < 8) return;
+    uint8_t nack[9];
+    nack[0] = kRelayNackTag;
+    std::memcpy(nack + 1, fwd_payload, 8); // stream_id(4) + seq(4), verbatim LE
+    rats_send_binary(g_client, sender_pid.c_str(), nack, sizeof(nack));
+    if (!g_quiet) {
+        const uint32_t sid = rd_u32_le(fwd_payload);
+        const uint32_t seq = rd_u32_le(fwd_payload + 4);
+        push_event("relay-nack", sender_pid,
+                   "sid=" + std::to_string(sid) + " seq=" + std::to_string(seq));
+    }
+}
 
 void on_relay_binary(void* /*ud*/, const char* peer_id,
                      const void* data, size_t size) {
@@ -2275,8 +2495,9 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
     // at kRelayRefillBps since last_refill_ms. Drop the frame (do NOT
     // forward) when the bucket would go negative.
     const std::string sender_pid(peer_id);
+    bool rate_limited = false;
     {
-        const uint64_t now = now_ms();
+        const uint64_t now = mono_ms(); // (#8) refill math — monotonic
         std::lock_guard<std::mutex> lk(g_relay_bucket_mu);
         auto [it, inserted] = g_relay_buckets.try_emplace(sender_pid);
         RelayBucket& bk = it->second;
@@ -2296,21 +2517,47 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
         // Charge the PAYLOAD (the bytes that actually traverse the uplink),
         // not the 1+40+16 mini-node header.
         if (bk.tokens < payload_size) {
-            if (!g_quiet) {
-                push_event("relay-drop", sender_pid, "rate_limited");
-            }
-            cleanup();
-            return;
+            rate_limited = true;
+        } else {
+            bk.tokens -= payload_size;
         }
-        bk.tokens -= payload_size;
+    }
+    // (#2 + #8) Out of tokens. We deliberately do NOT block the io thread to
+    // pace this through: librats does accept + recv + decrypt + sends on this
+    // ONE thread, so a backpressure sleep here would stall EVERY peer's recv,
+    // not just this sender (true pacing is deferred for that reason — see the
+    // change-list). Instead of a SILENT discard we NACK the sender keyed by
+    // stream_id+seq so its player retransmits that chunk; the chunk is recovered
+    // rather than lost, which is the property item #8 actually requires.
+    if (rate_limited) {
+        if (!g_quiet) {
+            push_event("relay-drop", sender_pid, "rate_limited");
+        }
+        send_relay_nack(sender_pid, b + payload_off, payload_size);
+        cleanup();
+        return;
     }
     if (!g_quiet) {
         push_event("relay-bin", std::string(target_hex),
                    std::to_string(payload_size) + " B from "
                        + std::string(peer_id).substr(0, 12));
     }
-    rats_send_binary(g_client, target_hex,
-                      b + payload_off, payload_size);
+    // (#2 binary NACK) the return code used to be ignored here — a failed
+    // forward (target gone, transient send error) left the receiver waiting out
+    // its whole stream stall for a chunk that never came. NACK the sender so its
+    // player retransmits immediately. We still fall through to the delivery
+    // accounting below ONLY on success.
+    const rats_error_t bin_rc = rats_send_binary(g_client, target_hex,
+                                                 b + payload_off, payload_size);
+    if (bin_rc != RATS_SUCCESS) {
+        if (!g_quiet) {
+            push_event("relay-bin-fail", std::string(target_hex),
+                       "rc=" + std::to_string((int)bin_rc));
+        }
+        send_relay_nack(sender_pid, b + payload_off, payload_size);
+        cleanup();
+        return;
+    }
     // #10: accumulate relayed bytes per delivery_id, keyed by its hex, with
     // the broker (= target full node) so the reaper can flush a signed
     // relay.report. delivery_id == all-zero means "no triangulation" (legacy
@@ -2329,7 +2576,7 @@ void on_relay_binary(void* /*ud*/, const char* peer_id,
             auto& a = g_delivery_accum[did_hex];
             std::memcpy(a.delivery_id.data(), delivery_id, 16);
             a.bytes        += payload_size;
-            a.last_ms       = now_ms();
+            a.last_ms       = mono_ms(); // (#8) idle-flush clock — monotonic
         }
     }
     cleanup();
@@ -2389,7 +2636,7 @@ void flush_relay_report(const DeliveryAccum& a) {
                              std::to_string(a.bytes) + "B");
 }
 
-// Wakes every kReaperIntervalMs while g_reaper_running. Four jobs:
+// Wakes every kReaperIntervalMs while g_reaper_running. Jobs:
 //   1. Expire RouteEntry records older than kRouteTtlMs so a vanished
 //      full node stops appearing in routes.get.
 //   2. Prune mini-node auxiliary tables (g_mininode_load /
@@ -2398,7 +2645,11 @@ void flush_relay_report(const DeliveryAccum& a) {
 //      rats_get_validated_peer_ids — otherwise a churn of cellular
 //      peers would let the bucket map grow unboundedly.
 //   4. (#10) Flush idle delivery accumulators as signed relay.report.
-//   5. (#1) Expire stale g_pending_relays + synthetic-timeout the originator.
+//   6. (chat) TTL-evict the moderation-action dedup set.
+//   7. (chat) refresh the cached global-moderator set.
+// NOTE: the pending-relay TTL sweep (formerly job 5) now runs on its own 1s
+// timer in pending_sweep_loop (#1) so the fail-fast reply isn't delayed by
+// this 30s cadence.
 void reaper_loop() {
     while (g_reaper_running.load()) {
         // Sleep in small slices so shutdown is responsive.
@@ -2409,7 +2660,11 @@ void reaper_loop() {
         }
         if (!g_reaper_running.load()) break;
 
-        const uint64_t now = now_ms();
+        // (#8) two clocks: mono_now drives every duration/TTL comparison;
+        // wall_now is only for the chat-mod dedup TTL whose entries are
+        // stamped from the on-the-wire now_ms() (system_clock).
+        const uint64_t mono_now = mono_ms();
+        const uint64_t wall_now = now_ms();
 
         // 1 + 2: expire stale routes, take a list of evicted node_ids
         // / rats_peer_ids so we can purge mirror tables outside the
@@ -2418,7 +2673,7 @@ void reaper_loop() {
         {
             std::lock_guard<std::mutex> lk(g_routes_mu);
             for (auto it = g_routes.begin(); it != g_routes.end(); ) {
-                if (it->second.received_at_ms + kRouteTtlMs < now) {
+                if (it->second.received_at_ms + kRouteTtlMs < mono_now) {
                     if (!it->second.rats_peer_id.empty()) {
                         evicted_peers.push_back(it->second.rats_peer_id);
                     }
@@ -2469,7 +2724,7 @@ void reaper_loop() {
 
         // 4: (#10) flush idle delivery accumulators as signed relay.report.
         {
-            const uint64_t now = now_ms();
+            const uint64_t now = mono_ms(); // (#8) idle math — monotonic
             std::vector<DeliveryAccum> ready;
             {
                 std::lock_guard<std::mutex> lk(g_delivery_mu);
@@ -2484,37 +2739,11 @@ void reaper_loop() {
             for (const auto& a : ready) flush_relay_report(a);
         }
 
-        // 5: (#1 instability fix) expire stale pending relay forwards whose
-        // target never replied, and send the originator a synthetic timeout
-        // reply so it fails fast instead of waiting out its own 15s timer.
-        {
-            struct Expired { std::string originator, orig_req; };
-            std::vector<Expired> expired;
-            {
-                std::lock_guard<std::mutex> lk(g_relay_mu);
-                for (auto it = g_pending_relays.begin();
-                     it != g_pending_relays.end(); ) {
-                    if (it->second.created_ms + kPendingRelayTtlMs < now) {
-                        expired.push_back({it->second.originator_peer_id,
-                                           it->second.original_req_id});
-                        it = g_pending_relays.erase(it);
-                    } else { ++it; }
-                }
-            }
-            for (const auto& e : expired) {
-                if (e.originator.empty() || !g_client) continue;
-                nlohmann::json err = {
-                    {"req_id", e.orig_req},
-                    {"status", "error"},
-                    {"error",  "relay_timeout"},
-                };
-                rats_send_message(g_client, e.originator.c_str(),
-                                  kReplyType, err.dump().c_str());
-            }
-            if (!expired.empty() && !g_quiet)
-                push_event("relay-expire",
-                           std::to_string(expired.size()) + " pending", "ttl");
-        }
+        // 5: (#1 instability fix) the pending-relay sweep used to live here on
+        // the 30s reaper cadence, so a synthetic timeout could arrive up to 30s
+        // late — long after the player's own 8s/15s timers gave up. It now runs
+        // on its own 1s timer (pending_sweep_loop) so the fail-fast reply beats
+        // the originator's timer. See kPendingRelayTtlMs.
 
         // 6: (chat) TTL-evict the moderation-action dedup set so a long-lived
         // mini-node doesn't accumulate every sig it ever saw. Entries older
@@ -2523,7 +2752,9 @@ void reaper_loop() {
             std::lock_guard<std::mutex> lk(g_chat_mod_seen_mu);
             for (auto it = g_chat_mod_seen.begin();
                  it != g_chat_mod_seen.end(); ) {
-                if (it->second + kChatModSeenTtlMs < now) {
+                // chat_mod_seen entries are stamped with now_ms() (wall) so
+                // compare against wall_now, not the monotonic clock.
+                if (it->second + kChatModSeenTtlMs < wall_now) {
                     it = g_chat_mod_seen.erase(it);
                 } else { ++it; }
             }
@@ -2533,6 +2764,87 @@ void reaper_loop() {
         // chat.moderate can authorize global mods, not just room creators.
         // Internally rate-limited to kChatModsTtlMs.
         chat_refresh_global_mods_if_stale();
+    }
+}
+
+// ---- Pending-relay sweeper (#1) -------------------------------------
+//
+// Decoupled from the 30s reaper so the synthetic fail-fast reply arrives
+// before the player's own timer. Runs every kPendingSweepIntervalMs, expires
+// entries older than kPendingRelayTtlMs (monotonic, #8), and sends each
+// stranded originator a `relay_timeout` reply on the original req_id so it
+// retries against another full node instead of stalling.
+void pending_sweep_loop() {
+    while (g_pending_sweep_running.load()) {
+        for (int slept = 0;
+             slept < kPendingSweepIntervalMs && g_pending_sweep_running.load();
+             slept += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!g_pending_sweep_running.load()) break;
+
+        const uint64_t now = mono_ms();
+        struct Expired { std::string originator, orig_req; };
+        std::vector<Expired> expired;
+        {
+            std::lock_guard<std::mutex> lk(g_relay_mu);
+            for (auto it = g_pending_relays.begin();
+                 it != g_pending_relays.end(); ) {
+                if (it->second.created_ms + kPendingRelayTtlMs < now) {
+                    expired.push_back({it->second.originator_peer_id,
+                                       it->second.original_req_id});
+                    it = g_pending_relays.erase(it);
+                } else { ++it; }
+            }
+        }
+        for (const auto& e : expired) {
+            if (e.originator.empty() || !g_client) continue;
+            nlohmann::json err = {
+                {"req_id", e.orig_req},
+                {"status", "error"},
+                {"error",  "relay_timeout"},
+            };
+            rats_send_message(g_client, e.originator.c_str(),
+                              kReplyType, err.dump().c_str());
+        }
+        if (!expired.empty() && !g_quiet)
+            push_event("relay-expire",
+                       std::to_string(expired.size()) + " pending", "ttl");
+    }
+}
+
+// ---- mini.hello heartbeat (#5) --------------------------------------
+//
+// Load-based VPS selection used to freeze at connect time: g_mininode_load was
+// only refreshed when send_mini_hello's reply first arrived. This tick re-sends
+// mini.hello to every current mini-node peer every kMiniHelloHeartbeatMs so the
+// peer re-reports its load_score and our table tracks real-time load.
+constexpr int      kMiniHelloHeartbeatMs = 45 * 1000; // 45s (in 30-60s window)
+std::atomic<bool>  g_heartbeat_running{false};
+std::thread        g_heartbeat_thread;
+
+void mini_hello_heartbeat_loop() {
+    while (g_heartbeat_running.load()) {
+        for (int slept = 0;
+             slept < kMiniHelloHeartbeatMs && g_heartbeat_running.load();
+             slept += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!g_heartbeat_running.load()) break;
+
+        // Snapshot the peer set under the lock, then send outside it — a single
+        // mini.hello per peer is cheap, but we still keep the sends off the lock
+        // to avoid holding g_mininodes_mu across rats_send_message.
+        std::vector<std::string> peers;
+        {
+            std::lock_guard<std::mutex> lk(g_mininodes_mu);
+            peers.reserve(g_mininode_peers.size());
+            for (const auto& p : g_mininode_peers) peers.push_back(p);
+        }
+        for (const auto& p : peers) send_mini_hello(p);
+        if (!peers.empty() && !g_quiet)
+            push_event("mini-hello-hb",
+                       std::to_string(peers.size()) + " peers", "refresh");
     }
 }
 
@@ -2718,7 +3030,16 @@ int main(int argc, char** argv) {
     rats_set_console_logging_enabled(g_quiet ? 1 : 0);
     rats_set_log_level(g_quiet ? "INFO" : "WARN");
 
-    rats_client_t client = rats_create(rats_port);
+    // wallet-as-id: pin the hub's librats peer id to the mini's 20-byte wallet
+    // address (lowercase 40-hex) so the relay identity never drifts on rebuild.
+    // An unpinned relay id makes the whole swarm unreachable, so fail fast.
+    if (g_wallet_address_raw.size() != 40) {
+        std::cerr << "[mini-node] FATAL: wallet address is not 40 hex ('"
+                  << g_wallet_address_raw
+                  << "'); refusing to start with an unpinned relay identity\n";
+        return 2;
+    }
+    rats_client_t client = rats_create_with_id(rats_port, g_wallet_address_raw.c_str());
     if (!client) {
         std::cerr << "[mini-node] rats_create failed on port " << rats_port << "\n";
         return 2;
@@ -2777,6 +3098,22 @@ int main(int argc, char** argv) {
     // shutdown below.
     g_reaper_running.store(true);
     g_reaper_thread = std::thread(reaper_loop);
+
+    // (#6) Single-consumer sender thread that drains the off-io fan-out work
+    // queue (swarm broadcasts, route replication, player replay). Keeps those
+    // multi-send loops off the librats io thread. Joined on shutdown below.
+    g_sender_running.store(true);
+    g_sender_thread = std::thread(sender_loop);
+
+    // (#1) Dedicated 1s pending-relay sweeper — fails stranded relay forwards
+    // fast (before the player's own timer) instead of waiting on the 30s reaper.
+    g_pending_sweep_running.store(true);
+    g_pending_sweep_thread = std::thread(pending_sweep_loop);
+
+    // (#5) mini.hello heartbeat so g_mininode_load tracks real-time peer load
+    // for load-based VPS selection instead of freezing at connect time.
+    g_heartbeat_running.store(true);
+    g_heartbeat_thread = std::thread(mini_hello_heartbeat_loop);
 
     rats_start_automatic_peer_discovery(client);
 
@@ -2854,10 +3191,21 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[mini-node] shutting down...\n";
-    // Stop + join the reaper before tearing down librats so it can't
-    // call rats_get_validated_peer_ids on a destroyed client.
+    // Stop + join every background thread before tearing down librats so none
+    // can call rats_* on a destroyed client. Order doesn't matter for safety
+    // (each only touches its own state + rats_send_*), but stop the sender last
+    // so any final fan-outs enqueued by the others can still drain.
     g_reaper_running.store(false);
     if (g_reaper_thread.joinable()) g_reaper_thread.join();
+    g_pending_sweep_running.store(false);
+    if (g_pending_sweep_thread.joinable()) g_pending_sweep_thread.join();
+    g_heartbeat_running.store(false);
+    if (g_heartbeat_thread.joinable()) g_heartbeat_thread.join();
+    // Sender thread waits on a condvar — clear the flag THEN notify so it wakes,
+    // observes !running, and exits.
+    g_sender_running.store(false);
+    g_send_q_cv.notify_all();
+    if (g_sender_thread.joinable()) g_sender_thread.join();
     rats_stop_automatic_peer_discovery(client);
     rats_stop(client);
     rats_destroy(client);

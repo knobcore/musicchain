@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'library_scanner.dart';
 import 'node_service.dart';
 import 'rats_client.dart';
 
@@ -51,6 +52,13 @@ class LibratsDiscovery extends ChangeNotifier {
   bool    isRefreshing    = false;
   String  vpsStatus       = '';
 
+  /// True after the user taps "go offline" (disconnect()), false again once
+  /// they tap Connect (forceReconnect()). Honored at the top of refresh() so a
+  /// periodic tick already in flight — or the 20 s timer if it somehow
+  /// survives — can't repopulate routes and silently drag the player back
+  /// online after a deliberate disconnect.
+  bool    _disconnected   = false;
+
   Timer? _timer;
 
   void _startPeriodicRefresh() {
@@ -77,7 +85,11 @@ class LibratsDiscovery extends ChangeNotifier {
   /// returns small data.
   Future<void> _bidirectionalProbe() async {
     final rats = RatsClient.instance;
-    final mini = rats.firstMiniNodePeerId;
+    // Probe the ACTIVE relay (the load-aware best mini-node) — that's the one
+    // whose return-path NAT mapping actually carries our relay.forward traffic
+    // and must be kept warm. firstMiniNodePeerId could name a different,
+    // idle mini-node whose mapping we don't depend on.
+    final mini = rats.bestMiniNodePeerId ?? rats.firstMiniNodePeerId;
     if (mini == null) return;
     try {
       await rats.request(mini, 'mini.ping', const {},
@@ -105,6 +117,10 @@ class LibratsDiscovery extends ChangeNotifier {
   }
 
   Future<void> refresh() async {
+    // Honor a deliberate disconnect: a tick already queued before the user
+    // went offline (or the periodic timer racing disconnect()) must not
+    // repopulate routes / re-select a node behind their back.
+    if (_disconnected) return;
     if (isRefreshing) return;
     isRefreshing = true;
     lastError    = '';
@@ -123,7 +139,11 @@ class LibratsDiscovery extends ChangeNotifier {
       routes
         ..clear()
         ..addEntries(list
-            .where((m) => (m['node_id'] as String? ?? '').isNotEmpty)
+            .where((m) => (m['node_id'] as String? ?? '').isNotEmpty
+                // Dead-node GC: drop nodes the relay reported unreachable so a
+                // corpse can't be re-selected; it returns when it comes back.
+                && !RatsClient.instance
+                    .isPeerDead(m['rats_peer_id'] as String? ?? ''))
             .map((m) => MapEntry(m['node_id'] as String, m)));
 
       // Wire reachability into RatsClient's relay map. Nodes the mini-
@@ -202,7 +222,44 @@ class LibratsDiscovery extends ChangeNotifier {
           return ((b['last_seen_ms'] as int? ?? 0))
               .compareTo(a['last_seen_ms'] as int? ?? 0);
         });
-        final pick = candidates.first;
+        var pick = candidates.first;
+
+        // Auto-node hysteresis. Flapping between two near-equal full nodes
+        // every 20 s tears down + rebuilds direct connections and re-fires
+        // onAutoNodeChanged (→ a full library re-announce) for no benefit.
+        // Keep the current incumbent UNLESS a challenger beats it by a real
+        // margin (>25% lower score) AND the incumbent is stale (not seen in
+        // >120 s) or unreachable (missing from this route set). A challenger
+        // that's only marginally better — or an incumbent that's still fresh —
+        // does NOT win, so the selection stays sticky.
+        final incumbentId = autoSelectedRatsPeerId;
+        if (incumbentId.isNotEmpty &&
+            (pick['rats_peer_id'] as String? ?? '') != incumbentId) {
+          Map<String, dynamic>? incumbent;
+          for (final m in candidates) {
+            if ((m['rats_peer_id'] as String? ?? '') == incumbentId) {
+              incumbent = m;
+              break;
+            }
+          }
+          if (incumbent != null) {
+            final incScore = scoreOf(incumbent);
+            final pickScore = scoreOf(pick);
+            final incSeenMs = (incumbent['last_seen_ms'] as int? ?? 0);
+            final incAgeMs  =
+                DateTime.now().millisecondsSinceEpoch - incSeenMs;
+            final incStale  = incAgeMs > 120000;
+            // Beats-by-margin: challenger score is <75% of incumbent's.
+            final beatsByMargin = pickScore < incScore * 0.75;
+            if (!(beatsByMargin && incStale)) {
+              // Incumbent holds: still reachable and either fresh or the
+              // challenger isn't decisively better.
+              pick = incumbent;
+            }
+          }
+          // incumbent == null → it dropped out of the route set entirely
+          // (unreachable); fall through and let the challenger win.
+        }
         autoSelectedRatsPeerId   = pick['rats_peer_id'] as String? ?? '';
         autoSelectedUrl          = pick['api_url']      as String? ?? '';
         // Surface the chosen node's reachability so UI can show "via tunnel"
@@ -227,82 +284,16 @@ class LibratsDiscovery extends ChangeNotifier {
           try { onAutoNodeChanged?.call(autoSelectedRatsPeerId); } catch (_) {}
         }
 
-        // Open a direct librats peer connection to the home node so
-        // its peer id ends up in validatedPeerIds — without this, the
-        // routing layer in RatsClient.request never picks a direct
-        // path and every RPC tunnels through the VPS (or, when the
-        // mini-node tagged the home node `direct`, the relay fallback
-        // is suppressed and the send lands on an empty peer table and
-        // times out silently). public_address is the host:port the
-        // mini-node's STUN probe observed for the home node — that's
-        // our reachability hint. librats.connect is async and
-        // dedupes, so re-dialing on every 20 s refresh is cheap and
-        // recovers from a home-node restart that rebinds an
-        // ephemeral port.
-        if (pickPub.isNotEmpty) {
-          final colon = pickPub.indexOf(':');
-          if (colon > 0) {
-            final host = pickPub.substring(0, colon);
-            final port = int.tryParse(pickPub.substring(colon + 1));
-            if (port != null && port > 0) {
-              final rc = rats.connect(host, port);
-              if (identityChanged) {
-                debugPrint('[discovery] rats.connect($host:$port) rc=$rc '
-                           'peers=${rats.peerCount}');
-                Timer(const Duration(seconds: 5), () {
-                  debugPrint('[discovery] post-connect '
-                             'peers=${rats.peerCount} '
-                             'validated=${rats.validatedPeerIds.length}');
-                });
-              }
-            }
-          }
-        }
-
-        // Direct-when-reachable carve-out. If routes.get told the mini-
-        // node WE are 'direct' (port-forwarded desktop, open egress), we
-        // can talk peer-to-peer regardless of what the mini-node
-        // labelled the picked full node. Cellular players hit symmetric
-        // NAT and this connect either fails fast or is deduped silently
-        // by librats — there's no harm in trying. On desktop with an
-        // open port this unlocks direct P2P even when the mini-node
-        // (conservatively) tagged the picked node 'relay' because its
-        // own probe couldn't traverse our NAT.
-        final ourPid = rats.ownPeerId;
-        Map<String, dynamic>? ourRoute;
-        if (ourPid.isNotEmpty) {
-          ourRoute = routes.values.firstWhere(
-              (m) => (m['rats_peer_id'] as String? ?? '') == ourPid,
-              orElse: () => const <String, dynamic>{});
-        }
-        final ourReach = (ourRoute?['reachability'] as String? ?? '');
-        if (ourReach == 'direct' &&
-            autoSelectedReachability == 'relay' &&
-            pickPub.isNotEmpty) {
-          final colon = pickPub.indexOf(':');
-          if (colon > 0) {
-            final host = pickPub.substring(0, colon);
-            final port = int.tryParse(pickPub.substring(colon + 1));
-            if (port != null && port > 0) {
-              rats.connect(host, port);
-              // Wait up to 3 s for the dial to land in validatedPeerIds.
-              // If it does, suppress the relay so subsequent RPCs go
-              // direct; otherwise leave the relay mapping the
-              // setRelayVia loop above installed.
-              final pickedPid = autoSelectedRatsPeerId;
-              for (int i = 0; i < 12; ++i) {
-                await Future.delayed(const Duration(milliseconds: 250));
-                if (rats.validatedPeerIds.contains(pickedPid)) {
-                  rats.setRelayVia(pickedPid, null);
-                  autoSelectedReachability = 'direct';
-                  debugPrint('[discovery] direct-when-reachable carve-out '
-                             'succeeded for $pickedPid via $host:$port');
-                  break;
-                }
-              }
-            }
-          }
-        }
+        // NO DIRECT CONNECTS. We used to dial the home node directly here (plus
+        // a "direct-when-reachable" carve-out) so its peer id landed in
+        // validatedPeerIds and request() could pick a direct path. That is gone:
+        // request() now relays EVERY non-mini-node peer — the home node
+        // included — through the least-busy mini-node, with failover, because
+        // mini-nodes are rewarded for forwarding and direct links proved flaky
+        // (half-open NAT/IPv6 sockets that the keepalive flapped, stranding
+        // transfers). Dialing the home node here only created an idle socket
+        // that flapped every ~20 s refresh. The mini-node mesh routes our
+        // relay.forward frames to the home node, so there is nothing to dial.
 
         // Save peer ids for offline restart (mirrors old DHT cache).
         final prefs = await SharedPreferences.getInstance();
@@ -338,6 +329,12 @@ class LibratsDiscovery extends ChangeNotifier {
   /// do NOT immediately re-dial the VPS — the user explicitly asked to
   /// stop talking to peers. The next tap on Connect re-dials.
   Future<void> disconnect() async {
+    // Flip the flag + kill the periodic timer FIRST so neither the 20 s tick
+    // nor an in-flight refresh() can repopulate routes after we clear them.
+    _disconnected = true;
+    _timer?.cancel();
+    _timer = null;
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auto_node_url');
     await prefs.remove('auto_rats_peer_id');
@@ -353,6 +350,14 @@ class LibratsDiscovery extends ChangeNotifier {
   }
 
   Future<void> forceReconnect() async {
+    // User tapped Connect — undo a prior deliberate disconnect so refresh()
+    // runs again, and restart the periodic timer disconnect() cancelled.
+    _disconnected = false;
+    _timer ??= Timer.periodic(const Duration(seconds: 20), (_) {
+      refresh();
+      _bidirectionalProbe();
+    });
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auto_node_url');
     await prefs.remove('auto_rats_peer_id');
@@ -375,6 +380,14 @@ class LibratsDiscovery extends ChangeNotifier {
       await Future.delayed(const Duration(milliseconds: 250));
     }
     await refresh();
+
+    // User explicitly tapped Connect — (re)declare our wallet<->peer presence
+    // binding and re-publish the library so we're discoverable immediately.
+    // The node may have restarted (clearing its in-memory presence map) or
+    // evicted us when a relayed download saturated the mini-node; this rebinds
+    // without waiting for the periodic heartbeat. reAnnounce() fires
+    // presence.hello first, then the digest-gated library.delta + playlists.
+    unawaited(LibraryScanner.instance.reAnnounce());
   }
 
   @override

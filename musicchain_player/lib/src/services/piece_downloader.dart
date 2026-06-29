@@ -6,9 +6,12 @@
 //   * looks up peer sources via SwarmRegistry (DHT first, full-node fallback);
 //   * keeps a persistent piece bitmap on disk so process restart / crash
 //     resumes from the last verified byte;
-//   * runs N parallel workers — each pinned to a different peer — that
-//     pick the next missing piece, request a 256 KB byte range via
-//     `audio.piece_get`, and write it directly into the partial file;
+//   * runs N parallel workers that each claim the next missing piece and a
+//     peer (round-robin), request a 256 KB byte range via `audio.piece_get`,
+//     and write it directly into the partial file. Workers SHARE a peer when
+//     there are fewer peers than workers, so a single-peer download (e.g. one
+//     relayed through the mini-node) still keeps many piece requests in flight
+//     instead of fetching them serially round-trip-by-round-trip;
 //   * swaps peers if a piece times out and re-queries DHT when the live
 //     candidate list goes empty;
 //   * verifies the assembled file's SHA-256 against the chain-block
@@ -47,7 +50,11 @@ class PieceDownloaderConfig {
   /// blocking a single piece only stalls ~3 MB/s for the duration.
   final int pieceSize;
 
-  /// Max concurrent workers, each pinned to a distinct peer source.
+  /// Max concurrent piece-fetch workers. Workers round-robin over the peer
+  /// pool and SHARE a peer when there are fewer peers than workers, so this is
+  /// also the in-flight piece depth against a single (e.g. relayed) peer — the
+  /// difference between latency-bound serial fetching (~15 KB/s over the VPS
+  /// relay) and overlapping round-trips that saturate the available bandwidth.
   final int maxWorkers;
 
   /// Per-piece RPC timeout. A slow peer blowing this is treated as a
@@ -55,16 +62,22 @@ class PieceDownloaderConfig {
   /// it up.
   final Duration pieceTimeout;
 
-  /// Max number of times we ask a single peer to serve a piece before
-  /// banning it for this download. Higher than 1 because transient
-  /// hiccups on a fast peer are still cheaper than swapping.
+  /// Cumulative piece errors from one peer before it's banned for this
+  /// download. Kept generous because with many in-flight workers sharing a
+  /// single relayed peer, a brief relay hiccup can rack up several stalls at
+  /// once — banning the sole source on 2-3 of those would fail an otherwise
+  /// recoverable download.
   final int perPeerRetryCap;
 
   const PieceDownloaderConfig({
     this.pieceSize        = 256 * 1024,
-    this.maxWorkers       = 4,
+    // Raised 8 -> 16 so a LONE track can fill the adaptive congestion window
+    // (_cwnd) and saturate a higher bandwidth-delay link instead of leaving the
+    // pipe half-empty at 8 in-flight. The GLOBAL _cwnd still caps total
+    // in-flight across all tracks, so this is per-track headroom, not 16x load.
+    this.maxWorkers       = 16,
     this.pieceTimeout     = const Duration(seconds: 15),
-    this.perPeerRetryCap  = 3,
+    this.perPeerRetryCap  = 8,
   });
 }
 
@@ -148,6 +161,14 @@ class PieceDownloader {
   final List<PeerSource>  _sources       = [];
   final Map<String, int>  _perPeerErrors = {};
   final Set<String>       _bannedPeers   = {};
+  // (#8) Transient cooldown for stalled peers. A protocol violation is a hard
+  // ban (the peer sent garbage); a stall is transient (relay hiccup, slow
+  // pipe) and must NOT permanently ban the sole relayed source — that would
+  // strand an otherwise-recoverable download. Instead the peer is parked here
+  // until `cooldownUntil`, then becomes eligible again. _nextSource skips a
+  // peer whose cooldown is still active but does NOT treat it as banned.
+  final Map<String, DateTime> _cooldownUntil = {};
+  static const Duration _kStallCooldown = Duration(seconds: 5);
   // (DHT un-nerf P0b) DHT-source dialing: address → resolved librats peer_id,
   // and addresses that never validated (don't redial them every piece).
   final Map<String, String> _dhtResolved = {};
@@ -173,11 +194,30 @@ class PieceDownloader {
 
       // 2. Seed source pool: caller-provided + DHT.
       _sources.addAll(extraSources);
-      try {
-        final dhtSources =
-            await SwarmRegistry.instance.findSources(contentHash);
-        _mergeIntoSources(dhtSources);
-      } catch (_) { /* DHT down — continue with seeded sources */ }
+      if (extraSources.isNotEmpty) {
+        // We already have at least one full-node-swarm seed — don't pay the
+        // multi-second DHT round-trip on the critical path. Kick findSources
+        // off in the BACKGROUND to top up the pool with DHT seeders as they
+        // reply (_mergeIntoSources de-dups against what we already have) and
+        // start the workers immediately on the seeded peer(s). The worker
+        // loop also re-queries the DHT on its own when the live pool empties,
+        // so a background top-up that lands late is still useful.
+        unawaited(() async {
+          try {
+            final dhtSources =
+                await SwarmRegistry.instance.findSources(contentHash);
+            _mergeIntoSources(dhtSources);
+          } catch (_) { /* DHT down — seeded peers carry the download */ }
+        }());
+      } else {
+        // No seeds at all — the DHT IS the source list, so we must wait for it
+        // before we have anything to download from.
+        try {
+          final dhtSources =
+              await SwarmRegistry.instance.findSources(contentHash);
+          _mergeIntoSources(dhtSources);
+        } catch (_) { /* DHT down — _sources stays empty → NoPeer below */ }
+      }
 
       if (_sources.isEmpty) {
         throw NoPeerAvailableException(contentHash);
@@ -237,8 +277,13 @@ class PieceDownloader {
       //    every remaining pieceTimeout. Errors are absorbed inside the
       //    worker loop; Future.wait never sees them so eagerError stays
       //    false.
+      // Decoupled from the source count: with a single peer (e.g. a relayed
+      // download through the mini-node) we still want maxWorkers piece requests
+      // in flight sharing that one peer, not one serial worker paying the full
+      // relay round-trip per piece. Capped at the piece count so a tiny file
+      // doesn't spin up idle workers.
       final workerCount =
-          math.min(config.maxWorkers, math.max(1, _sources.length));
+          math.min(config.maxWorkers, math.max(1, _numPieces));
       final workers = <Future<void>>[
         for (int i = 0; i < workerCount; ++i) _worker(),
       ];
@@ -292,15 +337,30 @@ class PieceDownloader {
       final source = _nextSource();
       if (source == null) {
         _releasePiece(piece);
-        // Refill from DHT once before bailing.
-        try {
-          final fresh = await SwarmRegistry.instance.findSources(contentHash);
-          _mergeIntoSources(fresh);
-        } catch (_) {}
-        if (_sources.where((s) => !_bannedPeers.contains(_keyFor(s))).isEmpty) {
-          _failTerminal(NoPeerAvailableException(contentHash));
-          return;
+        // (#8) Distinguish "all sources permanently banned" (fail) from "the
+        // only sources left are mid-cooldown" (wait — they'll come back). A
+        // cooled-down peer is NOT in _bannedPeers, so the ban check below sees
+        // it as still-usable and we DON'T fail terminal; instead we back off
+        // briefly and retry once the stall cooldown elapses.
+        final unbanned =
+            _sources.where((s) => !_bannedPeers.contains(_keyFor(s)));
+        if (unbanned.isEmpty) {
+          // Refill from DHT once before bailing.
+          try {
+            final fresh = await SwarmRegistry.instance.findSources(contentHash);
+            _mergeIntoSources(fresh);
+          } catch (_) {}
+          if (_sources.where((s) => !_bannedPeers.contains(_keyFor(s)))
+              .isEmpty) {
+            _failTerminal(NoPeerAvailableException(contentHash));
+            return;
+          }
+          continue;
         }
+        // Some source exists but is cooling down — wait out the cooldown
+        // rather than hammering _nextSource / the DHT in a tight loop.
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (_terminalError != null) return;
         continue;
       }
 
@@ -362,28 +422,55 @@ class PieceDownloader {
   int _rrCursor = 0;
   PeerSource? _nextSource() {
     if (_sources.isEmpty) return null;
+    final now = DateTime.now();
     for (int n = 0; n < _sources.length; ++n) {
       final i = (_rrCursor + n) % _sources.length;
       final s = _sources[i];
-      if (_bannedPeers.contains(_keyFor(s))) continue;
+      final k = _keyFor(s);
+      if (_bannedPeers.contains(k)) continue;
+      // (#8) Skip a peer still inside its stall cooldown, but DON'T treat it
+      // as banned — once the window elapses it's eligible again.
+      final cd = _cooldownUntil[k];
+      if (cd != null) {
+        if (now.isBefore(cd)) continue;
+        _cooldownUntil.remove(k);   // cooldown elapsed — usable again
+      }
       _rrCursor = (i + 1) % _sources.length;
       return s;
     }
     return null;
   }
 
+  /// (#8) Record a STALL (transient) error against [source]. Distinct from a
+  /// protocol violation, which bans directly via `_bannedPeers.add`. A stall
+  /// burst should never permanently ban the SOLE relayed source — that fails
+  /// an otherwise-recoverable download. So: ban only when OTHER usable sources
+  /// remain; if this is the last one, park it on a short cooldown and reset
+  /// its error count so it retries after the relay hiccup clears.
   void _markPeerError(PeerSource source) {
     final k = _keyFor(source);
     final cnt = (_perPeerErrors[k] ?? 0) + 1;
     _perPeerErrors[k] = cnt;
-    if (cnt >= config.perPeerRetryCap) {
-      _bannedPeers.add(k);
-      // Evict from _sources so the round-robin walker doesn't keep
-      // re-encountering dead peers — saves O(N) skipped sources per
-      // tick once a peer is dead.
-      _sources.removeWhere((s) => _keyFor(s) == k);
-      if (_rrCursor >= _sources.length) _rrCursor = 0;
+    if (cnt < config.perPeerRetryCap) return;
+
+    // Would banning this peer leave us with no usable source at all?
+    final otherUsable = _sources.any((s) {
+      final ok = _keyFor(s);
+      return ok != k && !_bannedPeers.contains(ok);
+    });
+    if (!otherUsable) {
+      // Sole source on a stall burst — cooldown instead of hard ban so the
+      // download can resume once the transient condition clears.
+      _cooldownUntil[k] = DateTime.now().add(_kStallCooldown);
+      _perPeerErrors[k] = 0;   // give it a fresh budget after the cooldown
+      return;
     }
+    _bannedPeers.add(k);
+    // Evict from _sources so the round-robin walker doesn't keep
+    // re-encountering dead peers — saves O(N) skipped sources per
+    // tick once a peer is dead.
+    _sources.removeWhere((s) => _keyFor(s) == k);
+    if (_rrCursor >= _sources.length) _rrCursor = 0;
   }
 
   String _keyFor(PeerSource s) =>
@@ -400,6 +487,44 @@ class PieceDownloader {
   }
 
   // ---- Per-piece RPC --------------------------------------------------
+
+  // ---- Adaptive relay congestion window (audit #1 + #4) --------------------
+  // This is NOT a throughput limit. Throughput is set by the relay link's rate,
+  // not by how many audio.piece_get are outstanding — extra in-flight requests
+  // don't transfer faster, they just pile into the relay's FIFO and overrun it,
+  // timing out the tail AND every control RPC stuck behind it (the congestion
+  // collapse behind "download messes up the connection" / bidirectional
+  // timeouts). So we run a TCP-style congestion window over in-flight pieces
+  // (shared across ALL downloads): GROW it to keep the relay pipe saturated for
+  // MAX throughput, and only back off when the relay actually signals congestion
+  // (a timeout). A 100 MB transfer then rides the link at full speed and never
+  // collapses, because it stops just short of overrunning. The window's ceiling
+  // scales with mini-node count, so adding mini-nodes raises aggregate
+  // throughput rather than just deepening one queue.
+  static double _cwnd = 12.0;            // congestion window (pieces in flight)
+  static const double _cwndMin = 4.0;
+  static int _relayInFlight = 0;
+  static final List<Completer<void>> _relayWaiters = <Completer<void>>[];
+  static double _cwndMax() =>
+      (RatsClient.instance.knownMiniNodes.length.clamp(1, 16) * 24).toDouble();
+  static void _cwndOnSuccess() {  // additive increase (~+1 per window of acks)
+    _cwnd = (_cwnd + 1.0 / _cwnd).clamp(_cwndMin, _cwndMax());
+  }
+  static void _cwndOnCongestion() {  // multiplicative decrease
+    _cwnd = (_cwnd / 2).clamp(_cwndMin, _cwndMax());
+  }
+  static Future<void> _acquireRelaySlot() async {
+    while (_relayInFlight >= _cwnd.floor()) {
+      final c = Completer<void>();
+      _relayWaiters.add(c);
+      await c.future;
+    }
+    _relayInFlight++;
+  }
+  static void _releaseRelaySlot() {
+    if (_relayInFlight > 0) _relayInFlight--;
+    if (_relayWaiters.isNotEmpty) _relayWaiters.removeAt(0).complete();
+  }
 
   Future<_PieceReply> _fetchPiece(
       PeerSource source, int offset, int length) async {
@@ -431,6 +556,7 @@ class PieceDownloader {
         target = resolved;
       }
     }
+    await _acquireRelaySlot();
     Object? reply;
     try {
       reply = await RatsClient.instance.request(
@@ -444,11 +570,15 @@ class PieceDownloader {
         },
         timeout: config.pieceTimeout,
       );
+      _cwndOnSuccess();        // additive increase — the pipe had room, grow it
     } on RatsRpcException catch (e) {
       if (e.status == 'timeout') {
+        _cwndOnCongestion();   // relay congested (or peer slow) — back the window off
         throw _PeerStallException();
       }
       rethrow;
+    } finally {
+      _releaseRelaySlot();
     }
     if (reply is! Map) {
       throw _PeerProtocolException('non-map reply');

@@ -428,7 +428,12 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
               << g_load_cfg.busy_score_threshold << "\n";
     mc::net::RatsLink rats(cfg.rats_port,
                             mc::crypto::to_hex(cfg.node_id),
-                            cfg.api_port);
+                            cfg.api_port,
+                            // wallet-as-id: pin the librats peer id to the node's
+                            // 20-byte wallet address (lowercase 40-hex) so it can
+                            // never drift on rebuild/key reload.
+                            mc::crypto::to_hex(keypair.address.data(),
+                                               keypair.address.size()));
     rats.set_load_monitor(&load_mon);
     mc::api::RatsApi rats_api(api, chain, candidates, network, db, cfg, keypair);
     // DeepAuditor (#4) at cmd_start scope, declared AFTER rats_api so it

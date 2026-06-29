@@ -11,8 +11,9 @@
     #include <mstcpip.h>
 #endif
 #ifndef _WIN32
-    #include <fcntl.h>    // for O_NONBLOCK
-    #include <errno.h>    // for errno
+    #include <fcntl.h>        // for O_NONBLOCK
+    #include <errno.h>        // for errno
+    #include <netinet/tcp.h>  // TCP_NODELAY, TCP_KEEPIDLE/INTVL/CNT, TCP_USER_TIMEOUT
 #endif
 
 // Socket module logging macros
@@ -68,6 +69,21 @@ static void apply_tcp_keepalive(socket_t sock,
     if (sock == INVALID_SOCKET_VALUE) return;
 
     int yes = 1;
+
+    // Latency: disable Nagle's algorithm. Without this, small RPC requests +
+    // 16 KB audio frames wait ~40 ms (Nagle + delayed-ACK) to coalesce with the
+    // next write — which on a request/response relayed transfer is THE dominant
+    // stall (the link + CPU sit idle waiting on it). This single setsockopt is
+    // the biggest throughput win for the latency-bound P2P audio path. TCP-only.
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
+
+    // NOTE: we deliberately do NOT set SO_SNDBUF/SO_RCVBUF here. Forcing a fixed
+    // size on Linux disables the kernel's receive-buffer autotuning (which grows
+    // the window to the path BDP on its own), and setting it post-connect is too
+    // late to change the negotiated window scale anyway — so it was redundant at
+    // best and counterproductive at worst. Leave buffer sizing to the kernel.
+
     if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<const char*>(&yes), sizeof(yes)) != 0) {
         LOG_SOCKET_WARN("SO_KEEPALIVE failed on socket " << sock
@@ -492,7 +508,22 @@ socket_t accept_client(socket_t server_socket) {
 
     socket_t client_socket = accept(server_socket, reinterpret_cast<sockaddr*>(&client_addr), &client_addr_len);
     if (client_socket == INVALID_SOCKET_VALUE) {
-        LOG_SOCKET_ERROR("Failed to accept client connection");
+        int err = get_last_socket_error();
+        // The accept loop is level-triggered and drains until it would block, so a
+        // would-block result is the EXPECTED loop terminator, not an error. Logging it
+        // at ERROR spammed the log on every poll wake. Demote would-block to debug;
+        // keep real failures at error.
+#ifdef _WIN32
+        const bool would_block = (err == WSAEWOULDBLOCK);
+#else
+        const bool would_block = (err == EAGAIN || err == EWOULDBLOCK);
+#endif
+        if (would_block) {
+            LOG_SOCKET_DEBUG("accept: no more pending connections (would block)");
+        } else {
+            LOG_SOCKET_ERROR("Failed to accept client connection (error: "
+                             << socket_error_string(err) << ")");
+        }
         return INVALID_SOCKET_VALUE;
     }
     apply_tcp_keepalive(client_socket);

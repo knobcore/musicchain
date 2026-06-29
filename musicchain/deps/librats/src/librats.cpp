@@ -23,12 +23,14 @@ const std::string RatsClient::PEERS_EVER_FILE_NAME = "peers_ever.rats";
 // Constructor and Destructor
 // =========================================================================
 
-RatsClient::RatsClient(int listen_port, int max_peers, const std::string& bind_address) 
+RatsClient::RatsClient(int listen_port, int max_peers, const std::string& bind_address, const std::string& forced_peer_id)
     : listen_port_(listen_port), 
       bind_address_(bind_address),
       max_peers_(max_peers),
       server_socket_(INVALID_SOCKET_VALUE),
       running_(false),
+      // Wallet-as-id: forced peer id, applied in load_configuration()
+      forced_peer_id_(forced_peer_id),
       // [1] Configuration persistence
       data_directory_("."),
       // [2] Custom protocol configuration
@@ -370,6 +372,45 @@ void RatsClient::io_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// looks_like_foreign_inbound – best-effort peek for non-librats connections
+//
+// Peeks (MSG_PEEK, never consumes) the first few bytes already buffered on a
+// freshly-accepted socket and reports whether they are clearly NOT a librats
+// frame, so accept_incoming() can drop them quietly before allocating any peer
+// state. Detects:
+//   - BitTorrent handshake: first byte 0x13 ("\x13BitTorrent protocol"). This is
+//     also why the old code logged "Frame too large (323MB)" — 0x13'B''i''t'
+//     decodes as a length prefix of 0x13426974 ≈ 323 MB.
+//   - Any 4-byte length prefix exceeding MAX_FRAME_SIZE (junk / scanners).
+// Returns false when no bytes are buffered yet (would-block) or fewer than 4
+// bytes are available — a legitimate slow peer is then handled normally and
+// validated by the handshake path.
+// ---------------------------------------------------------------------------
+bool RatsClient::looks_like_foreign_inbound(socket_t socket) {
+    uint8_t hdr[4];
+    int n = ::recv(socket, reinterpret_cast<char*>(hdr), sizeof(hdr), MSG_PEEK);
+    if (n <= 0) {
+        // No data yet (would-block), peer closed, or error — let the normal path decide.
+        return false;
+    }
+
+    // BitTorrent (and most foreign) handshakes start with 0x13. Catchable on 1 byte.
+    if (hdr[0] == 0x13) {
+        return true;
+    }
+
+    // Need the full 4-byte length prefix to range-check it.
+    if (n < 4) {
+        return false;
+    }
+
+    uint32_t net_len;
+    memcpy(&net_len, hdr, 4);
+    uint32_t msg_len = ntohl(net_len);
+    return msg_len > MAX_FRAME_SIZE;
+}
+
+// ---------------------------------------------------------------------------
 // accept_incoming – non-blocking accept of new TCP connections
 // ---------------------------------------------------------------------------
 void RatsClient::accept_incoming() {
@@ -392,7 +433,25 @@ void RatsClient::accept_incoming() {
         }
         
         std::string normalized = normalize_peer_address(ip, port);
-        
+
+        // Make the socket non-blocking BEFORE the MSG_PEEK below. POSIX accept() returns a
+        // BLOCKING socket (O_NONBLOCK is not inherited from the listener), so peeking on it
+        // while still blocking would stall the single IO thread until 4 bytes arrive — a
+        // trivial hang/DoS for a peer that connects and sends nothing. Non-blocking makes
+        // the peek return immediately (would-block => treated as "not enough data yet").
+        set_socket_nonblocking(client);
+
+        // Best-effort early rejection of non-librats inbound (BitTorrent handshakes,
+        // port scanners) BEFORE we allocate a peer-table slot / temp peer-id. We peek —
+        // never consume — so a legitimate but slow peer (whose bytes haven't arrived yet)
+        // falls through to the normal path and is validated in handle_readable.
+        if (looks_like_foreign_inbound(client)) {
+            LOG_SERVER_DEBUG("Dropping non-librats inbound from " << normalized
+                             << " (BitTorrent handshake or oversized frame)");
+            close_socket(client);
+            continue;
+        }
+
         if (is_peer_limit_reached()) {
             LOG_SERVER_INFO("Peer limit reached, rejecting " << normalized);
             close_socket(client);
@@ -405,9 +464,8 @@ void RatsClient::accept_incoming() {
             continue;
         }
         
-        // Make the new socket non-blocking and register with poller
-        set_socket_nonblocking(client);
-        
+        // Socket was already set non-blocking above (before the foreign-inbound peek).
+        // Register with the poller below.
         std::string initial_id = generate_temporary_peer_id(client, "incoming_from_" + peer_address);
         
         {
@@ -449,16 +507,18 @@ bool RatsClient::handle_readable(socket_t socket) {
         
         RatsPeer& peer = peer_it->second;
         auto& recv_buf = peer.io_.recv_buffer;
-        
+
         // Non-blocking recv loop
+        bool got_bytes = false;
         while (true) {
             recv_buf.ensure_space(16384);
             int bytes = ::recv(socket,
                                reinterpret_cast<char*>(recv_buf.write_ptr()),
                                static_cast<int>(recv_buf.write_space()), 0);
-            
+
             if (bytes > 0) {
                 recv_buf.received(static_cast<size_t>(bytes));
+                got_bytes = true;
                 continue;
             }
             if (bytes == 0) { peer_closed = true; break; }
@@ -471,9 +531,15 @@ bool RatsClient::handle_readable(socket_t socket) {
             peer_closed = true;
             break;
         }
-        
+
+        // App-level keepalive: record inbound activity (any bytes count, including a
+        // length-0 keepalive frame). Read under peers_mutex_ by management_loop.
+        if (got_bytes) {
+            peer.last_recv_time = std::chrono::steady_clock::now();
+        }
+
         if (peer_closed && recv_buf.empty()) return true;
-        
+
         // Parse length-prefixed frames:  [4-byte network-order length][payload]
         while (recv_buf.size() >= 4) {
             uint32_t net_len;
@@ -481,11 +547,25 @@ bool RatsClient::handle_readable(socket_t socket) {
             uint32_t msg_len = ntohl(net_len);
             
             if (msg_len > MAX_FRAME_SIZE) {
-                LOG_CLIENT_ERROR("Frame too large (" << msg_len << " bytes) from " << peer.peer_id);
+                // Almost always a BitTorrent handshake (0x13'B''i''t' → ~323MB length)
+                // or a port scanner, not a real oversized librats frame. Drop quietly
+                // at debug — this used to spam ERROR on every foreign connection.
+                LOG_CLIENT_DEBUG("Oversized/foreign frame (" << msg_len << " bytes) from "
+                                 << peer.peer_id << " — dropping");
                 return true;
             }
             if (recv_buf.size() < 4 + msg_len) break; // incomplete frame
-            
+
+            // App-level keepalive: a length-0 frame carries no payload — it exists only
+            // to refresh activity timers (already done above via last_recv_time). Consume
+            // and skip it. Must be handled HERE, before the encrypted/handshake paths:
+            // an empty frame has no AEAD tag and would otherwise trip "Encrypted frame
+            // too small" and disconnect the peer.
+            if (msg_len == 0) {
+                recv_buf.consume(4);
+                continue;
+            }
+
             // Handle Noise handshake messages inline (fast crypto, no callbacks)
             if (peer.handshake_state == RatsPeer::HandshakeState::NOISE_PENDING) {
                 if (!handle_noise_frame(peer)) return true;
@@ -591,7 +671,7 @@ bool RatsClient::handle_writable(socket_t socket) {
     if (peer_it == peers_.end()) return true;
     
     auto& send_buf = peer_it->second.io_.send_buffer;
-    
+
     while (!send_buf.empty()) {
         int bytes = ::send(socket,
                             reinterpret_cast<const char*>(send_buf.front_data()),
@@ -602,32 +682,50 @@ bool RatsClient::handle_writable(socket_t socket) {
                             MSG_NOSIGNAL
 #endif
         );
-        
+
         if (bytes > 0) {
             send_buf.pop_front(static_cast<size_t>(bytes));
+            // App-level keepalive: record outbound activity. (Under peers_mutex_.)
+            peer_it->second.last_send_time = std::chrono::steady_clock::now();
             continue;
         }
-        
+
         if (bytes < 0) {
 #ifdef _WIN32
-            if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+            if (WSAGetLastError() == WSAEWOULDBLOCK) break;  // kernel buffer full
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // kernel buffer full
 #endif
             LOG_CLIENT_ERROR("Send error on socket " << socket);
             return true;
         }
-        
-        // bytes == 0 — shouldn't happen on a stream socket
+
+        // bytes == 0 — shouldn't happen on a connected stream socket. Stop draining;
+        // the re-arm below keys off send_buf alone, so whatever is left stays armed for
+        // PollOut and can't be stranded.
         break;
     }
-    
-    // If buffer fully flushed, stop watching for PollOut
-    if (send_buf.empty()) {
+
+    // Re-arm the poller from the REAL buffer state, not a speculative probe. The IOCP
+    // backend no longer auto-re-arms PollOut on completion (that busy-spun the io thread
+    // with a zero-byte WSASend that completes instantly while the buffer still can't
+    // drain), so this is the explicit write-readiness signal it depends on.
+    //   - send buffer fully drained: watch PollIn only — nothing pending to write.
+    //   - send buffer still has data (real WOULDBLOCK, or the can't-happen bytes==0
+    //     break): arm PollOut so the next write-readiness completion calls us back to
+    //     flush the remainder. Gating on send_buf alone (rather than a write_blocked
+    //     flag) guarantees no buffered byte is stranded regardless of why we stopped.
+    {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
-        if (poller_) poller_->modify(socket, PollIn);
+        if (poller_) {
+            if (!send_buf.empty()) {
+                poller_->modify(socket, PollIn | PollOut);
+            } else {
+                poller_->modify(socket, PollIn);
+            }
+        }
     }
-    
+
     return false;
 }
 
@@ -676,13 +774,11 @@ void RatsClient::handle_disconnect(socket_t socket) {
         if (should_schedule_reconnect && running_.load()) {
             schedule_reconnect(peer_copy_for_reconnect);
         }
-        if (running_.load()) {
-            add_managed_thread(std::thread([this]() {
-                if (running_.load()) save_configuration();
-            }), "config-save-disconnect");
-        }
+        // Debounced save (item E): mark dirty; management_loop coalesces and flushes.
+        // Avoids spawning a thread per disconnect during connection churn.
+        config_dirty_.store(true);
     }
-    
+
     LOG_CLIENT_INFO("Peer disconnected: " << peer_id);
 }
 
@@ -717,22 +813,59 @@ bool RatsClient::enqueue_message(socket_t socket, const std::vector<uint8_t>& da
 bool RatsClient::enqueue_message_unlocked(RatsPeer& peer, const std::vector<uint8_t>& data) {
     // Build length-prefixed frame:  [4-byte network-order length][payload]
     uint32_t net_len = htonl(static_cast<uint32_t>(data.size()));
-    
+
     std::vector<uint8_t> frame;
     frame.reserve(4 + data.size());
     frame.insert(frame.end(),
                  reinterpret_cast<const uint8_t*>(&net_len),
                  reinterpret_cast<const uint8_t*>(&net_len) + 4);
     frame.insert(frame.end(), data.begin(), data.end());
-    
-    peer.io_.send_buffer.append(std::move(frame));
-    
-    // Arm PollOut so io_loop flushes the buffer
+
+    auto& send_buf = peer.io_.send_buffer;
+    const bool was_empty = send_buf.empty();
+    send_buf.append(std::move(frame));
+
+    // Fast path (item E): if nothing was already queued, try to push the frame straight
+    // to the kernel from here rather than waiting for the next PollOut wake. This is safe
+    // because both this path and handle_writable() run under peers_mutex_, so they can
+    // never interleave partial writes on the same socket. We only attempt this when the
+    // buffer was previously empty (no risk of reordering ahead of pending bytes).
+    if (was_empty) {
+        while (!send_buf.empty()) {
+            int bytes = ::send(peer.socket,
+                               reinterpret_cast<const char*>(send_buf.front_data()),
+                               static_cast<int>(send_buf.front_size()),
+#ifdef _WIN32
+                               0
+#else
+                               MSG_NOSIGNAL
+#endif
+            );
+            if (bytes > 0) {
+                send_buf.pop_front(static_cast<size_t>(bytes));
+                peer.last_send_time = std::chrono::steady_clock::now();
+                continue;
+            }
+            // WOULDBLOCK or error: stop and fall through to arming PollOut. Real send
+            // errors are surfaced to the IO thread (it will disconnect on its own recv/
+            // send failure); we don't tear the peer down from this non-IO context.
+            break;
+        }
+        if (send_buf.empty()) {
+            // Fully flushed inline — no need to watch for writability.
+            std::lock_guard<std::mutex> io_lock(io_mutex_);
+            if (poller_) poller_->modify(peer.socket, PollIn);
+            return true;
+        }
+        // else: partial write — fall through to arm PollOut for the remainder.
+    }
+
+    // Arm PollOut so io_loop flushes the (remaining) buffer.
     {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
         if (poller_) poller_->modify(peer.socket, PollIn | PollOut);
     }
-    
+
     return true;
 }
 
@@ -764,6 +897,24 @@ void RatsClient::management_loop() {
         } catch (const std::exception& e) {
             LOG_CLIENT_ERROR("Exception during reconnect queue processing: " << e.what());
         }
+
+        // App-level keepalive: refresh idle peers, prune dead ones
+        try {
+            keepalive_sweep();
+        } catch (const std::exception& e) {
+            LOG_CLIENT_ERROR("Exception during keepalive sweep: " << e.what());
+        }
+
+        // Debounced configuration save (item E): flush once per tick if any
+        // connect/disconnect marked it dirty, coalescing churn into one write.
+        if (config_dirty_.exchange(false)) {
+            try {
+                if (running_.load()) save_configuration();
+            } catch (const std::exception& e) {
+                LOG_CLIENT_ERROR("Exception during debounced config save: " << e.what());
+                config_dirty_.store(true);  // retry next tick
+            }
+        }
         
         // Periodically cleanup finished threads (every 30 seconds)
         auto now = std::chrono::steady_clock::now();
@@ -779,6 +930,71 @@ void RatsClient::management_loop() {
     }
     
     LOG_CLIENT_INFO("Management loop ended");
+}
+
+// ---------------------------------------------------------------------------
+// keepalive_sweep – app-level keepalive + dead-peer pruning (item C)
+//
+// Runs on the management thread each tick. For every COMPLETED peer:
+//   - if we have RECEIVED nothing for KEEPALIVE_DEAD_SECONDS (~3x the keepalive
+//     interval), the path is dead: half-close the socket so the IO thread's recv
+//     returns 0 and it runs handle_disconnect() on its own thread — which schedules
+//     a reconnect. We deliberately do NOT call handle_disconnect() / close_socket()
+//     here, because the IO thread owns those sockets; ::shutdown() only signals it.
+//   - else, if we have SENT nothing for KEEPALIVE_IDLE_SECONDS, enqueue a length-0
+//     keepalive frame (peer receiver no-ops it). This keeps the path warm and lets
+//     the remote's own dead-peer detection work too.
+//
+// Locking: the scan + enqueue run under peers_mutex_. enqueue_message_unlocked()
+// then takes io_mutex_ INSIDE peers_mutex_ — the established peers_mutex_ -> io_mutex_
+// order (peers_ is lock-class [5], io_mutex_ is [6]). This matches the global invariant
+// (peers_mutex_ -> io_mutex_) and the existing enqueue path, so no new ordering is
+// introduced. ::shutdown() is collected under the lock and issued after release; it
+// touches only the kernel socket, takes no librats lock, and races benignly with the
+// IO thread (a concurrent close just makes shutdown a harmless no-op).
+// ---------------------------------------------------------------------------
+void RatsClient::keepalive_sweep() {
+    auto now = std::chrono::steady_clock::now();
+    const auto idle_threshold = std::chrono::seconds(KEEPALIVE_IDLE_SECONDS);
+    const auto dead_threshold = std::chrono::seconds(KEEPALIVE_DEAD_SECONDS);
+
+    std::vector<socket_t> dead_sockets;  // half-closed after releasing the lock
+
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto& [id, peer] : peers_) {
+            // Only act on fully-established peers; handshakes have their own timeout path.
+            if (peer.handshake_state != RatsPeer::HandshakeState::COMPLETED) continue;
+            if (!is_valid_socket(peer.socket)) continue;
+
+            if (now - peer.last_recv_time >= dead_threshold) {
+                LOG_CLIENT_INFO("Keepalive: no data from " << id.substr(0, 8)
+                                << "… for " << KEEPALIVE_DEAD_SECONDS << "s — disconnecting");
+                dead_sockets.push_back(peer.socket);
+                continue;  // don't also send a keepalive to a peer we're dropping
+            }
+
+            if (now - peer.last_send_time >= idle_threshold) {
+                // Length-0 frame: 4-byte length prefix of 0, no payload. The receiver's
+                // frame parser consumes and ignores it (see handle_readable). Updates
+                // last_send_time via handle_writable when it actually flushes.
+                enqueue_message_unlocked(peer, std::vector<uint8_t>{});
+            }
+        }
+    }
+    // ── peers_mutex_ released ────────────────────────────────────────────────
+
+    // Half-close dead sockets: signals the IO thread to disconnect them through its
+    // normal path (which reschedules reconnects for validated peers).
+    for (socket_t s : dead_sockets) {
+        if (is_valid_socket(s)) {
+#ifdef _WIN32
+            ::shutdown(s, SD_BOTH);
+#else
+            ::shutdown(s, SHUT_RDWR);
+#endif
+        }
+    }
 }
 
 void RatsClient::handle_post_handshake_completion(socket_t socket, const RatsPeer& peer_copy) {
@@ -810,14 +1026,9 @@ void RatsClient::handle_post_handshake_completion(socket_t socket, const RatsPee
         send_peers_request(socket, peer_copy.peer_id);
     }
     
-    // Save configuration
-    if (running_.load()) {
-        add_managed_thread(std::thread([this]() {
-            if (running_.load()) {
-                save_configuration();
-            }
-        }), "config-save");
-    }
+    // Debounced save (item E): mark dirty; management_loop coalesces and flushes the
+    // peer list once per tick instead of spawning a save thread on every handshake.
+    config_dirty_.store(true);
 }
 
 void RatsClient::process_message(socket_t socket, const std::vector<uint8_t>& data, const std::string& initial_peer_id) {
@@ -1564,22 +1775,33 @@ bool RatsClient::send_binary_to_peer_unlocked(socket_t socket, const std::vector
     std::vector<uint8_t> message_with_header = create_message_with_header(data, message_type);
     
     if (send_cipher) {
+        // Serialize encrypt(nonce++) + enqueue per-peer. The send_cipher is
+        // shared by every sender to this peer (io-thread relay forward, RPC
+        // replies, broadcast loops); without this lock two concurrent sends
+        // race the in-place nonce and/or append frames out of nonce order, the
+        // receiver's AEAD fails, and handle_readable force-disconnects the peer
+        // mid-transfer. Holding tx_mutex across BOTH encrypt and enqueue couples
+        // nonce assignment to wire order. Lock order tx_mutex -> peers_mutex_
+        // (enqueue_message takes peers_mutex_); no path takes them in reverse,
+        // since every caller releases peers_mutex_ before calling this.
+        std::lock_guard<std::mutex> tx_lock(*send_cipher->tx_mutex);
+
         // Encrypt the message before enqueuing
         std::vector<uint8_t> ciphertext(message_with_header.size() + rats::NOISE_TAG_SIZE);
         size_t ct_len = send_cipher->encrypt_with_ad(
-            nullptr, 0, 
-            message_with_header.data(), message_with_header.size(), 
+            nullptr, 0,
+            message_with_header.data(), message_with_header.size(),
             ciphertext.data()
         );
-        
+
         if (ct_len == 0) {
             LOG_CLIENT_ERROR("Failed to encrypt message for peer: " << peer_id_for_logging);
             return false;
         }
-        
+
         ciphertext.resize(ct_len);
         LOG_CLIENT_DEBUG("Enqueuing encrypted message for " << peer_id_for_logging << " (" << ct_len << " bytes)");
-        
+
         return enqueue_message(socket, ciphertext);
     }
     
@@ -2138,18 +2360,14 @@ void RatsClient::handle_peer_exchange_message(socket_t socket, const std::string
         
         LOG_CLIENT_INFO("Received peer exchange: " << exchanged_ip << ":" << exchanged_port << " (peer_id: " << exchanged_peer_id << ")");
         
-        if (!can_connect_to_peer(exchanged_ip, exchanged_port)) {
-            return;
-        }
-        
-        // Try to connect to the exchanged peer (non-blocking)
-        add_managed_thread(std::thread([this, exchanged_ip, exchanged_port, exchanged_peer_id]() {
-            if (connect_to_peer(exchanged_ip, exchanged_port)) {
-                LOG_CLIENT_INFO("Successfully connected to exchanged peer: " << exchanged_ip << ":" << exchanged_port);
-            } else {
-                LOG_CLIENT_DEBUG("Failed to connect to exchanged peer: " << exchanged_ip << ":" << exchanged_port);
-            }
-        }), "peer-exchange-connect-" + exchanged_peer_id.substr(0, 8));
+        // RELAY-ONLY: do NOT auto-dial peers learned via peer-exchange. Auto-dialing
+        // the address advertised by a connected peer opens a SECOND connection to a
+        // peer we already reach — the full-node <-> mini-node both-sides-dial loop:
+        // librats dedups the duplicate in ~35ms, the reconnection logic re-dials the
+        // wrong (ephemeral) port, and the link churns every few seconds, breaking
+        // relayed traffic. Explicit connections (the node dialing its mini-node
+        // bootstrap, players dialing the mini-node set) are unaffected — we still
+        // RECORD the exchanged peer (logged above), we just don't dial it.
         
     } catch (const nlohmann::json::exception& e) {
         LOG_CLIENT_ERROR("Failed to handle peer exchange message: " << e.what());
@@ -2300,18 +2518,8 @@ void RatsClient::handle_peers_response_message(socket_t socket, const std::strin
             
             LOG_CLIENT_DEBUG("Processing peer from response: " << resp_ip << ":" << resp_port << " (peer_id: " << resp_peer_id << ")");
             
-            if (!can_connect_to_peer(resp_ip, resp_port)) {
-                continue;
-            }
-            
-            LOG_CLIENT_DEBUG("Attempting to connect to peer from response: " << resp_ip << ":" << resp_port);
-            add_managed_thread(std::thread([this, resp_ip, resp_port, resp_peer_id]() {
-                if (connect_to_peer(resp_ip, resp_port)) {
-                    LOG_CLIENT_INFO("Successfully connected to peer from response: " << resp_ip << ":" << resp_port);
-                } else {
-                    LOG_CLIENT_DEBUG("Failed to connect to peer from response: " << resp_ip << ":" << resp_port);
-                }
-            }), "peer-response-connect-" + resp_peer_id.substr(0, 8));
+            // RELAY-ONLY: record but do NOT auto-dial peers from a peers_response —
+            // same duplicate-connection / flap reasoning as peer-exchange above.
         }
         
     } catch (const nlohmann::json::exception& e) {

@@ -17,9 +17,6 @@
 #ifdef RATS_STORAGE
 #include "storage.h" // Distributed storage functionality
 #endif
-#ifdef RATS_SEARCH_FEATURES
-#include "bittorrent.h" // BitTorrent functionality (optional, requires RATS_SEARCH_FEATURES)
-#endif
 #include "json.hpp" // nlohmann::json
 #include <string>
 #include <functional>
@@ -95,23 +92,36 @@ struct RatsPeer {
     
     // Async I/O context (per-peer buffers for non-blocking I/O)
     PeerIOContext io_;
-    
-    RatsPeer() : handshake_state(HandshakeState::PENDING), 
+
+    // App-level keepalive activity tracking. Written by the IO thread
+    // (handle_readable on recv > 0, handle_writable on send) AND by the management thread
+    // (keepalive_sweep -> enqueue_message_unlocked's inline-send fast path), always under
+    // peers_mutex_, so no separate lock is needed — every writer holds peers_mutex_.
+    // management_loop reads them under peers_mutex_ to decide when to send a length-0
+    // keepalive and when to declare a peer dead (no recv within ~3x the keepalive interval).
+    std::chrono::steady_clock::time_point last_send_time;  // last time we wrote bytes to this peer
+    std::chrono::steady_clock::time_point last_recv_time;  // last time we read bytes from this peer
+
+    RatsPeer() : handshake_state(HandshakeState::PENDING),
                  encryption_enabled(false),
                  noise_handshake_completed(false) {
         connected_at = std::chrono::steady_clock::now();
         handshake_start_time = connected_at;
+        last_send_time = connected_at;
+        last_recv_time = connected_at;
     }
-    
-    RatsPeer(const std::string& id, const std::string& peer_ip, uint16_t peer_port, 
+
+    RatsPeer(const std::string& id, const std::string& peer_ip, uint16_t peer_port,
              socket_t sock, const std::string& norm_addr, bool outgoing)
-        : peer_id(id), ip(peer_ip), port(peer_port), socket(sock), 
+        : peer_id(id), ip(peer_ip), port(peer_port), socket(sock),
           normalized_address(norm_addr), is_outgoing(outgoing),
           handshake_state(HandshakeState::PENDING),
           encryption_enabled(false),
           noise_handshake_completed(false) {
         connected_at = std::chrono::steady_clock::now();
         handshake_start_time = connected_at;
+        last_send_time = connected_at;
+        last_recv_time = connected_at;
     }
     
     // Custom copy: copies all fields except io_ (non-copyable due to unique_ptr).
@@ -124,7 +134,8 @@ struct RatsPeer {
           encryption_enabled(o.encryption_enabled),
           noise_handshake_completed(o.noise_handshake_completed),
           send_cipher(o.send_cipher), recv_cipher(o.recv_cipher),
-          remote_static_key(o.remote_static_key)
+          remote_static_key(o.remote_static_key),
+          last_send_time(o.last_send_time), last_recv_time(o.last_recv_time)
           /* io_ default-constructed (fresh, empty) */ {}
     
     RatsPeer& operator=(const RatsPeer& o) {
@@ -144,6 +155,8 @@ struct RatsPeer {
             send_cipher = o.send_cipher;
             recv_cipher = o.recv_cipher;
             remote_static_key = o.remote_static_key;
+            last_send_time = o.last_send_time;
+            last_recv_time = o.last_recv_time;
             // io_ left unchanged in the destination (no copy)
         }
         return *this;
@@ -171,7 +184,14 @@ struct ReconnectConfig {
     std::vector<int> retry_intervals_seconds = {5, 30, 120};   // Intervals between attempts (5s, 30s, 2min)
     int stable_connection_threshold_seconds = 60;              // Connection duration to be considered "stable" (1 minute)
     int stable_first_retry_seconds = 2;                        // First retry interval for stable peers (faster)
-    bool enabled = true;                                       // Whether auto-reconnection is enabled
+    // RELAY-ONLY default OFF: librats' auto-reconnect re-dials a dropped peer at the
+    // address it last saw — which for an INBOUND connection is the peer's EPHEMERAL
+    // source port, not its listen port — and it fights the app-level watchdog (the
+    // node's RatsLink re-dials its mini-node bootstrap; players re-dial the mini-node
+    // set), producing duplicate connections that dedup-churn the link. The app
+    // watchdogs own reconnection, so default this off. (set_reconnect_enabled(true)
+    // still re-enables it explicitly if ever needed.)
+    bool enabled = false;                                      // Whether auto-reconnection is enabled
 };
 
 /**
@@ -302,7 +322,7 @@ public:
      * @param max_peers Maximum number of concurrent peers (default: 10)
      * @param bind_address Interface IP address to bind to (empty for all interfaces)
      */
-    RatsClient(int listen_port, int max_peers = 10, const std::string& bind_address = "");
+    RatsClient(int listen_port, int max_peers = 10, const std::string& bind_address = "", const std::string& forced_peer_id = "");
     
     /**
      * Destructor
@@ -609,11 +629,42 @@ public:
     
     // DHT Discovery
     /**
+     * Configure the PRIVATE DHT bootstrap nodes for the overlay.
+     *
+     * musicchain's DHT is a private overlay: it speaks the standard KRPC/DHT wire
+     * protocol (camouflage) but must NOT bootstrap off the public mainline routers.
+     * The caller (node/player) supplies its own bootstrap nodes — typically the VPS
+     * mini-node — here, BEFORE start_dht_discovery(). If never called, the DHT comes
+     * up with no bootstrap and only learns nodes that contact it directly.
+     *
+     * Replaces any previously configured list. Process-wide (shared by the IPv4 and
+     * IPv6 DHT instances). Safe to call before or after start_dht_discovery().
+     * @param nodes Bootstrap nodes (host may be an IP or a hostname; resolved per family)
+     */
+    void set_dht_bootstrap_nodes(const std::vector<Peer>& nodes);
+
+    /**
+     * Convenience overload: configure a single host:port bootstrap node (the common
+     * "one VPS" case). May be called repeatedly to add several. See set_dht_bootstrap_nodes().
+     */
+    void add_dht_bootstrap_node(const std::string& host, uint16_t port);
+
+    /**
      * Start DHT discovery on specified port
      * @param dht_port Port for DHT communication (default: 6881)
      * @return true if started successfully
      */
     bool start_dht_discovery(int dht_port = 6881);
+
+    /**
+     * Start DHT discovery with an explicit PRIVATE bootstrap list (convenience overload).
+     * Equivalent to set_dht_bootstrap_nodes(bootstrap_nodes) followed by
+     * start_dht_discovery(dht_port). Use this to pass the VPS host:port through in one call.
+     * @param bootstrap_nodes Private bootstrap nodes (the VPS); empty for none
+     * @param dht_port Port for DHT communication (default: 6881)
+     * @return true if started successfully
+     */
+    bool start_dht_discovery(const std::vector<Peer>& bootstrap_nodes, int dht_port = 6881);
 
     /**
      * Stop DHT discovery
@@ -1690,297 +1741,6 @@ public:
     void on_storage_sync_complete(StorageSyncCompleteCallback callback);
 #endif // RATS_STORAGE
 
-#ifdef RATS_SEARCH_FEATURES
-    // =========================================================================
-    // BitTorrent API (requires RATS_SEARCH_FEATURES)
-    // =========================================================================
-    
-    /**
-     * Enable BitTorrent functionality
-     * @param listen_port Port to listen for BitTorrent connections (default: 6881)
-     * @return true if BitTorrent was successfully enabled
-     */
-    bool enable_bittorrent(int listen_port = 6881);
-    
-    /**
-     * Set the directory for storing resume data files
-     * Resume data allows torrents to resume from where they left off.
-     * Should be called after enable_bittorrent() and before adding torrents.
-     * @param path Directory path for resume data (e.g., app data folder)
-     */
-    void set_resume_data_path(const std::string& path);
-    
-    /**
-     * Disable BitTorrent functionality
-     */
-    void disable_bittorrent();
-    
-    /**
-     * Check if BitTorrent is enabled
-     * @return true if BitTorrent is active
-     */
-    bool is_bittorrent_enabled() const;
-    
-    /**
-     * Add a torrent from a file
-     * @param torrent_file Path to the .torrent file
-     * @param download_path Directory where files will be downloaded
-     * @return Shared pointer to TorrentDownload object, or nullptr on failure
-     */
-    std::shared_ptr<TorrentDownload> add_torrent(const std::string& torrent_file, 
-                                                  const std::string& download_path);
-    
-    /**
-     * Add a torrent from TorrentInfo
-     * @param torrent_info TorrentInfo object with torrent metadata
-     * @param download_path Directory where files will be downloaded
-     * @return Shared pointer to TorrentDownload object, or nullptr on failure
-     */
-    std::shared_ptr<TorrentDownload> add_torrent(const TorrentInfo& torrent_info, 
-                                                  const std::string& download_path);
-    
-    /**
-     * Add a torrent by info hash (magnet link style - uses DHT to find peers)
-     * @param info_hash Info hash of the torrent
-     * @param download_path Directory where files will be downloaded
-     * @return Shared pointer to TorrentDownload object, or nullptr on failure
-     * @note Requires DHT to be running. Will discover peers via DHT.
-     */
-    std::shared_ptr<TorrentDownload> add_torrent_by_hash(const InfoHash& info_hash, 
-                                                          const std::string& download_path);
-    
-    /**
-     * Add a torrent by info hash hex string (magnet link style - uses DHT to find peers)
-     * @param info_hash_hex Info hash as 40-character hex string
-     * @param download_path Directory where files will be downloaded
-     * @return Shared pointer to TorrentDownload object, or nullptr on failure
-     * @note Requires DHT to be running. Will discover peers via DHT.
-     */
-    std::shared_ptr<TorrentDownload> add_torrent_by_hash(const std::string& info_hash_hex, 
-                                                          const std::string& download_path);
-    
-    /**
-     * Remove a torrent by info hash
-     * @param info_hash Info hash of the torrent to remove
-     * @return true if torrent was removed successfully
-     */
-    bool remove_torrent(const InfoHash& info_hash);
-    
-    /**
-     * Get a torrent by info hash
-     * @param info_hash Info hash of the torrent
-     * @return Shared pointer to TorrentDownload object, or nullptr if not found
-     */
-    std::shared_ptr<TorrentDownload> get_torrent(const InfoHash& info_hash);
-    
-    /**
-     * Get all active torrents
-     * @return Vector of all active torrent downloads
-     */
-    std::vector<std::shared_ptr<TorrentDownload>> get_all_torrents();
-    
-    /**
-     * Get the number of active torrents
-     * @return Number of active torrents
-     */
-    size_t get_active_torrents_count() const;
-    
-    /**
-     * Get BitTorrent statistics (downloaded and uploaded bytes)
-     * @return Pair of (downloaded_bytes, uploaded_bytes)
-     */
-    std::pair<uint64_t, uint64_t> get_bittorrent_stats() const;
-    
-    /**
-     * Get torrent metadata without downloading (requires DHT to be running)
-     * @param info_hash Info hash of the torrent
-     * @param callback Function called when metadata is retrieved (torrent_info, success, error_message)
-     * @note This only retrieves metadata via BEP 9, it does not start downloading
-     */
-    void get_torrent_metadata(const InfoHash& info_hash, 
-                             std::function<void(const TorrentInfo&, bool, const std::string&)> callback);
-    
-    /**
-     * Get torrent metadata without downloading by hex string (requires DHT to be running)
-     * @param info_hash_hex Info hash as 40-character hex string
-     * @param callback Function called when metadata is retrieved (torrent_info, success, error_message)
-     * @note This only retrieves metadata via BEP 9, it does not start downloading
-     */
-    void get_torrent_metadata(const std::string& info_hash_hex, 
-                             std::function<void(const TorrentInfo&, bool, const std::string&)> callback);
-    
-    /**
-     * Get torrent metadata directly from a specific peer (fast path - no DHT search needed)
-     * This is more efficient when you already know a peer that has the torrent (e.g., from announce_peer)
-     * @param info_hash Info hash of the torrent
-     * @param peer_ip IP address of the peer
-     * @param peer_port Port of the peer
-     * @param callback Function called when metadata is retrieved (torrent_info, success, error_message)
-     * @note This only retrieves metadata via BEP 9, it does not start downloading
-     */
-    void get_torrent_metadata_from_peer(const InfoHash& info_hash,
-                                        const std::string& peer_ip,
-                                        uint16_t peer_port,
-                                        std::function<void(const TorrentInfo&, bool, const std::string&)> callback);
-    
-    /**
-     * Get torrent metadata directly from a specific peer by hex string (fast path)
-     * @param info_hash_hex Info hash as 40-character hex string
-     * @param peer_ip IP address of the peer
-     * @param peer_port Port of the peer
-     * @param callback Function called when metadata is retrieved (torrent_info, success, error_message)
-     * @note This only retrieves metadata via BEP 9, it does not start downloading
-     */
-    void get_torrent_metadata_from_peer(const std::string& info_hash_hex,
-                                        const std::string& peer_ip,
-                                        uint16_t peer_port,
-                                        std::function<void(const TorrentInfo&, bool, const std::string&)> callback);
-    
-    // =========================================================================
-    // Torrent Creation API (requires RATS_SEARCH_FEATURES)
-    // =========================================================================
-    
-    /**
-     * Torrent creation progress callback type
-     * Called during piece hashing to report progress
-     * @param current_piece Current piece being hashed (0-indexed)
-     * @param total_pieces Total number of pieces
-     */
-    using TorrentCreationProgressCallback = std::function<void(uint32_t current_piece, uint32_t total_pieces)>;
-    
-    /**
-     * Create a torrent from a file or directory and return TorrentInfo
-     * This is a synchronous operation that reads all files to compute piece hashes.
-     * @param path Path to file or directory to create torrent from
-     * @param trackers Optional list of tracker URLs
-     * @param comment Optional comment
-     * @param progress_callback Optional callback for progress updates
-     * @return TorrentInfo object, or nullopt on failure
-     */
-    std::optional<TorrentInfo> create_torrent_from_path(
-        const std::string& path,
-        const std::vector<std::string>& trackers = {},
-        const std::string& comment = "",
-        TorrentCreationProgressCallback progress_callback = nullptr);
-    
-    /**
-     * Create a torrent from a file or directory and return raw torrent data
-     * @param path Path to file or directory
-     * @param trackers Optional list of tracker URLs
-     * @param comment Optional comment
-     * @param progress_callback Optional callback for progress updates
-     * @return Bencoded torrent data, or empty vector on failure
-     */
-    std::vector<uint8_t> create_torrent_data(
-        const std::string& path,
-        const std::vector<std::string>& trackers = {},
-        const std::string& comment = "",
-        TorrentCreationProgressCallback progress_callback = nullptr);
-    
-    /**
-     * Create a torrent and save it to a file
-     * @param path Path to file or directory
-     * @param output_file Path to save the .torrent file
-     * @param trackers Optional list of tracker URLs
-     * @param comment Optional comment
-     * @param progress_callback Optional callback for progress updates
-     * @return true if torrent was created and saved successfully
-     */
-    bool create_torrent_file(
-        const std::string& path,
-        const std::string& output_file,
-        const std::vector<std::string>& trackers = {},
-        const std::string& comment = "",
-        TorrentCreationProgressCallback progress_callback = nullptr);
-    
-    /**
-     * Create a torrent, add it to the BitTorrent client, and start seeding
-     * This combines torrent creation with immediately starting to seed it.
-     * @param path Path to file or directory
-     * @param trackers Optional list of tracker URLs
-     * @param comment Optional comment
-     * @param progress_callback Optional callback for progress updates
-     * @return Shared pointer to TorrentDownload for the seeding torrent, or nullptr on failure
-     * @note Requires BitTorrent to be enabled (call enable_bittorrent() first)
-     */
-    std::shared_ptr<TorrentDownload> create_and_seed_torrent(
-        const std::string& path,
-        const std::vector<std::string>& trackers = {},
-        const std::string& comment = "",
-        TorrentCreationProgressCallback progress_callback = nullptr);
-    
-    // =========================================================================
-    // Spider Mode API (requires RATS_SEARCH_FEATURES)
-    // =========================================================================
-    
-    /**
-     * Spider announce callback type
-     * Called when a peer announces they have a torrent (announce_peer request received)
-     * @param info_hash The info hash being announced (as hex string)
-     * @param peer_address The peer that is announcing (ip:port format)
-     */
-    using SpiderAnnounceCallback = std::function<void(const std::string& info_hash, const std::string& peer_address)>;
-    
-    /**
-     * Enable spider mode on DHT
-     * In spider mode:
-     * - Nodes are added to routing table without ping verification
-     * - All announce_peer requests from other peers are collected via callback
-     * @param enable true to enable spider mode, false to disable
-     */
-    void set_spider_mode(bool enable);
-    
-    /**
-     * Check if spider mode is enabled
-     * @return true if spider mode is enabled
-     */
-    bool is_spider_mode() const;
-    
-    /**
-     * Set callback for announce_peer requests (spider mode)
-     * Called when other peers announce they have a torrent
-     * @param callback The callback to invoke
-     */
-    void set_spider_announce_callback(SpiderAnnounceCallback callback);
-    
-    /**
-     * Set spider ignore mode - when true, incoming requests are not processed
-     * Useful for rate limiting in spider mode
-     * @param ignore true to ignore incoming requests, false to process them
-     */
-    void set_spider_ignore(bool ignore);
-    
-    /**
-     * Check if spider ignore mode is enabled
-     * @return true if ignoring incoming requests
-     */
-    bool is_spider_ignoring() const;
-    
-    /**
-     * Trigger a single spider walk iteration
-     * Sends find_node to a random node from the spider pool
-     * Call this periodically at desired frequency to discover new nodes
-     */
-    void spider_walk();
-    
-    /**
-     * Get the size of the spider node pool
-     * @return Number of nodes in spider pool
-     */
-    size_t get_spider_pool_size() const;
-    
-    /**
-     * Get the number of visited nodes in spider mode
-     * @return Number of visited nodes
-     */
-    size_t get_spider_visited_count() const;
-    
-    /**
-     * Clear spider state (pool and visited nodes)
-     * Useful for resetting the spider walk
-     */
-    void clear_spider_state();
-#endif // RATS_SEARCH_FEATURES
 
 private:
     int listen_port_;
@@ -2012,7 +1772,12 @@ private:
     // [1] Configuration persistence (protected by config_mutex_)
     mutable std::mutex config_mutex_;                       // [1] Protects configuration data
     std::string our_peer_id_;                               // Our persistent peer ID
+    std::string forced_peer_id_;                            // Embedder-forced id (wallet address); overrides generated/persisted id when non-empty
     std::string data_directory_;                            // Directory where data files are stored
+    // Debounced configuration save (item E): connect/disconnect churn used to spawn a
+    // detached save_configuration() thread per event. Instead they set this flag and the
+    // management_loop flushes it once per tick (coalescing bursts into a single write).
+    std::atomic<bool> config_dirty_{false};
     static const std::string CONFIG_FILE_NAME;             // "config.json"
     static const std::string PEERS_FILE_NAME;              // "peers.rats"
     static const std::string PEERS_EVER_FILE_NAME;         // "peers_ever.rats"
@@ -2131,10 +1896,6 @@ private:
     std::unique_ptr<StorageManager> storage_manager_;
 #endif
 
-#ifdef RATS_SEARCH_FEATURES
-    // BitTorrent client (optional, requires RATS_SEARCH_FEATURES)
-    std::unique_ptr<BitTorrentClient> bittorrent_client_;
-#endif
     
     void initialize_modules();
     void destroy_modules();
@@ -2142,9 +1903,18 @@ private:
     // Async I/O loop (single thread for all sockets)
     void io_loop();
     void management_loop();
+    // App-level keepalive sweep (item C): runs each management_loop tick. Sends a
+    // length-0 keepalive frame to idle COMPLETED peers and half-closes peers from which
+    // nothing has been received for KEEPALIVE_DEAD_SECONDS so the io thread disconnects
+    // (and reschedules) them. See definition for locking notes.
+    void keepalive_sweep();
     
     // I/O event handlers (called from io_loop)
     void accept_incoming();
+    // Best-effort MSG_PEEK check: true if a freshly-accepted socket is clearly not a
+    // librats peer (BitTorrent handshake / oversized length prefix). Used to drop such
+    // sockets before allocating peer state. See definition for details.
+    static bool looks_like_foreign_inbound(socket_t socket);
     bool handle_readable(socket_t socket);
     bool handle_writable(socket_t socket);
     void handle_disconnect(socket_t socket);
@@ -2219,10 +1989,20 @@ private:
     static constexpr int HANDSHAKE_TIMEOUT_SECONDS = 10;
     static constexpr int TCP_CONNECT_TIMEOUT_MS = 10000;        // 10 second TCP connection timeout
     static constexpr int IO_POLL_TIMEOUT_MS = 100;              // IO poller tick interval (ms)
-    static constexpr size_t MAX_FRAME_SIZE = 100 * 1024 * 1024; // 100 MB max single frame
+    static constexpr size_t MAX_FRAME_SIZE = 2 * 1024 * 1024;   // 2 MB max single frame (largest
+                                                                // legit librats frame is far under this;
+                                                                // tighter bound rejects junk/BitTorrent
+                                                                // handshakes early instead of trying to
+                                                                // buffer hundreds of MB)
     static constexpr int PEER_RECONNECT_DELAY_MS = 100;         // Delay before reconnecting saved peers
     static constexpr int HISTORICAL_RECONNECT_DELAY_MS = 500;   // Delay before reconnecting historical peers
     static constexpr int MANAGEMENT_LOOP_INTERVAL_SECONDS = 2;  // Management loop tick interval
+    // App-level keepalive (item C): send a length-0 frame to a COMPLETED peer that has
+    // been idle (no send) beyond this, and proactively disconnect a peer from which we
+    // have received nothing for KEEPALIVE_DEAD_SECONDS (≈3x interval). This surfaces
+    // dead paths in ~15s instead of waiting out the OS TCP keepalive (~30s+).
+    static constexpr int KEEPALIVE_IDLE_SECONDS = 5;            // idle-send threshold
+    static constexpr int KEEPALIVE_DEAD_SECONDS = 15;          // no-recv -> declare dead
     static constexpr int THREAD_CLEANUP_INTERVAL_SECONDS = 30;  // Thread cleanup interval
     static constexpr int INITIAL_DISCOVERY_DELAY_SECONDS = 5;   // DHT bootstrap delay
     static constexpr int MAX_PEERS_REQUEST_COUNT = 5;            // Max peers to request/respond

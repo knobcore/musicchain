@@ -43,6 +43,10 @@ const int    kVpsRatsPort = 8080;
 /// advertise this to a NAT'd peer; the DHT only exists for content-hash
 /// → peer-address lookups.
 const int    kDhtPort     = 0;
+// The VPS node's DHT port. The player bootstraps its PRIVATE DHT from here —
+// never the public mainline BitTorrent routers. KRPC on the wire looks like
+// BitTorrent (camouflage) but only ever reaches our own infrastructure.
+const int    kDhtBootstrapPort = 6881;
 
 /// A single mini-node we've heard about — either from prefs (cached from
 /// a previous run's `mininodes.list` reply) or hard-coded as the
@@ -98,7 +102,7 @@ class RatsClient {
   }
 
   /// One-shot init at app startup. Subsequent calls are no-ops.
-  static Future<RatsClient> initialize({int listenPort = 0}) async {
+  static Future<RatsClient> initialize({int listenPort = 0, String? walletAddress}) async {
     if (_instance != null) return _instance!;
 
     final lib = _loadLibrary();
@@ -108,7 +112,21 @@ class RatsClient {
     // do not want a fixed port (multiple players on the same LAN, mobile
     // hotspot scenarios, etc.).
     final port = listenPort != 0 ? listenPort : 33000 + Random().nextInt(2000);
-    final handle = b.create(port);
+
+    // wallet-as-id: pin our librats peer id to the wallet's chain address
+    // (lowercase 40-hex) so identity is stable across restarts and other peers
+    // can derive it from the wallet. Falls back to a generated id when there is
+    // no wallet yet (first run) or the loaded lib lacks rats_create_with_id; the
+    // next launch with a wallet pins it deterministically.
+    final pid = _normalizeWalletId(walletAddress);
+    Pointer<Void> handle;
+    if (pid != null && b.createWithId != null) {
+      final pidPtr = pid.toNativeUtf8();
+      handle = b.createWithId!(port, pidPtr);
+      malloc.free(pidPtr);
+    } else {
+      handle = b.create(port);
+    }
     if (handle.address == 0) {
       throw StateError('rats_create($port) returned null');
     }
@@ -117,6 +135,24 @@ class RatsClient {
     _instance = client;
     await client._start();
     return client;
+  }
+
+  /// Normalize a wallet address to a bare lowercase 40-hex string (the librats
+  /// peer-id format). Strips an optional 0x prefix; returns null if it is not a
+  /// valid 20-byte hex address.
+  static String? _normalizeWalletId(String? addr) {
+    if (addr == null) return null;
+    var s = addr.trim();
+    if (s.length >= 2 && (s.startsWith('0x') || s.startsWith('0X'))) {
+      s = s.substring(2);
+    }
+    s = s.toLowerCase();
+    if (s.length != 40) return null;
+    for (final cu in s.codeUnits) {
+      final isHex = (cu >= 0x30 && cu <= 0x39) || (cu >= 0x61 && cu <= 0x66);
+      if (!isHex) return null;
+    }
+    return s;
   }
 
   // -- Wiring ------------------------------------------------------------
@@ -133,6 +169,38 @@ class RatsClient {
 
   /// Tracks stream_id → stream sink so binary chunks can be reassembled.
   final Map<int, _AudioReceiver> _streams = {};
+
+  // -- Dead-peer GC ------------------------------------------------------
+  // Full nodes / serving peers the relay reported unreachable ('dead_route').
+  // We skip them for [_deadPeerTtl] so a stream/play/request stops hammering a
+  // corpse; discovery filters them out of the route list and selection/stream
+  // skips them, and they are re-learned automatically once they come back.
+  static const Duration _deadPeerTtl = Duration(seconds: 45);
+  final Map<String, DateTime> _deadPeers = {};
+
+  /// True while [peerId] is known-dead (within the TTL). Expired entries clear
+  /// lazily on read.
+  bool isPeerDead(String peerId) {
+    final until = _deadPeers[peerId];
+    if (until == null) return false;
+    if (DateTime.now().isAfter(until)) {
+      _deadPeers.remove(peerId);
+      return false;
+    }
+    return true;
+  }
+
+  /// Clear a dead mark — called whenever we successfully reach [peerId].
+  void markPeerAlive(String peerId) {
+    if (peerId.isNotEmpty) _deadPeers.remove(peerId);
+  }
+
+  void _markPeerDead(String peerId) {
+    if (peerId.isEmpty) return;
+    _deadPeers[peerId] = DateTime.now().add(_deadPeerTtl);
+    // ignore: avoid_print
+    print('[rats] GC: marked $peerId dead (relay reported unreachable)');
+  }
 
   // (#17 instability fix) Receiver-allocated stream ids. We propose a unique
   // id per fetch (client_stream_id) to the serving peer so two serving peers
@@ -227,6 +295,29 @@ class RatsClient {
     return eligible.first;
   }
 
+  /// All connected mini-nodes ordered least-busy-first (same ordering as
+  /// [bestMiniNodePeerId], but the full list rather than just the head).
+  /// request()'s relay routing walks this to fail over to the next mini-node
+  /// when one is busy/unreachable — so the more mini-nodes on the network, the
+  /// more aggregate relay throughput it carries.
+  List<String> _miniNodesByLoad() {
+    if (!_started) return const <String>[];
+    final validated = validatedPeerIds.toSet();
+    final eligible = _miniNodePeerIds
+        .where((id) => validated.contains(id))
+        .toList(growable: true);
+    eligible.sort((a, b) {
+      final la = _miniNodeLoad[a] ?? double.infinity;
+      final lb = _miniNodeLoad[b] ?? double.infinity;
+      final cmp = la.compareTo(lb);
+      if (cmp != 0) return cmp;
+      final sa = _miniNodeLastSeenMs[a] ?? 0;
+      final sb = _miniNodeLastSeenMs[b] ?? 0;
+      return sb.compareTo(sa);
+    });
+    return eligible;
+  }
+
   /// Per-target relay routing. Populated by `LibratsDiscovery` from the
   /// `reachability` field returned by routes.get. When set, requests bound
   /// for `targetPeerId` are wrapped as `relay.forward` and sent to the
@@ -301,6 +392,9 @@ class RatsClient {
 
   /// Direct rats_connect by host:port. Returns 0 on success.
   int connect(String host, int port) {
+    // (offline gate) An explicit dial is the user coming back online — clear
+    // the offline flag so the watchdog resumes maintaining the link.
+    _offline = false;
     final hostPtr = host.toNativeUtf8();
     try {
       return _b.connect(_handle, hostPtr, port);
@@ -309,37 +403,19 @@ class RatsClient {
     }
   }
 
-  // (DHT un-nerf P0b) serializes connectAndResolve so concurrent dials can't
-  // misattribute which newly-validated peer_id belongs to which dial.
-  Future<void> _dialResolveChain = Future<void>.value();
-
-  /// Dial a raw host:port that carries no librats peer_id (e.g. a
-  /// DHT-discovered seeder) and return the peer_id that validates as a result.
-  /// librats exposes no address→peer_id lookup, so we snapshot the validated
-  /// set, dial, and return the newly-appeared id. Serialized via a chained
-  /// future (Dart is single-isolate, so the synchronous prefix that swaps the
-  /// chain is atomic) so two concurrent dials don't both claim the same fresh
-  /// id. Returns null if nothing new validates within [timeout].
+  /// Formerly: dial a raw host:port (DHT-discovered seeder) and return the
+  /// peer_id that validates. Now a relay-only no-op — see the body. Kept so
+  /// PieceDownloader's call site needs no change.
   Future<String?> connectAndResolve(String host, int port,
       {Duration timeout = const Duration(seconds: 6)}) async {
-    if (!_started || host.isEmpty || port <= 0) return null;
-    final prev = _dialResolveChain;
-    final gate = Completer<void>();
-    _dialResolveChain = gate.future;
-    await prev;
-    try {
-      final before = validatedPeerIds.toSet();
-      connect(host, port);
-      final deadline = DateTime.now().add(timeout);
-      while (DateTime.now().isBefore(deadline)) {
-        await Future.delayed(const Duration(milliseconds: 200));
-        final fresh = validatedPeerIds.toSet().difference(before);
-        if (fresh.isNotEmpty) return fresh.first;
-      }
-      return null;
-    } finally {
-      gate.complete();
-    }
+    // NO DIRECT CONNECTS. This used to dial a DHT-discovered seeder (a raw
+    // host:port with no peer_id) so PieceDownloader could pull pieces from it
+    // directly. With relay-only routing there is no way to relay to a bare
+    // host:port — the mini-node forwards by peer_id — and dialing the seeder is
+    // exactly the flaky direct link we removed. Return null so PieceDownloader
+    // bans the bare-address source and falls back to the full-node swarm peers
+    // (which carry peer_ids and relay cleanly through the mini-nodes).
+    return null;
   }
 
   /// Drop the open librats peer with `peerId`. No-op if the peer is not
@@ -361,6 +437,9 @@ class RatsClient {
   /// and rebuilds discovery state.
   int disconnectAll() {
     if (!_started) return 0;
+    // (offline gate) Mark us deliberately offline so the 3 s watchdog stops
+    // re-dialing the mini-node set. Cleared by forceVpsReconnect()/connect().
+    _offline = true;
     final ids = validatedPeerIds;
     for (final id in ids) {
       disconnectPeer(id);
@@ -415,13 +494,28 @@ class RatsClient {
 
     _started = true;
 
-    // Spin up the BitTorrent-compatible DHT on a dedicated UDP port so
-    // peers can find each other for a content_hash without going through
-    // the VPS's in-memory swarm index. Failure here is non-fatal — we
-    // still have the VPS-relayed swarm.locate as a fallback discovery
-    // mechanism. The DHT bootstraps from public BitTorrent nodes baked
-    // into librats and from any peer the rats client already knows.
+    // Spin up the KRPC DHT on a dedicated UDP port so peers can find each
+    // other for a content_hash without going through the VPS's in-memory swarm
+    // index. Failure here is non-fatal — we still have the VPS-relayed
+    // swarm.locate as a fallback discovery mechanism. The DHT speaks the
+    // BitTorrent KRPC protocol (so the wire looks like BitTorrent), but it is
+    // pointed at our PRIVATE bootstrap (the VPS) — never the public mainline
+    // routers — so it only ever talks to our own infrastructure.
     try {
+      // Private overlay: set the VPS as the DHT bootstrap before starting.
+      // Even if the VPS DHT does not answer, the bootstrap ping is KRPC on the
+      // wire (indistinguishable from a BitTorrent client) — that's the camouflage.
+      // Optional symbol: an older mc_rats build may not export it, in which case
+      // we skip the private-bootstrap step rather than crash the whole client.
+      final setBoot = _b.dhtSetBootstrap;
+      if (setBoot != null) {
+        final bootPtr = kVpsHost.toNativeUtf8();
+        try {
+          setBoot(_handle, bootPtr, kDhtBootstrapPort);
+        } finally {
+          malloc.free(bootPtr);
+        }
+      }
       final dhtRc = _b.startDhtDiscovery(_handle, kDhtPort);
       if (dhtRc != 0) {
         // ignore: avoid_print
@@ -502,6 +596,13 @@ class RatsClient {
   /// any half-dead one still mapped server-side.
   void forceVpsReconnect() {
     if (!_started) return;
+    // (offline gate) Explicit reconnect clears the deliberate-offline state
+    // and resets every mini-node's redial backoff so all of them are dialed
+    // immediately rather than waiting out a stale per-peer backoff window.
+    _offline = false;
+    _redialFails.clear();
+    _redialNextAt.clear();
+    _downSince = null;
     for (final v in _knownMiniNodes) {
       _dialOne(v);
     }
@@ -623,6 +724,10 @@ class RatsClient {
 
   Timer? _reconnectTimer;
   bool   _vpsWasUp = false;
+  // (offline gate) Set by disconnectAll (user "go offline"), cleared by
+  // forceVpsReconnect / connect. While true the watchdog returns early so a
+  // user who deliberately went offline isn't dragged back online every 3 s.
+  bool   _offline = false;
   // (#6 instability fix) hysteresis + rate-limit for the heavy reconnect
   // recovery (full library re-announce + onVpsReconnected). A flapping
   // wifi↔cellular link would otherwise re-fire that storm on every up-edge.
@@ -631,28 +736,79 @@ class RatsClient {
   static const Duration _kStableUp          = Duration(seconds: 3);
   static const Duration _kReconnectCooldown = Duration(seconds: 20);
 
+  // Per-mini-node redial backoff. The old watchdog re-dialed the ENTIRE known
+  // set every 3 s while down; a few unreachable VPSes in the list then meant a
+  // connect storm every tick. Instead each mini-node gets exponential backoff
+  // (3 s doubling to a 60 s cap) keyed on its consecutive-failure count, so a
+  // dead VPS is probed ever-less-often while a flapping one still recovers
+  // fast. Reset to zero the moment that mini-node validates (handled lazily in
+  // _vpsWatchdog when the link is up, and on forceVpsReconnect).
+  final Map<MiniNodeAddr, int>      _redialFails    = {};
+  final Map<MiniNodeAddr, DateTime> _redialNextAt   = {};
+  static const Duration _kRedialBase = Duration(seconds: 3);
+  static const Duration _kRedialCap  = Duration(seconds: 60);
+
+  // (#4b) Down-hysteresis before nuking ALL mini-node identity + relay
+  // routing. A single empty watchdog tick (one missed keepalive, a brief
+  // event-loop stall) used to wipe _miniNodePeerIds + _relayVia wholesale,
+  // forcing a full rediscovery even though the sockets were fine. We only
+  // clear after the set has been CONTINUOUSLY empty for _kDownHysteresis; the
+  // per-peer _handlePeerDisconnected eviction already removes genuinely-dead
+  // ids the instant librats reports them, so this wholesale wipe is a
+  // last-resort backstop, not the primary path.
+  DateTime? _downSince;
+  static const Duration _kDownHysteresis = Duration(seconds: 10);
+
+  /// Backoff-aware redial of every known mini-node. Dials only those whose
+  /// per-peer backoff window has elapsed and advances each dialed peer's next
+  /// attempt time. librats's connect is idempotent in async mode, so a dial
+  /// that races an in-flight connect is a cheap no-op.
+  void _redialDueMiniNodes() {
+    final now = DateTime.now();
+    for (final v in _knownMiniNodes) {
+      final nextAt = _redialNextAt[v];
+      if (nextAt != null && now.isBefore(nextAt)) continue;
+      _dialOne(v);
+      final fails = (_redialFails[v] ?? 0) + 1;
+      _redialFails[v] = fails;
+      // base * 2^(fails-1), clamped to the cap. fails=1 → 3s, 2 → 6s, … 60s.
+      final int shift = (fails - 1).clamp(0, 16).toInt();
+      final ms = (_kRedialBase.inMilliseconds * (1 << shift))
+          .clamp(_kRedialBase.inMilliseconds, _kRedialCap.inMilliseconds)
+          .toInt();
+      _redialNextAt[v] = now.add(Duration(milliseconds: ms));
+    }
+  }
+
   void _vpsWatchdog() {
+    // (offline gate) User asked to go offline — don't drag them back.
+    if (_offline) return;
     final up = validatedPeerIds.isNotEmpty;
     if (!up) {
-      // No live handshake — dial every known mini-node. rats_connect is
-      // idempotent in async mode; a duplicate call when we're already
-      // connecting is a no-op, so dialing the full set every tick is
-      // cheap and gives whichever VPS comes back first the win.
-      for (final v in _knownMiniNodes) {
-        _dialOne(v);
+      // No live handshake — redial mini-nodes whose per-peer backoff window
+      // has elapsed (NOT the whole set every tick; see _redialDueMiniNodes).
+      _redialDueMiniNodes();
+      // (#4b) Only wipe mini-node identity + relay routing after the set has
+      // been CONTINUOUSLY empty for _kDownHysteresis. A single empty tick is
+      // not enough — the per-peer disconnect handler is the primary eviction
+      // path; this wholesale clear is a backstop for the ~30 s window after a
+      // mini-node restart where the old (dead) peer_id is still cached but
+      // librats never fired a disconnect for it.
+      _downSince ??= DateTime.now();
+      if (DateTime.now().difference(_downSince!) >= _kDownHysteresis) {
+        _miniNodePeerIds.clear();
+        _relayVia.clear();
       }
-      // Drop ghost mini-node peer ids and stale relay mappings so the
-      // next refresh repopulates from scratch instead of routing through
-      // peer ids librats no longer knows. After a mini-node restart
-      // there's a ~30 s window where the old peer_id is still cached
-      // here but the underlying socket is dead — without this every
-      // outbound request gets routed to the ghost peer and times out at
-      // 15 s instead of failing fast.
-      _miniNodePeerIds.clear();
-      _relayVia.clear();
       _vpsWasUp = false;
       _upSince  = null;
       return;
+    }
+    // Link is up — clear the down timer and reset every mini-node's redial
+    // backoff so the next outage starts fresh from the 3 s base.
+    _downSince = null;
+    if (_redialFails.isNotEmpty || _redialNextAt.isNotEmpty) {
+      _redialFails.clear();
+      _redialNextAt.clear();
     }
     // Link is up. Only run the heavy recovery once per up-period, AND only
     // after it has been stably up for _kStableUp (so a momentary flap
@@ -686,10 +842,16 @@ class RatsClient {
     if (!_started)                   return;
     if (validatedPeerIds.isEmpty)    return;
     Future<void> announceOnce() async {
-      final ids = validatedPeerIds;
-      if (ids.isEmpty) return;
+      // player.announce registers us in the mini-node's g_players map so other
+      // players can locate us — it is a MINI-NODE-ONLY verb. Targeting
+      // validatedPeerIds.first would land it on a full node (or another
+      // player), which never registers the device and silently swallows it.
+      // Bail (the 5-min periodic / watchdog retries) until a mini-node is
+      // connected; never fall back to ids.first for a mini-node-only verb.
+      final vps = bestMiniNodePeerId ?? firstMiniNodePeerId;
+      if (vps == null) return;
       try {
-        await request(ids.first, 'player.announce',
+        await request(vps, 'player.announce',
             {'peer_id': _ownPeerId},
             timeout: const Duration(seconds: 6));
       } catch (_) {
@@ -716,10 +878,13 @@ class RatsClient {
     if (!_started)                return;
     if (validatedPeerIds.isEmpty) return;
     // stun.observe is mini-node-only; full nodes return unknown_type
-    // post-pivot. Wait briefly for a mini-node to identify itself if
-    // none has yet — the watchdog calls this on every reconnect so a
-    // delayed mini.hello recovers on the next tick anyway.
-    final vps = firstMiniNodePeerId ?? validatedPeerIds.first;
+    // post-pivot. NEVER fall back to validatedPeerIds.first here — that lands
+    // the verb on a full node (unknown_type) and the device never learns its
+    // observed address. Return when no mini-node is connected; the watchdog
+    // calls this on every reconnect so a delayed mini.hello recovers on the
+    // next tick anyway.
+    final vps = bestMiniNodePeerId ?? firstMiniNodePeerId;
+    if (vps == null) return;
     try {
       final reply = await request(vps, 'stun.observe', const {},
           timeout: const Duration(seconds: 6));
@@ -1006,37 +1171,75 @@ class RatsClient {
     //      have at least one validated peer (the VPS), fall back to
     //      relaying through that peer.
     //   3. Otherwise, send direct.
-    final explicitRelay = _relayVia[peerId];
-    String? routeVia;
-    if (type != 'relay.forward') {
-      if (explicitRelay != null && explicitRelay.isNotEmpty) {
-        routeVia = explicitRelay;
-      } else if (!validatedPeerIds.contains(peerId)) {
-        // Prefer a peer we've confirmed is a mini-node (via mini.hello)
-        // over an arbitrary librats validated peer. Pre-fix this used
-        // `ids.first`, which after any peer-table churn (mini-node
-        // restart, network blip) could be ANOTHER PLAYER — and players
-        // don't handle relay.forward, so the relayed request bounced
-        // back as "no handler for type=relay.forward". Mirrors the
-        // pattern already used for stun.observe at line 531.
-        //
-        // bestMiniNodePeerId is load-aware (lightest mini-node first,
-        // tiebreak on freshness) so during a peak we don't concentrate
-        // every player's relay traffic on a single VPS. Falls through
-        // to firstMiniNodePeerId on cold start (before mininodes.list
-        // populated the load cache) and finally to validatedPeerIds.first
-        // as the universal last resort.
-        routeVia = bestMiniNodePeerId
-            ?? firstMiniNodePeerId
-            ?? (validatedPeerIds.isNotEmpty ? validatedPeerIds.first : null);
+    // ALWAYS relay through a mini-node — NO direct connects. Mini-nodes are
+    // rewarded for forwarding, so the data path must traverse them; bypassing
+    // them with a direct connect breaks that incentive. Direct links
+    // (NAT-punch / LAN IPv6) also proved flaky — they go half-open and the
+    // keepalive flaps them, stranding transfers. The only non-relayed sends are
+    // to a mini-node itself (it IS the relay) and relay.forward frames.
+    //
+    // Fail over across mini-nodes least-busy-first: a busy/unreachable mini-node
+    // doesn't sink the request, and aggregate relay throughput scales with the
+    // number of mini-nodes on the network (add a mini-node → more capacity).
+    if (type != 'relay.forward' && !_miniNodePeerIds.contains(peerId)) {
+      final relays = _miniNodesByLoad();
+      if (relays.isEmpty) {
+        throw RatsRpcException(
+            'send_failed', 'no mini-node connected to relay to $peerId');
       }
-    }
-    if (routeVia != null && routeVia != peerId) {
-      return request(routeVia, 'relay.forward', {
-        'target_peer_id': peerId,
-        'type':           type,
-        'body':           body,
-      }, timeout: timeout);
+      Object? relayErr;
+      for (final relay in relays) {
+        if (relay == peerId) continue;
+        try {
+          final relayed = await request(relay, 'relay.forward', {
+            'target_peer_id': peerId,
+            'type':           type,
+            'body':           body,
+          }, timeout: timeout);
+          markPeerAlive(peerId); // target replied through the relay -> it's alive
+          return relayed;
+        } catch (e) {
+          relayErr = e;
+          // Transport/route failure → fail over to the next least-busy mini-node,
+          // then (if all exhausted) surface as send_failed below so the caller's
+          // rediscover/retry kicks in. This INCLUDES the relay reporting it
+          // forwarded to a now-dead/evicted target ('dead_route') or that its
+          // forward TTL expired with no reply ('error' + message 'relay_timeout')
+          // — those mean the ROUTE is stale (node restart / NAT flap / VPS
+          // hand-off), NOT that the request was rejected, so we must fail over +
+          // rediscover instead of hard-failing into the UI (this is what made
+          // catalog ops + downloads intermittently hang). A real protocol reply
+          // (not_matched / rejected / 402 / …) means relay+target worked, so
+          // surface it immediately rather than failing over.
+          if (e is RatsRpcException &&
+              (e.status == 'send_failed' ||
+               e.status == 'timeout' ||
+               e.status == 'dead_route' ||
+               (e.status == 'error' && e.message == 'relay_timeout'))) {
+            continue;
+          }
+          rethrow;
+        }
+      }
+      // Dead-node GC (user-requested): the relay reported the TARGET unreachable
+      // ('dead_route') after exhausting every working mini-node — the node /
+      // serving-peer is dead. Mark it so discovery filters it out of the route
+      // list and selection/stream skips it, instead of hammering a corpse until
+      // the next 20s refresh. It returns automatically once it comes back.
+      if (relayErr is RatsRpcException && relayErr.status == 'dead_route') {
+        _markPeerDead(peerId);
+      }
+      // Every mini-node failed to relay (or every route was stale). ALWAYS
+      // surface as send_failed — never the raw dead_route/relay_timeout — so
+      // every caller's send_failed handling (LibraryProvider._withRediscoverRetry,
+      // the swarm-fetch fallback) triggers a rediscover instead of dead-ending.
+      // The original status/message is preserved for diagnostics.
+      throw RatsRpcException(
+          'send_failed',
+          relayErr is RatsRpcException
+              ? 'all mini-nodes failed to relay to $peerId '
+                '(last: ${relayErr.status}/${relayErr.message})'
+              : 'all mini-nodes failed to relay to $peerId');
     }
 
     // No route possible — target isn't validated and we have no VPS to
@@ -1410,6 +1613,25 @@ class RatsClient {
       PlayerServer.instance.cancelStreamsForPeer(peerId);
     } catch (_) {/* PlayerServer not initialized yet, or cancel threw */}
 
+    // (#6) Abort every INBOUND audio receiver whose serving peer OR relay
+    // mini-node just disconnected. Without this a known drop only surfaces
+    // after the AudioStream's stall guard (6-8 s streaming / 30 s download)
+    // expires; cancelling here makes the proxy/await fail instantly so the
+    // caller re-resolves the swarm immediately. cancel() errors the receiver
+    // future + closes its stream; we drop the _streams entry so a late chunk
+    // for that id parks harmlessly in _earlyChunks instead of feeding a torn-
+    // down receiver.
+    final deadStreams = <int>[];
+    _streams.forEach((sid, r) {
+      if (r.servingPeerId == peerId || r.relayPeerId == peerId) {
+        deadStreams.add(sid);
+      }
+    });
+    for (final sid in deadStreams) {
+      final r = _streams.remove(sid);
+      try { r?.cancel(); } catch (_) {/* cancel must not crash disconnect */}
+    }
+
     // (#4 instability fix) Fail-fast every in-flight request whose
     // destination (a relay mini-node or a direct peer) just died. Without
     // this, a mini-node drop / cellular-flip leaves each orphaned request
@@ -1629,7 +1851,12 @@ class RatsClient {
       throw RatsRpcException('no_swarm',
           'no swarm peers for $contentHash');
     }
-    final ordered = _pickOrder(variants, preferredBitrate: preferredBitrate);
+    // Dead-node GC: skip serving peers the relay recently reported unreachable
+    // so a download stops re-dialing corpses. All-dead -> try anyway.
+    final liveVariants = variants.where((v) => !isPeerDead(v.peerId)).toList();
+    final ordered = _pickOrder(
+        liveVariants.isNotEmpty ? liveVariants : variants,
+        preferredBitrate: preferredBitrate);
 
     // 2. Resolve public addresses via the VPS player.locate, if we have one.
     final addresses = await _resolveAddresses(
@@ -1641,7 +1868,9 @@ class RatsClient {
     Object? lastError;
     for (final v in ordered) {
       try {
-        await _maybeDirectConnect(v.peerId, addresses[v.peerId], vpsPeerId);
+        // (#7) Non-blocking: sets relay-via as the default immediately and
+        // races a short direct dial in the background.
+        _maybeDirectConnect(v.peerId, addresses[v.peerId], vpsPeerId);
         final bytes = await requestAudio(v.peerId, v.contentHash,
             openTimeout:  const Duration(seconds: 10),
             totalTimeout: totalTimeout,
@@ -1774,36 +2003,29 @@ class RatsClient {
     return addresses;
   }
 
-  Future<void> _maybeDirectConnect(
+  /// (#7) Set relay-via as the default IMMEDIATELY and kick off a short,
+  /// non-blocking speculative direct dial. The old version blocked the first
+  /// byte for up to 5 s (20×250 ms) waiting for a direct connection that, on
+  /// cellular's symmetric NAT, almost never lands — every play paid a 5 s tax
+  /// before even sending stream.open. Now: relay is live the instant we
+  /// return, the dial races in the background (~1 s cap), and IF it validates
+  /// we flip the route to direct for the NEXT request. The in-flight stream
+  /// already running over relay is unaffected.
+  // NO-OP. Direct peer connections are gone by design: mini-nodes are rewarded
+  // for relaying, so the data path must always traverse a mini-node, and
+  // request() now routes EVERY non-mini-node peer through the least-busy
+  // mini-node (with failover). Direct links (NAT-punch / LAN IPv6) also proved
+  // flaky — half-open sockets that the keepalive flapped, stranding transfers —
+  // so we no longer dial peers at all. Kept as a no-op so the call sites
+  // (streamFromSwarm / downloadFromSwarm) need no changes. Params intentionally
+  // unused.
+  // ignore: unused_element
+  void _maybeDirectConnect(
     String peerId,
     String? addr,
     String? vpsPeerId,
-  ) async {
-    bool direct = false;
-    if (addr != null) {
-      // Use lastIndexOf so IPv6 literals like 2001:db8::1:8080 parse to
-      // host=2001:db8::1 / port=8080 instead of host=2001 / port=garbage.
-      // The mini-node list parsers (_loadKnownMiniNodes, _refreshMiniNodes)
-      // already do this; the indexOf here silently dropped every IPv6
-      // public_address into the relay fallback path.
-      final colon = addr.lastIndexOf(':');
-      if (colon > 0) {
-        final host = addr.substring(0, colon);
-        final port = int.tryParse(addr.substring(colon + 1)) ?? 0;
-        if (port > 0) {
-          connect(host, port);
-          for (int i = 0; i < 20; ++i) {
-            await Future.delayed(const Duration(milliseconds: 250));
-            if (validatedPeerIds.contains(peerId)) { direct = true; break; }
-          }
-        }
-      }
-    }
-    if (direct) {
-      setRelayVia(peerId, null);
-    } else if (vpsPeerId != null && vpsPeerId.isNotEmpty) {
-      setRelayVia(peerId, vpsPeerId);
-    }
+  ) {
+    // Intentionally empty — see the note above. All routing is relay-only.
   }
 
   /// Same shape as [downloadFromSwarm] but returns an [AudioStream] the
@@ -1816,6 +2038,14 @@ class RatsClient {
     required String contentHash,
     String? vpsPeerId,
     int? preferredBitrate,
+    /// (#6) Streaming stall guard plumbed into the returned AudioStream. The
+    /// streaming path wants a much tighter idle window than the bulk
+    /// download (which keeps the 30 s default): if no chunk lands for this
+    /// long the AudioStream cancels, the proxy unblocks, and the caller can
+    /// re-resolve the swarm instead of libmpv hanging on a dead pipe. 6-8 s
+    /// is long enough to ride out a relay hiccup, short enough that a real
+    /// drop aborts fast.
+    Duration chunkStall = const Duration(seconds: 7),
   }) async {
     final probeRaw = await request(nodePeerId, 'stream.open',
         {'content_hash': contentHash},
@@ -1833,14 +2063,24 @@ class RatsClient {
       final receiver = _AudioReceiver(totalBytes);
       _streams[streamId] = receiver;
       _drainEarlyChunks(streamId, receiver);
-      return AudioStream._(streamId, totalBytes, receiver, _streams);
+      // Local fast-path: the full node itself is sending bytes, so the
+      // "serving peer" is nodePeerId. No swarm relay involved.
+      receiver.servingPeerId = nodePeerId;
+      return AudioStream._(streamId, totalBytes, receiver, _streams,
+          chunkStall: chunkStall);
     }
     final variants = _parseVariants(probe['peers']);
     if (variants.isEmpty) {
       throw RatsRpcException('no_swarm',
           'no swarm peers for $contentHash');
     }
-    final ordered = _pickOrder(variants, preferredBitrate: preferredBitrate);
+    // Dead-node GC: skip serving peers the relay recently reported unreachable
+    // so we don't re-dial corpses on every stream attempt. If they're ALL
+    // marked dead, try them anyway (they may have recovered) rather than failing.
+    final liveVariants = variants.where((v) => !isPeerDead(v.peerId)).toList();
+    final ordered = _pickOrder(
+        liveVariants.isNotEmpty ? liveVariants : variants,
+        preferredBitrate: preferredBitrate);
     final addresses = await _resolveAddresses(
       ordered.map((v) => v.peerId).toSet().toList(),
       vpsPeerId: vpsPeerId,
@@ -1850,12 +2090,15 @@ class RatsClient {
     final fetchHash = (SwarmVariant v) => v.contentHash.isNotEmpty
         ? v.contentHash
         : contentHash;
-    for (final v in ordered) {
-      await _maybeDirectConnect(v.peerId, addresses[v.peerId], vpsPeerId);
-      // Retry once: the first stream.open against a freshly-relayed
-      // peer often races the VPS forwarding table. A 300 ms wait +
-      // single retry is enough to make playback start on the first
-      // tap instead of "click play, get nothing, click play again."
+
+    // (#7) Open one swarm member, returning a ready AudioStream or null on
+    // failure (lastError captured in the closure scope). Shorter first-attempt
+    // open timeout (4 s vs the old 8 s) so a dead member is abandoned fast;
+    // ONE quick retry for a forwarding-table race, but short-circuit
+    // immediately on send_failed / disconnect (the relay/peer is gone — a
+    // retry would just burn another timeout).
+    Future<AudioStream?> openMember(SwarmVariant v) async {
+      _maybeDirectConnect(v.peerId, addresses[v.peerId], vpsPeerId);
       Map<String, dynamic>? reply;
       for (int attempt = 0; attempt < 2; ++attempt) {
         try {
@@ -1863,54 +2106,104 @@ class RatsClient {
               {'content_hash': fetchHash(v),
                'client_stream_id': _allocClientStreamId(),   // #17
                if (deliveryId != null) 'delivery_id': deliveryId},
-              timeout: const Duration(seconds: 8))
+              timeout: const Duration(seconds: 4))
               as Map<String, dynamic>;
           break;
         } catch (e) {
           lastError = e;
           reply = null;
+          // Short-circuit: a dead relay/peer won't recover on a retry.
+          if (e is RatsRpcException &&
+              (e.status == 'send_failed' || e.status == 'timeout')) {
+            return null;
+          }
           if (attempt == 0) {
             await Future.delayed(const Duration(milliseconds: 300));
           }
         }
       }
-      if (reply == null) continue;
+      if (reply == null) return null;
       if (reply['matched'] == false) {
         lastError = RatsRpcException('not_matched',
             'peer ${v.peerId} no longer has ${fetchHash(v)}');
-        continue;
+        return null;
       }
       // (#12 instability fix) defensive parse — a malformed/hostile serving
       // peer could send a non-int/absent stream_id|total_bytes; a raw
-      // `as int` here is OUTSIDE the per-attempt try and would abort the
-      // whole playback instead of just skipping this member.
+      // `as int` would abort the whole playback instead of just skipping.
       final streamId   = (reply['stream_id']   as num?)?.toInt();
       final totalBytes = (reply['total_bytes'] as num?)?.toInt();
       if (streamId == null || totalBytes == null) {
         lastError = RatsRpcException('not_matched',
             'peer ${v.peerId} sent malformed stream.open reply');
-        continue;
+        return null;
       }
       final receiver = _AudioReceiver(totalBytes);
       _streams[streamId] = receiver;
       _drainEarlyChunks(streamId, receiver);
+      // (#6) Tag the receiver with its serving peer + relay so a disconnect of
+      // EITHER aborts this inbound stream immediately (_handlePeerDisconnected)
+      // rather than waiting out the stall guard.
+      receiver.servingPeerId = v.peerId;
+      // Relay-only: the serving peer is reached through the least-busy
+      // mini-node, so credit THAT mini-node for the relay (and abort the stream
+      // if it drops). _relayVia may carry a discovery-set override; otherwise
+      // it's whatever bestMiniNodePeerId request() routed through.
+      receiver.relayPeerId   = _relayVia[v.peerId] ?? bestMiniNodePeerId ?? '';
       // #10: when the stream finishes (EOF), send a signed relay.receipt to
       // the broker. Best-effort: a never-completing stream just never
       // corroborates (the mini's report alone earns nothing).
       if (deliveryId != null) {
-        final servingPeer = v.peerId;
         final fh = fetchHash(v);
         receiver.future.then((_) {
           _sendRelayReceipt(
             brokerPeerId:  nodePeerId,
             deliveryId:    deliveryId,
             contentHash:   fh,
-            miniPeerId:    _relayVia[servingPeer] ?? '',
+            miniPeerId:    receiver.relayPeerId,
             bytesReceived: receiver.received,
           );
         }).catchError((_) {});
       }
-      return AudioStream._(streamId, totalBytes, receiver, _streams);
+      return AudioStream._(streamId, totalBytes, receiver, _streams,
+          chunkStall: chunkStall);
+    }
+
+    // (#7) Try members CONCURRENTLY in small batches and RETURN on the first
+    // one that opens — first-byte latency is bounded by the FASTEST member in
+    // the batch, not the slowest. Stragglers from the same batch are reaped in
+    // the background: any that still open get cancelled so their serving peer
+    // stops pushing chunks into a stream nobody drains. Batching (vs fanning
+    // out all of `ordered`) bounds wasted opens to batchSize-1 per round.
+    const batchSize = 2;
+    for (int i = 0; i < ordered.length; i += batchSize) {
+      final batch = ordered.sublist(
+          i, min(i + batchSize, ordered.length));
+      final futures = [for (final v in batch) openMember(v)];
+      // Race the batch: first non-null wins. We track the others so we can
+      // cancel a late opener instead of leaking its stream.
+      final completer = Completer<AudioStream?>();
+      int pending = futures.length;
+      for (final f in futures) {
+        f.then((s) {
+          if (s != null && !completer.isCompleted) {
+            completer.complete(s);
+          } else if (s != null) {
+            // Lost the race but still opened — tear it down in the background.
+            s.cancel();
+          }
+          if (--pending == 0 && !completer.isCompleted) {
+            completer.complete(null);   // whole batch failed
+          }
+        }).catchError((_) {
+          // openMember swallows its own errors; defensive only.
+          if (--pending == 0 && !completer.isCompleted) {
+            completer.complete(null);
+          }
+        });
+      }
+      final winner = await completer.future;
+      if (winner != null) return winner;
     }
     throw RatsRpcException('swarm_exhausted',
         'no swarm member served $contentHash (last error: $lastError)');
@@ -1991,7 +2284,7 @@ class RatsClient {
           brokerPeerId:  brokerPeerId,
           deliveryId:    deliveryId,
           contentHash:   contentHash,
-          miniPeerId:    _relayVia[peerId] ?? '',
+          miniPeerId:    _relayVia[peerId] ?? bestMiniNodePeerId ?? '',
           bytesReceived: receiver.received,
         ));
       }
@@ -2154,6 +2447,15 @@ class _AudioReceiver {
   _AudioReceiver(this.totalBytes);
 
   final int totalBytes;
+
+  /// (#6) The peer serving this stream and the relay (mini-node) it routes
+  /// through, when known. _handlePeerDisconnected matches the disconnected
+  /// peerId against EITHER so a known drop of the serving peer OR its relay
+  /// aborts the inbound receiver instantly instead of waiting out the stall
+  /// guard. Set by the streaming/download paths right after registration;
+  /// empty for the legacy full-node local fast-path (no swarm peer).
+  String servingPeerId = '';
+  String relayPeerId   = '';
   final Completer<List<int>> _done = Completer();
   final StreamController<Uint8List> _stream =
       StreamController<Uint8List>(sync: false);
@@ -2286,8 +2588,27 @@ class AudioStream {
 
   void cancel() {
     _stopWatch();
+    // (H1) Tell the serving peer to STOP pushing this stream. A skip/abandon is
+    // NOT a peer disconnect, so without this the seeder keeps streaming the rest
+    // of the track through the single relay (30 s+ for a full song), starving
+    // the next stream.open — the "skip → next track hangs" bug. Best-effort,
+    // fire-and-forget, routed via the relay like any other RPC; harmless if the
+    // peer/relay is already gone (it just fails and is swallowed).
+    final servingPeer = _receiver.servingPeerId;
+    if (servingPeer.isNotEmpty) {
+      // ignore: unawaited_futures
+      RatsClient.instance
+          .request(servingPeer, 'stream.cancel', {'stream_id': _streamId},
+              timeout: const Duration(seconds: 3))
+          .catchError((Object _) => null);
+    }
     _receiver.cancel();
-    _owner.remove(_streamId);
+    // Only evict the map entry if it's still OURS. Concurrent stream.open
+    // attempts (streamFromSwarm now races members) can collide on a stream_id;
+    // a losing attempt cancelling must not remove the WINNER's live receiver
+    // under the same key — that would orphan the live stream until its stall
+    // guard fires. Identity-check before removing.
+    if (identical(_owner[_streamId], _receiver)) _owner.remove(_streamId);
   }
 }
 

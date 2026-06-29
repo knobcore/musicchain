@@ -22,6 +22,7 @@ RATS_API uint32_t rats_get_abi(void);
 
 // Client lifecycle
 RATS_API rats_client_t rats_create(int listen_port);
+RATS_API rats_client_t rats_create_with_id(int listen_port, const char* peer_id); // peer_id: 40-hex wallet address; null/empty = auto-generate
 RATS_API void rats_destroy(rats_client_t client);
 RATS_API int rats_start(rats_client_t client);
 RATS_API void rats_stop(rats_client_t client);
@@ -97,7 +98,25 @@ RATS_API rats_error_t rats_send_json(rats_client_t client, const char* peer_id, 
 RATS_API int rats_broadcast_json(rats_client_t client, const char* json_str);
 
 // DHT Discovery
+//
+// PRIVATE OVERLAY: musicchain's DHT speaks the standard KRPC/DHT wire protocol but must
+// NOT bootstrap off the public mainline routers. Call rats_dht_set_bootstrap() with the
+// VPS host:port BEFORE rats_start_dht_discovery() (or pass them through the latter). With
+// no bootstrap configured the DHT starts isolated (only learns nodes that contact it).
+
+// Replace the private DHT bootstrap list with a single host:port (the VPS). Pass host=NULL
+// (or port=0) to clear the list. Process-wide; takes effect on the next bootstrap.
+RATS_API rats_error_t rats_dht_set_bootstrap(rats_client_t client, const char* host, int port);
+
+// Start DHT discovery. If bootstrap_host is non-NULL, it is installed as the (single)
+// private bootstrap node before starting — equivalent to rats_dht_set_bootstrap()
+// followed by rats_start_dht_discovery(). Pass bootstrap_host=NULL to start with whatever
+// was previously configured via rats_dht_set_bootstrap().
 RATS_API rats_error_t rats_start_dht_discovery(rats_client_t client, int dht_port);
+RATS_API rats_error_t rats_start_dht_discovery_bootstrap(rats_client_t client,
+                                                         const char* bootstrap_host,
+                                                         int bootstrap_port,
+                                                         int dht_port);
 RATS_API void rats_stop_dht_discovery(rats_client_t client);
 RATS_API int rats_is_dht_running(rats_client_t client);
 // Announce that this client holds [content_hash] on the DHT and start

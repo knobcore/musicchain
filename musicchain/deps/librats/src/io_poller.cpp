@@ -548,18 +548,21 @@ public:
                 if (internal_status == 0) {
                     // Success — report readiness for the event type we were watching
                     reported_events = io->event_type & state->desired_events;
-                    
-                    // Re-arm overlapped I/O for next notification.
-                    // Without this, the socket becomes deaf after the first
-                    // completion because sync_poller() only calls modify()
-                    // when desired_events change — which they don't for a
+
+                    // Re-arm READ for the next notification. Without this the socket
+                    // becomes deaf after the first completion because the io thread only
+                    // calls modify() when desired_events change — which they don't for a
                     // socket that stays PollIn-only.
                     if ((io->event_type & PollIn) && (state->desired_events & PollIn)) {
                         arm_read(state);
                     }
-                    if ((io->event_type & PollOut) && (state->desired_events & PollOut)) {
-                        arm_write(state);
-                    }
+                    // Do NOT auto-re-arm WRITE here. A zero-byte WSASend completes the
+                    // instant the kernel send buffer has ANY space — which is almost
+                    // always — so re-arming on completion busy-spun the io thread whenever
+                    // a peer's buffer couldn't fully drain. PollOut is now re-armed only
+                    // by an explicit modify(PollIn|PollOut) from handle_writable AFTER a
+                    // real ::send returns WSAEWOULDBLOCK (genuine back-pressure). When the
+                    // app drains fully it modifies to PollIn only and we stay quiet.
                 } else {
                     // I/O error (connection reset, cancelled, etc.)
                     reported_events = PollErr;

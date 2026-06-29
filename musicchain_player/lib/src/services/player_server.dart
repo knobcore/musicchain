@@ -108,9 +108,23 @@ class PlayerServer {
     switch (type) {
       case 'audio.piece_get': return _handlePieceGet(body);
       case 'stream.open':     return _handleStreamOpen(peerId, body, originator);
+      case 'stream.cancel':   return _handleStreamCancel(body);
       case 'library.list':    return _handleLibraryList();
       default: return null;
     }
+  }
+
+  /// stream.cancel — the requester skipped/abandoned the track. Stop pushing
+  /// immediately instead of streaming the rest of the file through the relay
+  /// (which would starve the requester's NEXT stream.open — the "skip → next
+  /// track hangs ~30 s" bug). The chunk loop notices `_ActiveStream.cancelled`
+  /// next iteration and bails. Idempotent: an unknown/finished stream_id is a
+  /// no-op, so duplicate cancels (local stall guard + explicit skip) are safe.
+  Future<Map<String, dynamic>?> _handleStreamCancel(
+      Map<String, dynamic> body) async {
+    final sid = (body['stream_id'] as num?)?.toInt();
+    if (sid != null) cancelStream(sid);
+    return {'cancelled': sid != null};
   }
 
   /// audio.piece_get — return a base64-encoded slice of a local file.
@@ -287,6 +301,11 @@ class PlayerServer {
     final prefixLen  = relay ? (1 + 40 + 16) : 0;
     final peerPtr    = sendTo.toNativeUtf8();
     final native     = malloc<Uint8>(prefixLen + 9 + chunkPayload);
+    // Typed-data view over the same native allocation so we can bulk-copy each
+    // disk slice in with setRange (one memmove) instead of a per-byte Dart
+    // loop — on a hot stream that's the difference between ~16K bounds-checked
+    // index writes per chunk and a single native block copy.
+    final nativeView = native.asTypedList(prefixLen + 9 + chunkPayload);
     // Page-sized scratch we reuse across iterations. We could read
     // directly into the native buffer with a typed-data view, but
     // RandomAccessFile.read returns a fresh Uint8List anyway, so the
@@ -348,21 +367,20 @@ class PlayerServer {
         native[prefixLen + 6] = (seq >> 16) & 0xFF;
         native[prefixLen + 7] = (seq >> 24) & 0xFF;
         native[prefixLen + 8] = eof ? 1 : 0;
-        for (int i = 0; i < n; ++i) native[prefixLen + 9 + i] = slice[i];
+        // Bulk copy the payload in one memmove (see nativeView above).
+        nativeView.setRange(prefixLen + 9, prefixLen + 9 + n, slice);
         _bindings.sendBinary(_handle, peerPtr,
             native.cast<Void>(), prefixLen + 9 + n);
         offset += n;
         ++seq;
 
-        // Cooperative pacing. Yielding to the event loop every chunk
-        // was free CPU-wise but let one stream monopolise outbound
-        // bandwidth on the relaying mini-node. A real-time delay
-        // every kPaceEveryChunks gives other streams + control
-        // traffic time to interleave, which is the whole point of
-        // "stable + instant" — instant means low first-byte latency
-        // for the NEXT request too, not just maximum throughput on
-        // this one.
-        if (seq % kPaceEveryChunks == 0) {
+        // Cooperative pacing — but ONLY when more than one stream is in
+        // flight. A lone stream has no one to share the mini-node's outbound
+        // bandwidth with, so pacing it just adds first-byte latency for no
+        // benefit: let it run at line rate. The instant a SECOND stream
+        // starts, both pace (every kPaceEveryChunks chunks, kPaceDelay) so
+        // neither monopolises the relay and control traffic still interleaves.
+        if (_streams.length > 1 && seq % kPaceEveryChunks == 0) {
           await Future<void>.delayed(kPaceDelay);
         }
       }

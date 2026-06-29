@@ -8,6 +8,20 @@ import '../ffi/wallet_mnemonic_bindings.dart';
 import '../models/wallet.dart';
 
 class WalletService {
+  WalletService._();
+  static final WalletService _instance = WalletService._();
+
+  /// Every `WalletService()` call returns ONE shared instance — and therefore
+  /// one native wallet handle. Before this factory, each caller (WalletProvider,
+  /// the wallet gate, main()'s submit service, the settings screen) built its
+  /// own WalletService. The first-launch create flow set the handle on the
+  /// gate's instance, while the signer used by chat / presence / library is
+  /// WalletProvider's *separate* instance — which never got the handle. So a
+  /// freshly-created wallet could sign nothing ("wallet not loaded") until a
+  /// relaunch happened to auto-load onto the provider's copy. Collapsing them
+  /// into a singleton makes a just-created wallet sign immediately.
+  factory WalletService() => _instance;
+
   static const _secureStorage = FlutterSecureStorage();
   // The 12-word BIP39 mnemonic. The recovery secret lives ONLY here —
   // platform secure storage (Keychain / KeyStore / DPAPI). The legacy
@@ -29,13 +43,41 @@ class WalletService {
   /// True when a mnemonic exists in platform secure storage. Used by
   /// the boot path to decide whether to show first-launch UI.
   Future<bool> hasSavedWallet() async {
-    return (await _secureStorage.read(key: _walletMnemonicKey)) != null;
+    try {
+      return (await _secureStorage.read(key: _walletMnemonicKey)) != null;
+    } catch (e) {
+      // The encrypted entry exists but can't be decrypted — typically the
+      // Android Keystore key was destroyed (app uninstalled, or data restored
+      // via Auto-Backup without its non-exportable key) so reads throw
+      // BadPaddingException/BAD_DECRYPT. Treat as "no usable wallet" and purge
+      // the orphaned blob so the boot path proceeds to first-launch instead of
+      // throwing into the gate and wedging it on the spinner forever.
+      // ignore: avoid_print
+      print('[wallet] hasSavedWallet: secure-storage read failed ($e) — purging orphaned entry');
+      await _safeDeleteWalletKeys();
+      return false;
+    }
   }
 
   /// Reconstruct the wallet handle from the stored BIP39 mnemonic.
   /// Returns null on first launch (no saved mnemonic). Idempotent.
   Future<WalletInfo?> tryAutoLoad() async {
-    final mnemonic = await _secureStorage.read(key: _walletMnemonicKey);
+    // Shared singleton now — main()'s submit service, WalletProvider and the
+    // wallet gate all call this. If a handle is already loaded (e.g. the create
+    // flow just set it), return the cached info instead of re-deriving and
+    // leaking the prior libwally context.
+    if (_walletHandle != null) return _cachedInfo;
+    String? mnemonic;
+    try {
+      mnemonic = await _secureStorage.read(key: _walletMnemonicKey);
+    } catch (e) {
+      // Undecryptable entry (see hasSavedWallet) — purge and treat as first
+      // launch rather than letting the exception escape into the wallet gate.
+      // ignore: avoid_print
+      print('[wallet] tryAutoLoad: secure-storage read failed ($e) — purging orphaned entry');
+      await _safeDeleteWalletKeys();
+      return null;
+    }
     if (mnemonic == null || mnemonic.isEmpty) return null;
     final handle = WalletMnemonicBindings.walletFromMnemonic(mnemonic);
     if (handle == null) return null;
@@ -119,14 +161,6 @@ class WalletService {
     await _secureStorage.delete(key: _walletUsernameKey);
   }
 
-  /// Returns the EIP-55-checksummed 0x-prefixed Base address derived
-  /// from the same secp256k1 key the wallet holds — same key, different
-  /// derivation. Used by the bridge / external transfer UI.
-  String? ethAddress() {
-    if (_walletHandle == null) return null;
-    return WalletMnemonicBindings.walletGetEthAddress(_walletHandle!);
-  }
-
   // Sign data, returns hex signature
   String sign(Uint8List data) {
     if (_walletHandle == null) throw Exception('No wallet loaded');
@@ -153,6 +187,15 @@ class WalletService {
   }
 
   // ---- Internal -------------------------------------------------------
+
+  /// Best-effort purge of the secure-storage wallet entries. Called when a
+  /// stored value can't be decrypted (orphaned Keystore key) so a corrupt blob
+  /// can't wedge the boot path on every launch. Each delete is independently
+  /// guarded — on a fully-wedged keystore even delete can throw.
+  Future<void> _safeDeleteWalletKeys() async {
+    try { await _secureStorage.delete(key: _walletMnemonicKey); } catch (_) {}
+    try { await _secureStorage.delete(key: _walletUsernameKey); } catch (_) {}
+  }
 
   void _updateCache() {
     if (_walletHandle == null) return;

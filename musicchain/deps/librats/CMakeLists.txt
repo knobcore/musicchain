@@ -224,47 +224,8 @@ set(LIBRARY_SOURCES
     src/librats_portmap.cpp
 )
 
-# Add BitTorrent sources if RATS_SEARCH_FEATURES is enabled
-if(RATS_SEARCH_FEATURES)
-    list(APPEND LIBRARY_SOURCES
-        src/librats_bittorrent.cpp
-        src/bittorrent.cpp
-        src/bittorrent.h
-        src/bt_types.h
-        src/bt_bitfield.h
-        src/bt_bitfield.cpp
-        src/bt_file_storage.h
-        src/bt_file_storage.cpp
-        src/bt_torrent_info.h
-        src/bt_torrent_info.cpp
-        src/bt_piece_picker.h
-        src/bt_piece_picker.cpp
-        src/bt_messages.h
-        src/bt_messages.cpp
-        src/bt_handshake.h
-        src/bt_handshake.cpp
-        src/bt_peer_connection.h
-        src/bt_peer_connection.cpp
-        src/bt_extension.h
-        src/bt_extension.cpp
-        src/bt_choker.h
-        src/bt_choker.cpp
-        src/bt_torrent.h
-        src/bt_torrent.cpp
-        src/bt_client.h
-        src/bt_client.cpp
-        src/bt_network.h
-        src/bt_network.cpp
-        src/disk_io.cpp
-        src/disk_io.h
-        src/tracker.cpp
-        src/tracker.h
-        src/bt_create_torrent.h
-        src/bt_create_torrent.cpp
-        src/bt_resume_data.h
-        src/bt_resume_data.cpp
-    )
-endif()
+# BitTorrent client sources removed — musicchain uses its own Noise-encrypted
+# transport, not BitTorrent. The DHT (KRPC) is kept as a private overlay.
 
 # Add Storage sources if RATS_STORAGE is enabled
 if(RATS_STORAGE)
@@ -479,26 +440,7 @@ if(RATS_BUILD_TESTS)
         tests/test_chained_send_buffer.cpp
     )
 
-    # Add BitTorrent tests if RATS_SEARCH_FEATURES is enabled
-    if(RATS_SEARCH_FEATURES)
-        list(APPEND TEST_SOURCES 
-            tests/test_bittorrent.cpp
-            tests/test_tracker.cpp
-            tests/test_disk_io.cpp
-            tests/test_bt_bitfield.cpp
-            tests/test_bt_file_storage.cpp
-            tests/test_bt_torrent_info.cpp
-            tests/test_bt_piece_picker.cpp
-            tests/test_bt_messages.cpp
-            tests/test_bt_handshake.cpp
-            tests/test_bt_peer_connection.cpp
-            tests/test_bt_extension.cpp
-            tests/test_bt_network.cpp
-            tests/test_bt_integration.cpp
-            tests/test_bt_create_torrent.cpp
-            tests/test_bt_resume_data.cpp
-        )
-    endif()
+    # BitTorrent tests removed along with the BitTorrent client.
 
     # Add Storage tests if RATS_STORAGE is enabled
     if(RATS_STORAGE)

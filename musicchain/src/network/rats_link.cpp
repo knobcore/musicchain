@@ -27,17 +27,20 @@ namespace mc::net {
 
 RatsLink::RatsLink(uint16_t listen_port,
                    std::string node_id_hex,
-                   uint16_t own_api_port)
+                   uint16_t own_api_port,
+                   std::string wallet_addr_hex)
     : listen_port_(listen_port),
       node_id_hex_(std::move(node_id_hex)),
-      own_api_port_(own_api_port) {}
+      own_api_port_(own_api_port),
+      wallet_addr_hex_(std::move(wallet_addr_hex)) {}
 
 RatsLink::~RatsLink() { stop(); }
 
 bool RatsLink::start() {
     if (client_) return true;
 
-    client_ = rats_create(listen_port_);
+    client_ = rats_create_with_id(listen_port_,
+                                  wallet_addr_hex_.empty() ? nullptr : wallet_addr_hex_.c_str());
     if (!client_) {
         std::cerr << "[rats] rats_create failed on port " << listen_port_ << "\n";
         return false;

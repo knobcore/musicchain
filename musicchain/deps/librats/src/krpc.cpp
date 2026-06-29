@@ -24,6 +24,24 @@
 
 namespace librats {
 
+// ── Private-overlay network tag ─────────────────────────────────────────────
+// musicchain runs a PRIVATE DHT overlay on top of the KRPC wire format. Every
+// packet we emit carries this top-level key/value (see encode_message); every
+// inbound packet that lacks it is dropped at decode (see decode_message).
+//
+// No BitTorrent mainline client ever sets an "mc" top-level key, so this tag is
+// what isolates the overlay: nodes from the public swarm never get a response
+// from us and never enter our routing table, and their responses to us are
+// discarded so they can never be confirmed. Only peers running this exact build
+// (home node, mini-node, player) can talk to each other.
+//
+// Bump KRPC_NETWORK_MAGIC to fork the overlay (e.g. testnet vs mainnet) — nodes
+// with mismatched magic simply ignore one another. NOTE: this is an isolation
+// tag, not authentication; the value is in the binary. It stops accidental
+// mainline cross-talk, it does not stop a determined impersonator.
+static constexpr const char* KRPC_NETWORK_KEY   = "mc";
+static constexpr const char* KRPC_NETWORK_MAGIC = "mcnet1";
+
 std::atomic<uint32_t> KrpcProtocol::transaction_counter_ = 0;
 
 KrpcProtocol::KrpcProtocol() {}
@@ -147,7 +165,12 @@ std::vector<uint8_t> KrpcProtocol::encode_message(const KrpcMessage& message) {
             LOG_KRPC_ERROR("Unknown message type: " << static_cast<int>(message.type));
             return {};
     }
-    
+
+    // Stamp the private-overlay network tag on EVERY outgoing packet (query,
+    // response and error alike). Peers running this build require it; mainline
+    // BitTorrent nodes ignore the unknown key. See KRPC_NETWORK_KEY above.
+    root[KRPC_NETWORK_KEY] = BencodeValue(std::string(KRPC_NETWORK_MAGIC));
+
     return root.encode();
 }
 
@@ -280,7 +303,18 @@ std::unique_ptr<KrpcMessage> KrpcProtocol::decode_message(const std::vector<uint
             LOG_KRPC_ERROR("Root is not a dictionary");
             return nullptr;
         }
-        
+
+        // Private-overlay gate: drop anything that doesn't carry our network tag.
+        // This is the core of the musicchain DHT isolation — packets from the
+        // public BitTorrent mainline (or any non-musicchain peer) are silently
+        // ignored, so we never answer them and they never enter our routing table.
+        if (!root.has_key(KRPC_NETWORK_KEY) ||
+            !root[KRPC_NETWORK_KEY].is_string() ||
+            root[KRPC_NETWORK_KEY].as_string() != KRPC_NETWORK_MAGIC) {
+            LOG_KRPC_DEBUG("Dropping non-musicchain KRPC packet (missing/invalid network tag)");
+            return nullptr;
+        }
+
         if (!root.has_key("t") || !root.has_key("y")) {
             LOG_KRPC_ERROR("Missing required fields 't' or 'y'");
             return nullptr;

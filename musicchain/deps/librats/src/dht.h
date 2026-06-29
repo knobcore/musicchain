@@ -376,11 +376,13 @@ public:
     /**
      * Get the configured bootstrap nodes for this PRIVATE overlay.
      *
-     * NOTE: musicchain runs a private DHT overlay that speaks the standard KRPC/DHT
-     * wire protocol (so packets are indistinguishable from BitTorrent DHT — that is
-     * the camouflage) but deliberately does NOT bootstrap off the public mainline
-     * routers (router.bittorrent.com, dht.transmissionbt.com, …). Talking to those
-     * would join the real swarm and leak announces into it.
+     * NOTE: musicchain runs a private DHT overlay. It reuses the KRPC/DHT wire
+     * format but stamps every packet with a private network tag (KRPC_NETWORK_KEY
+     * in krpc.cpp); packets without it — i.e. the entire public BitTorrent mainline
+     * — are dropped at decode, so only our own nodes answer each other. It also
+     * deliberately does NOT bootstrap off the public mainline routers
+     * (router.bittorrent.com, dht.transmissionbt.com, …), which would otherwise
+     * seed the real swarm into our routing table.
      *
      * Instead the application populates a private bootstrap list (its own VPS) via
      * set_bootstrap_nodes(). This getter returns THAT list — and returns an EMPTY

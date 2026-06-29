@@ -382,10 +382,12 @@ size_t DhtClient::get_active_announces_count() const {
 }
 
 // ── PRIVATE overlay bootstrap list ──────────────────────────────────────────
-// musicchain runs a private DHT overlay: it speaks the exact KRPC/DHT wire
-// protocol (camouflage — packets look like BitTorrent DHT) but must NEVER bootstrap
-// off the public mainline routers, which would join the real swarm and leak
-// announces into it. The application supplies its own bootstrap nodes (its VPS) via
+// musicchain runs a private DHT overlay: it reuses the KRPC/DHT wire format but
+// tags every packet with a private network magic (see KRPC_NETWORK_KEY in
+// krpc.cpp), so only our nodes answer each other — packets from the public
+// BitTorrent mainline are dropped at decode. On top of that we must NEVER
+// bootstrap off the public mainline routers, which would seed the real swarm
+// into our table. The application supplies its own bootstrap nodes (its VPS) via
 // set_bootstrap_nodes(); get_default_bootstrap_nodes() returns ONLY that list and is
 // empty until configured. Guarded by its own mutex (independent of all per-instance
 // DHT locks — it touches no instance state, so it never participates in their lock order).

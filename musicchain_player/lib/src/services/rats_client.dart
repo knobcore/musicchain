@@ -182,6 +182,28 @@ class RatsClient {
   // deadline even though TCP will eventually deliver) before failing, so a
   // momentary stall becomes a slight delay rather than a hard failure.
   static const int _kSendRetries = 2;
+
+  // Bulk verbs whose RESPONSE is large (256 KB pieces / audio streams). These
+  // must NEVER be re-fired on timeout: the reply bytes flow back from the
+  // SEEDER, so re-firing makes it serve the whole piece AGAIN — doubling its
+  // uplink. On a slow phone uplink that is congestion collapse, which is what
+  // saturated + dropped the relay link and then crashed on the teardown.
+  // Piece/stream requests are tunnelled inside a relay.forward, so
+  // _isBulkRequest also peeks the wrapped inner verb. Small control RPCs stay
+  // retried for lossy-link resilience.
+  static const Set<String> _kBulkTypes = {
+    'audio.piece_get',
+    'stream.open',
+  };
+
+  static bool _isBulkRequest(String type, Map<String, dynamic> body) {
+    if (_kBulkTypes.contains(type)) return true;
+    if (type == 'relay.forward') {
+      final inner = body['type'];
+      if (inner is String && _kBulkTypes.contains(inner)) return true;
+    }
+    return false;
+  }
   final Map<String, DateTime> _deadPeers = {};
 
   /// True while [peerId] is known-dead (within the TTL). Expired entries clear
@@ -1314,11 +1336,13 @@ class RatsClient {
       try {
         return await completer.future;
       } on RatsRpcException catch (e) {
-        if (e.status == 'timeout' && sendAttempt < _kSendRetries) {
+        if (e.status == 'timeout' &&
+            sendAttempt < _kSendRetries &&
+            !_isBulkRequest(type, body)) {
           lastTimeoutErr = e;
-          continue; // re-fire after backoff
+          continue; // re-fire after backoff (control RPCs only)
         }
-        rethrow; // protocol reply, or retries exhausted — surface it
+        rethrow; // bulk transfer, protocol reply, or retries exhausted
       }
     }
     // Unreachable (the last iteration returns or rethrows), but satisfies the

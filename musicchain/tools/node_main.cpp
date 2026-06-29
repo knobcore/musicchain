@@ -300,7 +300,7 @@ static int cmd_start(const std::vector<std::string>& args, const char* exe_path 
 
     std::cout << "[node] data_dir : " << cfg.data_dir << "\n";
     std::cout << "[node] rats port: " << cfg.rats_port
-              << " (UDP/QUIC — all traffic, RPC and h3 verbs)\n";
+              << " (TCP — all librats RPC + bulk traffic)\n";
     std::cerr << "[dbg] opening database\n";
 
     // Open database

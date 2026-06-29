@@ -128,74 +128,13 @@ endif()
 
 endif() # NOT MC_MINI_NODE_ONLY
 
-# HTTP/3 (msh3 + msquic + QuicTLS) is opt-in. The home node currently
-# serves every verb over librats TCP RPC; the standalone msh3 listener was
-# removed when the QUIC bridge was ripped out (see [[project-revert-to-
-# plain-librats]]). Building msh3 also drags in QuicTLS, which needs perl
-# + NASM + a working OpenSSL configure pipeline. Skip it by default — flip
-# -DMC_WITH_H3=ON when restoring the h3_server. The h3_smoke target stays
-# behind the same flag.
-option(MC_WITH_H3 "Build the optional HTTP/3 surface (msh3 + msquic + h3_server)" OFF)
+# HTTP/3 / QUIC removed entirely — librats is plain TCP and the standalone
+# msh3 HTTP/3 listener was retired. No msh3/msquic/QuicTLS dependency.
 set(msh3_FOUND FALSE)
-if(MC_WITH_H3)
-  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/deps/msh3/CMakeLists.txt")
-    message(FATAL_ERROR "deps/msh3 not present but MC_WITH_H3=ON.")
-  endif()
 
-  # These must be set BEFORE add_subdirectory(deps/msh3) so msh3's own
-  # `set(QUIC_TLS_LIB ... CACHE)` calls (without FORCE) see them already
-  # cached and skip. We force quictls on every platform so the TLS backend
-  # is the same whether you talk to a Linux peer or a Windows peer.
-  set(QUIC_TLS_LIB       "quictls" CACHE STRING "" FORCE)
-  set(QUIC_BUILD_SHARED  OFF        CACHE BOOL   "" FORCE)
-  set(QUIC_BUILD_TOOLS   OFF        CACHE BOOL   "" FORCE)
-  set(QUIC_BUILD_TEST    OFF        CACHE BOOL   "" FORCE)
-  set(QUIC_BUILD_PERF    OFF        CACHE BOOL   "" FORCE)
-  set(MSH3_TOOL          OFF        CACHE BOOL   "" FORCE)
-  set(MSH3_TEST          OFF        CACHE BOOL   "" FORCE)
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-  add_subdirectory(deps/msh3 EXCLUDE_FROM_ALL)
-  set(msh3_FOUND TRUE)
-
-  # After deps/msh3 adds its inner msquic, the `msquic_static` target exists
-  # (with quictls statically linked). Use it everywhere msquic is needed.
-  set(MC_MSQUIC_TARGET msquic_static)
-  set(MC_MSQUIC_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/msh3/msquic/src/inc")
-endif()
-
-# When MC_WITH_H3 is on, reuse the quictls static archives produced inside
-# msh3's msquic build so the whole project shares one TLS source. When H3
-# is off, fall back to the OpenSSL find_package result (vcpkg on Windows,
-# system / prebuilt on Linux/Android) — librats only needs OpenSSL for
-# Noise + STUN crypto + file_transfer, no QUIC dependency.
-if(MC_WITH_H3)
-  set(MC_QUICTLS_DIR "${CMAKE_BINARY_DIR}/_deps/opensslquic-build/quictls")
-  add_library(mc_openssl_ssl    STATIC IMPORTED GLOBAL)
-  add_library(mc_openssl_crypto STATIC IMPORTED GLOBAL)
-  if(WIN32)
-    set_target_properties(mc_openssl_ssl    PROPERTIES IMPORTED_LOCATION
-      "${MC_QUICTLS_DIR}/release/lib/libssl.lib")
-    set_target_properties(mc_openssl_crypto PROPERTIES IMPORTED_LOCATION
-      "${MC_QUICTLS_DIR}/release/lib/libcrypto.lib")
-    set(MC_QUICTLS_INCLUDE_DIR "${MC_QUICTLS_DIR}/release/include")
-  else()
-    set_target_properties(mc_openssl_ssl    PROPERTIES IMPORTED_LOCATION
-      "${MC_QUICTLS_DIR}/lib/libssl.a")
-    set_target_properties(mc_openssl_crypto PROPERTIES IMPORTED_LOCATION
-      "${MC_QUICTLS_DIR}/lib/libcrypto.a")
-    set(MC_QUICTLS_INCLUDE_DIR "${MC_QUICTLS_DIR}/include")
-  endif()
-  file(MAKE_DIRECTORY "${MC_QUICTLS_INCLUDE_DIR}")
-  set_target_properties(mc_openssl_ssl    PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${MC_QUICTLS_INCLUDE_DIR}")
-  set_target_properties(mc_openssl_crypto PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${MC_QUICTLS_INCLUDE_DIR}")
-  set(MC_OPENSSL_SSL    mc_openssl_ssl)
-  set(MC_OPENSSL_CRYPTO mc_openssl_crypto)
-else()
-  set(MC_OPENSSL_SSL    OpenSSL::SSL)
-  set(MC_OPENSSL_CRYPTO OpenSSL::Crypto)
-endif()
+# librats needs OpenSSL only for Noise + STUN crypto + file_transfer (no QUIC).
+set(MC_OPENSSL_SSL    OpenSSL::SSL)
+set(MC_OPENSSL_CRYPTO OpenSSL::Crypto)
 
 # libcurl removed — its only consumer was the HttpGossip registry
 # announcer (network/registry_announcer.cpp), deleted in the Model 1
@@ -385,20 +324,14 @@ set(MC_SOURCES
   src/util/hw_fingerprint.cpp
   src/capi/capi.cpp
 )
-if(msh3_FOUND)
-  list(APPEND MC_SOURCES src/transport/h3_server.cpp src/transport/cert_util.cpp)
-  list(APPEND MC_LINK_LIBS msh3)
-endif()
+# (HTTP/3 surface removed — no msh3/h3_server; librats is plain TCP)
 
 # ---- librats (vanilla TCP transport) ----
 #
 # We build the *full* librats from deps/librats — DHT, GossipSub, ICE,
 # file transfer, Noise encryption, the lot — using its stock TCP socket
-# layer. The msquic/quictls QUIC bridge that used to live under
-# `quic_socket.cpp` was removed on 2026-06-03 after persistent wire-
-# alignment bugs (see [[project-revert-to-plain-librats]]); the
-# msquic+msh3 deps still build because `src/transport/h3_server.cpp` uses
-# them for a separate HTTP/3 listener, but librats no longer touches them.
+# layer. QUIC is gone entirely: the old quic_socket.cpp bridge and the
+# msh3/msquic HTTP/3 deps were removed. librats is plain TCP, end to end.
 #
 # The output is renamed `mc_rats` so the Dart FFI side keeps loading
 # 'mc_rats.dll' / 'libmc_rats.so' unchanged. Home node and mini-node link
@@ -519,14 +452,7 @@ if(NOT MSVC AND NOT APPLE AND NOT ANDROID)
     -static-libstdc++ -static-libgcc)
 endif()
 
-# h3_smoke — tiny HTTP/3 client used to verify H3Server end-to-end.
-if(msh3_FOUND AND NOT MC_MINI_NODE_ONLY)
-add_executable(h3_smoke tools/h3_smoke.cpp)
-target_link_libraries(h3_smoke PRIVATE msh3)
-if(WIN32)
-  target_link_libraries(h3_smoke PRIVATE ws2_32)
-endif()
-endif()
+# (h3_smoke removed — HTTP/3 surface gone)
 
 if(NOT MC_MINI_NODE_ONLY)
 

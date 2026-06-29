@@ -2,9 +2,9 @@
 #include "../audio/fingerprint.h"  // base64_encode / base64_decode
 #include "../crypto/hash.h"        // to_hex / from_hex helpers
 
-// `mc_rats_quic.h` was the old transparent shim that exported the librats C
-// API directly. We now link the real librats (deps/librats) compiled with a
-// QUIC backend, so include its C bindings header instead.
+// librats (deps/librats) is plain TCP — its stock socket layer. The old QUIC
+// bridge (mc_rats_quic / quic_socket.cpp) was removed; we link librats' C
+// bindings directly.
 #include "librats_c.h"
 
 // nlohmann::json is vendored inside librats; reuse it here so we can build

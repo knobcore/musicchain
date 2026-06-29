@@ -70,6 +70,13 @@ class PieceDownloaderConfig {
   /// recoverable download.
   final int perPeerRetryCap;
 
+  /// Swarm Transfer v2: pieces requested per swarm.fetch RANGE. >1 amortizes the
+  /// request round-trip across the whole range (one RTT per fetchPieces×256 KB
+  /// instead of per 256 KB). Bounded by the seeder's kMaxSwarmFetchPieces (16).
+  /// Workers still round-robin the source pool, so K workers × ranges fan the
+  /// download across K seeders concurrently — that's the multi-source win.
+  final int fetchPieces;
+
   const PieceDownloaderConfig({
     this.pieceSize        = 256 * 1024,
     // Raised 8 -> 16 so a LONE track can fill the adaptive congestion window
@@ -83,6 +90,7 @@ class PieceDownloaderConfig {
     // arriving reply so a piece is only re-requested when the source is truly stalled.
     this.pieceTimeout     = const Duration(seconds: 30),
     this.perPeerRetryCap  = 8,
+    this.fetchPieces      = 8,
   });
 }
 
@@ -334,12 +342,11 @@ class PieceDownloader {
       if (_terminalError != null) return;
       if (_isComplete())          return;
 
-      final piece = _claimNextPiece();
-      if (piece == null) {
-        // No piece to claim — the other N-1 workers hold them all.
-        // Back off exponentially up to 500 ms so the late-game spin
-        // (where 3 of 4 workers wait on the last piece) doesn't burn
-        // CPU. Reset the moment we hand back to the claim path.
+      final range = _claimNextRange(config.fetchPieces);
+      if (range == null) {
+        // Nothing claimable right now — the other workers hold every missing
+        // piece, or we're in the endgame tail. Back off exponentially up to
+        // 500 ms so the spin doesn't burn CPU; reset on the next claim.
         await Future<void>.delayed(Duration(milliseconds: idleBackoffMs));
         if (idleBackoffMs < 500) idleBackoffMs = (idleBackoffMs * 2).clamp(80, 500);
         if (_terminalError != null) return;
@@ -349,7 +356,7 @@ class PieceDownloader {
 
       final source = _nextSource();
       if (source == null) {
-        _releasePiece(piece);
+        _releaseRange(range);
         // (#8) Distinguish "all sources permanently banned" (fail) from "the
         // only sources left are mid-cooldown" (wait — they'll come back). A
         // cooled-down peer is NOT in _bannedPeers, so the ban check below sees
@@ -378,36 +385,39 @@ class PieceDownloader {
       }
 
       try {
-        // Race the fetch against the terminal-error signal so a peer
-        // stall doesn't keep this worker waiting the full piece
-        // timeout after another worker has already aborted the run.
-        final fetch = _fetchPiece(source, piece.offset, piece.length);
+        // Race the range fetch against the terminal-error signal so a stalled
+        // seeder doesn't pin this worker for the full timeout after another
+        // worker aborted the run. Writes happen AFTER the race in the awaited
+        // path, so an aborted fetch never writes into a closing file handle.
+        final fetch  = _fetchRange(source, range);
         final signal = (_terminalSignal ??= Completer<void>()).future
-            .then<_PieceReply?>((_) => null);
-        final reply = await Future.any([fetch, signal]);
-        if (reply == null) {
-          // Terminal error fired before our fetch returned. Drop the
-          // claim and exit; the originating worker has set
-          // _terminalError, which the run() loop will surface.
-          _releasePiece(piece);
+            .then<List<_PieceReply>?>((_) => null);
+        final pieces = await Future.any([fetch, signal]);
+        if (pieces == null) {
+          // Terminal error fired first. Swallow the dangling fetch's eventual
+          // result/throw, drop the claim, and exit.
+          unawaited(fetch.catchError((_) => <_PieceReply>[]));
+          _releaseRange(range);
           return;
         }
-        await _writePiece(reply);
+        for (final p in pieces) {
+          await _writePiece(p);
+        }
       } on _PeerStallException catch (_) {
-        _releasePiece(piece);
+        _releaseRange(range);
         _markPeerError(source);
       } on _PeerProtocolException catch (_) {
-        _releasePiece(piece);
+        _releaseRange(range);
         _bannedPeers.add(_keyFor(source));
       } on RatsRpcException catch (e) {
-        _releasePiece(piece);
+        _releaseRange(range);
         if (e.status == 'unknown_type') {
           _bannedPeers.add(_keyFor(source));
         } else {
           _markPeerError(source);
         }
       } catch (e) {
-        _releasePiece(piece);
+        _releaseRange(range);
         _failTerminal(e);
         return;
       }
@@ -416,20 +426,49 @@ class PieceDownloader {
 
   // ---- Piece + peer selection ----------------------------------------
 
-  _PieceSlice? _claimNextPiece() {
+  /// Claim the next contiguous run of up to [maxPieces] missing, unclaimed
+  /// pieces for one ranged fetch. Returns null only when nothing is claimable:
+  /// every missing piece is in flight, or — endgame — the small tail is in
+  /// flight on (possibly slow) sources and we let a different source race it.
+  _PieceRange? _claimNextRange(int maxPieces) {
+    // Primary: first unclaimed missing piece, extended forward over contiguous
+    // unclaimed missing pieces, capped at maxPieces.
     for (int i = 0; i < _numPieces; ++i) {
-      if (_bitmap[i] != 0)            continue;
-      if (_claimedPieces.contains(i)) continue;
+      if (_bitmap[i] != 0 || _claimedPieces.contains(i)) continue;
+      int count = 1;
       _claimedPieces.add(i);
-      final offset = i * config.pieceSize;
-      final length = math.min(config.pieceSize, _totalSize - offset);
-      return _PieceSlice(i, offset, length);
+      while (count < maxPieces &&
+             i + count < _numPieces &&
+             _bitmap[i + count] == 0 &&
+             !_claimedPieces.contains(i + count)) {
+        _claimedPieces.add(i + count);
+        ++count;
+      }
+      return _PieceRange(i, count);
     }
-    return null;
+    // Endgame: nothing unclaimed but the download isn't done — remaining pieces
+    // are in flight. If the tail is small, hand the first still-missing piece to
+    // THIS worker too so a different source races it; whoever lands first wins
+    // (_writePiece dedups). Bounded so we only ever dup-fetch the tail.
+    int missing = 0;
+    int firstMissing = -1;
+    for (int i = 0; i < _numPieces; ++i) {
+      if (_bitmap[i] == 0) {
+        ++missing;
+        if (firstMissing < 0) firstMissing = i;
+      }
+    }
+    if (missing == 0 || firstMissing < 0) return null;     // complete
+    if (missing <= config.maxWorkers) {
+      return _PieceRange(firstMissing, 1);                 // endgame dup-fetch
+    }
+    return null;                                           // wait for in-flight
   }
 
-  void _releasePiece(_PieceSlice p) {
-    _claimedPieces.remove(p.index);
+  void _releaseRange(_PieceRange r) {
+    for (int i = r.start; i < r.start + r.count; ++i) {
+      _claimedPieces.remove(i);
+    }
   }
 
   int _rrCursor = 0;
@@ -556,36 +595,36 @@ class PieceDownloader {
     if (_relayWaiters.isNotEmpty) _relayWaiters.removeAt(0).complete();
   }
 
+  /// Resolve a routable librats peer_id for [source]. Full-node-swarm sources
+  /// already carry a peer_id; DHT sources carry only host:port and must be
+  /// dialed once (result cached per address; an address that never validates is
+  /// banned so we don't redial it every fetch). Throws _PeerProtocolException
+  /// (unroutable) or _PeerStallException (dial failed) to steer the caller.
+  Future<String> _resolveTarget(PeerSource source) async {
+    if (source.peerId.isNotEmpty) return source.peerId;
+    final addr = source.address;
+    if (addr.isEmpty || _dhtBanned.contains(addr)) {
+      throw _PeerProtocolException('unroutable DHT source $addr');
+    }
+    final cached = _dhtResolved[addr];
+    if (cached != null) return cached;
+    final colon = addr.lastIndexOf(':');   // lastIndexOf for IPv6 literals
+    final host  = colon > 0 ? addr.substring(0, colon) : '';
+    final port  = colon > 0 ? (int.tryParse(addr.substring(colon + 1)) ?? 0) : 0;
+    final resolved = await RatsClient.instance.connectAndResolve(host, port);
+    if (resolved == null) {
+      _dhtBanned.add(addr);
+      throw _PeerStallException();   // move on to the next source
+    }
+    _dhtResolved[addr] = resolved;
+    return resolved;
+  }
+
+  /// Fetch a single piece (count=1) — used by the first-piece size probe before
+  /// the worker pool (which fetches whole ranges) starts.
   Future<_PieceReply> _fetchPiece(
       PeerSource source, int offset, int length) async {
-    // (DHT un-nerf P0b) Resolve a routable peer_id for a DHT-discovered
-    // source that only carries a host:port. Without this the raw address was
-    // shoved into request()'s peer_id slot — never in validatedPeerIds, never
-    // dialed — so DHT sources threw send_failed and could not serve a byte.
-    // Dial once, cache the resolved id per address, ban an address that never
-    // validates so we don't redial it for every piece.
-    String target = source.peerId;
-    if (target.isEmpty) {
-      final addr = source.address;
-      if (addr.isEmpty || _dhtBanned.contains(addr)) {
-        throw _PeerProtocolException('unroutable DHT source $addr');
-      }
-      final cached = _dhtResolved[addr];
-      if (cached != null) {
-        target = cached;
-      } else {
-        final colon = addr.lastIndexOf(':');   // lastIndexOf for IPv6 literals
-        final host  = colon > 0 ? addr.substring(0, colon) : '';
-        final port  = colon > 0 ? (int.tryParse(addr.substring(colon + 1)) ?? 0) : 0;
-        final resolved = await RatsClient.instance.connectAndResolve(host, port);
-        if (resolved == null) {
-          _dhtBanned.add(addr);
-          throw _PeerStallException();   // move on to the next source
-        }
-        _dhtResolved[addr] = resolved;
-        target = resolved;
-      }
-    }
+    final target = await _resolveTarget(source);
     await _acquireRelaySlot();
     RangeFetch result;
     try {
@@ -641,6 +680,63 @@ class PieceDownloader {
         offset:    offset,
         bytes:     bytes,
         totalSize: total > 0 ? total : _totalSize);
+  }
+
+  /// Fetch a contiguous RANGE of pieces in ONE swarm.fetch and return them as
+  /// verified _PieceReply records (NOT written — the worker writes them in the
+  /// awaited path so an aborted fetch can't write into a closing handle). One
+  /// request RTT covers the whole range; each piece is manifest-verified, so a
+  /// single bad piece from a lying seeder bans it without poisoning the range.
+  Future<List<_PieceReply>> _fetchRange(
+      PeerSource source, _PieceRange range) async {
+    final target = await _resolveTarget(source);
+    final offset = range.start * config.pieceSize;
+    await _acquireRelaySlot();
+    RangeFetch result;
+    try {
+      result = await RatsClient.instance.fetchRange(
+        target, contentHash, range.start, range.count, config.pieceSize,
+        totalTimeout: config.pieceTimeout,
+        chunkStall:   config.pieceTimeout,
+      );
+      _cwndOnSuccess();
+    } on RatsRpcException catch (e) {
+      if (e.status == 'timeout' || e.status == 'not_matched') {
+        _cwndOnCongestion();
+        throw _PeerStallException();
+      }
+      if (e.status == 'not_held' || e.status == 'unknown_type' ||
+          e.status == 'bad_range' || e.status == 'bad_hash') {
+        throw _PeerProtocolException('swarm.fetch ${e.status}');
+      }
+      rethrow;
+    } finally {
+      _releaseRelaySlot();
+    }
+    final total = result.totalSize > 0 ? result.totalSize : _totalSize;
+    final bytes = result.bytes is Uint8List
+        ? result.bytes as Uint8List
+        : Uint8List.fromList(result.bytes);
+    final expectedLen = math.min(range.count * config.pieceSize, total - offset);
+    if (bytes.length != expectedLen) {
+      throw _PeerProtocolException(
+          'range length mismatch: asked $expectedLen got ${bytes.length}');
+    }
+    final out = <_PieceReply>[];
+    for (int k = 0; k < range.count; ++k) {
+      final pOffset = offset + k * config.pieceSize;
+      if (pOffset >= total) break;
+      final pLen   = math.min(config.pieceSize, total - pOffset);
+      final pStart = k * config.pieceSize;
+      final pBytes = Uint8List.sublistView(bytes, pStart, pStart + pLen);
+      if (_manifestActive &&
+          !manifest!.verifyPiece(range.start + k, pBytes)) {
+        throw _PeerProtocolException(
+            'piece ${range.start + k} failed manifest hash');
+      }
+      out.add(_PieceReply(offset: pOffset, bytes: pBytes, totalSize: total));
+    }
+    return out;
   }
 
   // ---- Persistence ----------------------------------------------------
@@ -811,11 +907,10 @@ class PieceDownloader {
   }
 }
 
-class _PieceSlice {
-  _PieceSlice(this.index, this.offset, this.length);
-  final int index;
-  final int offset;
-  final int length;
+class _PieceRange {
+  _PieceRange(this.start, this.count);
+  final int start;   // first piece index in the range
+  final int count;   // number of contiguous pieces
 }
 
 class _PieceReply {

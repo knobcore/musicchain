@@ -82,10 +82,19 @@ public:
     
     /**
      * @brief Get size of front chunk (for send())
-     * 
+     *
      * Returns 0 if buffer is empty.
      */
     size_t front_size() const;
+
+    /**
+     * @brief True if the front frame is partially sent (mid-transmission).
+     *
+     * The priority sender must finish an in-progress frame before interleaving a
+     * higher-priority frame from another lane — otherwise the spliced bytes would
+     * corrupt the length-prefixed stream.
+     */
+    bool front_partial() const;
     
     /**
      * @brief Remove bytes from front after successful send

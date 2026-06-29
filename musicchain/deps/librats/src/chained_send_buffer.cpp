@@ -32,6 +32,10 @@ size_t ChainedSendBuffer::front_size() const {
     return chunks_.front().remaining();
 }
 
+bool ChainedSendBuffer::front_partial() const {
+    return !chunks_.empty() && chunks_.front().offset > 0;
+}
+
 void ChainedSendBuffer::pop_front(size_t bytes) {
     while (bytes > 0 && !chunks_.empty()) {
         SendChunk& front = chunks_.front();

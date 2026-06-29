@@ -51,7 +51,8 @@ class NetworkMonitor;
  */
 struct PeerIOContext {
     ReceiveBuffer recv_buffer{8192};
-    ChainedSendBuffer send_buffer;
+    ChainedSendBuffer send_buffer;        // bulk lane: large frames (> PRIO_FRAME_MAX)
+    ChainedSendBuffer prio_send_buffer;   // priority lane: control / keepalive / handshake
 
     // Async Noise handshake (only valid while handshake_state == NOISE_PENDING)
     std::unique_ptr<rats::NoiseHandshakeState> noise_hs;
@@ -1956,6 +1957,13 @@ private:
     // Unlocked variant – caller must hold peers_mutex_
     bool enqueue_message_unlocked(RatsPeer& peer, const std::vector<uint8_t>& data);
 
+    // Drain a peer's priority + bulk send buffers to the socket in PRIORITY order
+    // (control / keepalive / handshake ahead of bulk audio), finishing any in-progress
+    // frame first so the length-prefixed byte stream is never corrupted. Returns true on
+    // a real send error (caller disconnects); a WOULDBLOCK is normal (returns false, data
+    // stays queued). Caller holds peers_mutex_.
+    bool flush_send_unlocked(RatsPeer& peer);
+
     // Lightweight snapshot of peer data needed for sending (avoids holding peers_mutex_ during enqueue)
     struct PeerSendTarget {
         socket_t socket;
@@ -1994,15 +2002,21 @@ private:
                                                                 // tighter bound rejects junk/BitTorrent
                                                                 // handshakes early instead of trying to
                                                                 // buffer hundreds of MB)
+    // Frames at or below this size ride the PRIORITY send lane (handshake, keepalive,
+    // JSON control RPCs); larger frames (audio pieces — ~256 KB of base64) ride the bulk
+    // lane and can never block control/keepalive behind them. See flush_send_unlocked.
+    static constexpr size_t PRIO_FRAME_MAX = 16 * 1024;
     static constexpr int PEER_RECONNECT_DELAY_MS = 100;         // Delay before reconnecting saved peers
     static constexpr int HISTORICAL_RECONNECT_DELAY_MS = 500;   // Delay before reconnecting historical peers
     static constexpr int MANAGEMENT_LOOP_INTERVAL_SECONDS = 2;  // Management loop tick interval
     // App-level keepalive (item C): send a length-0 frame to a COMPLETED peer that has
-    // been idle (no send) beyond this, and proactively disconnect a peer from which we
-    // have received nothing for KEEPALIVE_DEAD_SECONDS (≈3x interval). This surfaces
-    // dead paths in ~15s instead of waiting out the OS TCP keepalive (~30s+).
+    // been idle (no send) beyond IDLE, and disconnect a peer from which we have received
+    // nothing for DEAD. DEAD is deliberately generous (~9 missed keepalives) so a
+    // LIVE-but-busy peer is NEVER falsely declared dead: keepalives ride the priority
+    // lane and always get out even under a bulk flood, so the only things that should
+    // ever drop an established connection are an explicit close or a real socket error.
     static constexpr int KEEPALIVE_IDLE_SECONDS = 5;            // idle-send threshold
-    static constexpr int KEEPALIVE_DEAD_SECONDS = 15;          // no-recv -> declare dead
+    static constexpr int KEEPALIVE_DEAD_SECONDS = 45;          // no-recv -> declare dead
     static constexpr int THREAD_CLEANUP_INTERVAL_SECONDS = 30;  // Thread cleanup interval
     static constexpr int INITIAL_DISCOVERY_DELAY_SECONDS = 5;   // DHT bootstrap delay
     static constexpr int MAX_PEERS_REQUEST_COUNT = 5;            // Max peers to request/respond

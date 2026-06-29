@@ -662,70 +662,95 @@ bool RatsClient::handle_readable(socket_t socket) {
 }
 
 // ---------------------------------------------------------------------------
-// handle_writable – flush the peer's send buffer to the kernel
+// flush_send_unlocked – drain a peer's send buffers in PRIORITY order:
+//   1. finish any in-progress BULK frame (a control frame spliced into a
+//      half-sent length-prefixed frame would corrupt the byte stream),
+//   2. drain the priority lane (control / keepalive / handshake) fully,
+//   3. drain the remaining bulk lane.
+// Guarantees a keepalive or control RPC never waits behind a 256 KB audio piece —
+// the cause of false-dead disconnects and control-RPC timeouts under load. Returns
+// true on a real send error (caller disconnects); a WOULDBLOCK leaves bytes queued
+// and returns false. Caller holds peers_mutex_.
+// ---------------------------------------------------------------------------
+bool RatsClient::flush_send_unlocked(RatsPeer& peer) {
+    const socket_t sock = peer.socket;
+    auto& prio = peer.io_.prio_send_buffer;
+    auto& bulk = peer.io_.send_buffer;
+
+    // Send the front frame of `buf`. Returns 1 = progress, 0 = WOULDBLOCK, -1 = error.
+    auto send_front = [&](ChainedSendBuffer& buf) -> int {
+        int bytes = ::send(sock,
+                           reinterpret_cast<const char*>(buf.front_data()),
+                           static_cast<int>(buf.front_size()),
+#ifdef _WIN32
+                           0
+#else
+                           MSG_NOSIGNAL
+#endif
+        );
+        if (bytes > 0) {
+            buf.pop_front(static_cast<size_t>(bytes));
+            peer.last_send_time = std::chrono::steady_clock::now();
+            return 1;
+        }
+        if (bytes < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEWOULDBLOCK) return 0;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+#endif
+            return -1;
+        }
+        return 0;  // bytes == 0: stop, stay armed (shouldn't happen on a healthy stream)
+    };
+
+    // Phase 1: finish an in-progress bulk frame before touching the prio lane.
+    while (bulk.front_partial()) {
+        int r = send_front(bulk);
+        if (r == 0) return false;   // WOULDBLOCK — bytes remain, not an error
+        if (r < 0) return true;     // real send error
+    }
+    // Phase 2: priority lane first (control / keepalive / handshake).
+    while (!prio.empty()) {
+        int r = send_front(prio);
+        if (r == 0) return false;
+        if (r < 0) return true;
+    }
+    // Phase 3: remaining bulk.
+    while (!bulk.empty()) {
+        int r = send_front(bulk);
+        if (r == 0) return false;
+        if (r < 0) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// handle_writable – flush the peer's send buffers (priority-ordered) to the kernel.
 // Returns true if the peer should be disconnected.
 // ---------------------------------------------------------------------------
 bool RatsClient::handle_writable(socket_t socket) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto peer_it = find_peer_by_socket_unlocked(socket);
     if (peer_it == peers_.end()) return true;
-    
-    auto& send_buf = peer_it->second.io_.send_buffer;
 
-    while (!send_buf.empty()) {
-        int bytes = ::send(socket,
-                            reinterpret_cast<const char*>(send_buf.front_data()),
-                            static_cast<int>(send_buf.front_size()),
-#ifdef _WIN32
-                            0
-#else
-                            MSG_NOSIGNAL
-#endif
-        );
-
-        if (bytes > 0) {
-            send_buf.pop_front(static_cast<size_t>(bytes));
-            // App-level keepalive: record outbound activity. (Under peers_mutex_.)
-            peer_it->second.last_send_time = std::chrono::steady_clock::now();
-            continue;
-        }
-
-        if (bytes < 0) {
-#ifdef _WIN32
-            if (WSAGetLastError() == WSAEWOULDBLOCK) break;  // kernel buffer full
-#else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // kernel buffer full
-#endif
-            LOG_CLIENT_ERROR("Send error on socket " << socket);
-            return true;
-        }
-
-        // bytes == 0 — shouldn't happen on a connected stream socket. Stop draining;
-        // the re-arm below keys off send_buf alone, so whatever is left stays armed for
-        // PollOut and can't be stranded.
-        break;
+    RatsPeer& peer = peer_it->second;
+    if (flush_send_unlocked(peer)) {
+        LOG_CLIENT_ERROR("Send error on socket " << socket);
+        return true;   // real send error — disconnect
     }
 
-    // Re-arm the poller from the REAL buffer state, not a speculative probe. The IOCP
-    // backend no longer auto-re-arms PollOut on completion (that busy-spun the io thread
-    // with a zero-byte WSASend that completes instantly while the buffer still can't
-    // drain), so this is the explicit write-readiness signal it depends on.
-    //   - send buffer fully drained: watch PollIn only — nothing pending to write.
-    //   - send buffer still has data (real WOULDBLOCK, or the can't-happen bytes==0
-    //     break): arm PollOut so the next write-readiness completion calls us back to
-    //     flush the remainder. Gating on send_buf alone (rather than a write_blocked
-    //     flag) guarantees no buffered byte is stranded regardless of why we stopped.
+    // Re-arm the poller from the REAL buffer state (both lanes). PollOut only while bytes
+    // remain to write; otherwise PollIn alone. (The IOCP backend doesn't auto re-arm
+    // PollOut, so this explicit signal is what drives the next flush.)
     {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
         if (poller_) {
-            if (!send_buf.empty()) {
-                poller_->modify(socket, PollIn | PollOut);
-            } else {
-                poller_->modify(socket, PollIn);
-            }
+            const bool pending = !peer.io_.prio_send_buffer.empty() ||
+                                 !peer.io_.send_buffer.empty();
+            poller_->modify(socket, pending ? (PollIn | PollOut) : PollIn);
         }
     }
-
     return false;
 }
 
@@ -821,51 +846,30 @@ bool RatsClient::enqueue_message_unlocked(RatsPeer& peer, const std::vector<uint
                  reinterpret_cast<const uint8_t*>(&net_len) + 4);
     frame.insert(frame.end(), data.begin(), data.end());
 
-    auto& send_buf = peer.io_.send_buffer;
-    const bool was_empty = send_buf.empty();
-    send_buf.append(std::move(frame));
+    // Route by size: small frames (control / keepalive / handshake) take the PRIORITY
+    // lane; large frames (audio pieces) take the bulk lane. flush_send_unlocked always
+    // drains prio ahead of bulk, so control never waits behind a piece. (Pieces ship as
+    // JSON base64, not binary, so frame size — not message type — is the discriminator.)
+    const bool is_prio = frame.size() <= PRIO_FRAME_MAX;
+    (is_prio ? peer.io_.prio_send_buffer : peer.io_.send_buffer).append(std::move(frame));
 
-    // Fast path (item E): if nothing was already queued, try to push the frame straight
-    // to the kernel from here rather than waiting for the next PollOut wake. This is safe
-    // because both this path and handle_writable() run under peers_mutex_, so they can
-    // never interleave partial writes on the same socket. We only attempt this when the
-    // buffer was previously empty (no risk of reordering ahead of pending bytes).
-    if (was_empty) {
-        while (!send_buf.empty()) {
-            int bytes = ::send(peer.socket,
-                               reinterpret_cast<const char*>(send_buf.front_data()),
-                               static_cast<int>(send_buf.front_size()),
-#ifdef _WIN32
-                               0
-#else
-                               MSG_NOSIGNAL
-#endif
-            );
-            if (bytes > 0) {
-                send_buf.pop_front(static_cast<size_t>(bytes));
-                peer.last_send_time = std::chrono::steady_clock::now();
-                continue;
-            }
-            // WOULDBLOCK or error: stop and fall through to arming PollOut. Real send
-            // errors are surfaced to the IO thread (it will disconnect on its own recv/
-            // send failure); we don't tear the peer down from this non-IO context.
-            break;
-        }
-        if (send_buf.empty()) {
-            // Fully flushed inline — no need to watch for writability.
-            std::lock_guard<std::mutex> io_lock(io_mutex_);
-            if (poller_) poller_->modify(peer.socket, PollIn);
-            return true;
-        }
-        // else: partial write — fall through to arm PollOut for the remainder.
-    }
+    // Fast path: push to the kernel immediately rather than waiting for the next PollOut
+    // wake. Safe because this path and handle_writable() both run under peers_mutex_, so
+    // they never interleave partial writes on the same socket; flush_send_unlocked also
+    // preserves frame boundaries between lanes. A real send error here is left for the IO
+    // thread (it disconnects on its own next cycle); we don't tear the peer down from
+    // this non-IO context.
+    flush_send_unlocked(peer);
 
-    // Arm PollOut so io_loop flushes the (remaining) buffer.
+    // Arm PollOut iff bytes remain in either lane; otherwise PollIn only.
     {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
-        if (poller_) poller_->modify(peer.socket, PollIn | PollOut);
+        if (poller_) {
+            const bool pending = !peer.io_.prio_send_buffer.empty() ||
+                                 !peer.io_.send_buffer.empty();
+            poller_->modify(peer.socket, pending ? (PollIn | PollOut) : PollIn);
+        }
     }
-
     return true;
 }
 

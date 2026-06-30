@@ -303,29 +303,39 @@
     if (!state.query) renderTrackPane(); else renderSearch();
   }
 
-  // Try the WASM decoder first; fall back to <audio> on unsupported codec / error.
+  // Try the WASM decoder first; fall back to <audio> on unsupported codec, error,
+  // or if no audio actually starts within a few seconds (watchdog).
   async function startEngine(song) {
     const url = streamUrl(song.contentHash);
     const durSec = (song.durationMs || 0) / 1000;
     audio.pause();
     try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+    const useAudio = () => {
+      if (state.playing !== song.contentHash) return;
+      engine = 'audio';
+      audio.src = url;
+      audio.play().catch(() => {/* autoplay policy: user can hit play */});
+    };
     if (wasm) {
-      wasm.onplaying    = () => { if (state.playing === song.contentHash) { $('np-spin').hidden = true; npToggleIcon(); } };
+      let started = false;
+      wasm.onplaying    = () => { started = true; if (state.playing === song.contentHash) { $('np-spin').hidden = true; npToggleIcon(); } };
       wasm.ontimeupdate = () => { if (state.playing === song.contentHash) npProgress(); };
       wasm.onended      = () => onTrackEnded();
       try {
         await wasm.load(url, durSec);
-        if (state.playing === song.contentHash) engine = 'wasm';
+        if (state.playing !== song.contentHash) return;
+        engine = 'wasm';
+        setTimeout(() => {          // watchdog: no sound? drop to <audio>
+          if (!started && engine === 'wasm' && state.playing === song.contentHash) {
+            wasm.stop(); useAudio();
+          }
+        }, 5000);
         return;
       } catch (_) {                 // unsupported codec or decode error
         try { await wasm.stop(); } catch (_) {}
       }
     }
-    if (state.playing === song.contentHash) {
-      engine = 'audio';
-      audio.src = url;
-      audio.play().catch(() => {/* autoplay policy: user can hit play */});
-    }
+    useAudio();
   }
 
   function onTrackEnded() {

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -60,6 +61,7 @@ private:
     std::map<int, std::string> pieces_;            // piece_index -> bytes
     std::atomic<int64_t>    total_size_{-1};
     int64_t                 last_served_ = 0;      // high-water byte the HTTP layer wants
+    std::chrono::steady_clock::time_point last_touch_{};  // last get_range() — idle prefetch when stale
     int                     prefetch_next_ = 0;    // next piece the prefetcher will fetch
     std::string             seeder_;               // first successful seeder
 

@@ -13,8 +13,8 @@ namespace {
 constexpr int     kPieceSize     = 64 * 1024;    // small => the first fetch (click-to-play) is ~64 KB, not 256 KB
 constexpr int     kInitialPieces = 1;            // 64 KB first => fast click-to-play
 constexpr int     kBatchPieces   = 16;           // 1 MB per prefetch fetch (16 * 64 KB; seeder caps count at 16)
-constexpr int     kParallel      = 3;            // concurrent prefetch flows — saturates the seeder upload (a single flow underuses it) and spreads across seeders when there's > 1
-constexpr int64_t kAheadBytes    = 8 * 1024 * 1024;  // keep ~8 MB fetched ahead of playback (room for kParallel in flight)
+constexpr int     kParallel      = 3;            // MAX concurrent prefetch flows; capped at seeder count so a single seeder gets ONE gentle flow (parallel flows to one upload just split it and starve the click-to-play open)
+constexpr int64_t kAheadBytes    = 4 * 1024 * 1024;  // keep ~4 MB fetched ahead of playback
 
 int wait_ms_for(int64_t range_len) { return static_cast<int>(range_len / 200 + 8000); }
 
@@ -88,6 +88,7 @@ bool PieceStore::open() {
         }
         // Prefetch from the audio's first piece, skipping the ID3 pieces entirely.
         prefetch_next_ = std::max(1, static_cast<int>(audio_offset_ / piece_size_));
+        last_touch_ = std::chrono::steady_clock::now();
     }
     if (total_size_.load() - audio_offset_ <= 0) return false;
 
@@ -148,28 +149,33 @@ void PieceStore::store_locked(int piece_start, const std::string& bytes) {
 // HTTP layer advances. Bounded look-ahead caps eager download + memory.
 void PieceStore::prefetch_loop() {
     while (!stop_.load()) {
-        int next; int64_t total, served;
+        int next; int64_t total, served; bool abandoned;
         {
             std::unique_lock<std::mutex> lk(m_);
             next = prefetch_next_; total = total_size_.load(); served = last_served_;
+            // If the HTTP layer hasn't asked for anything in a while, the listener
+            // moved on (clicked another song). Stop prefetching this store so it
+            // doesn't congest the seeder and starve the new song's open.
+            abandoned = (std::chrono::steady_clock::now() - last_touch_) > std::chrono::seconds(4);
             if (total >= 0 && static_cast<int64_t>(next) * piece_size_ >= total) {
                 cv_.wait(lk, [&] { return stop_.load(); });   // fully fetched
                 return;
             }
-            if (static_cast<int64_t>(next) * piece_size_ >= served + kAheadBytes) {
-                cv_.wait_for(lk, std::chrono::milliseconds(150), [&] {
+            if (abandoned || static_cast<int64_t>(next) * piece_size_ >= served + kAheadBytes) {
+                cv_.wait_for(lk, std::chrono::milliseconds(abandoned ? 500 : 150), [&] {
                     return stop_.load() ||
                            last_served_ + kAheadBytes > static_cast<int64_t>(prefetch_next_) * piece_size_;
                 });
                 continue;
             }
         }
-        // Fan out kParallel concurrent fetches over consecutive ranges. A single
-        // flow underutilizes the seeder's upload; several in flight saturate it
-        // (and spread across seeders when there's more than one).
+        // Fan out up to kParallel concurrent fetches, but never more than the
+        // number of seeders — one seeder gets a single flow (parallel flows to one
+        // upload just split it). Several seeders => aggregate their uploads.
+        const int par = std::max(1, std::min(kParallel, static_cast<int>(seeders_.size())));
         std::vector<int> starts;
         std::vector<std::future<FetchOut>> futs;
-        for (int i = 0; i < kParallel; ++i) {
+        for (int i = 0; i < par; ++i) {
             const int ps = next + i * kBatchPieces;
             if (total >= 0 && static_cast<int64_t>(ps) * piece_size_ >= total) break;
             starts.push_back(ps);
@@ -203,6 +209,7 @@ void PieceStore::prefetch_loop() {
 std::string PieceStore::get_range(int64_t offset, int64_t len) {
     offset += audio_offset_;                 // served-stream offset -> file offset (skip ID3)
     std::unique_lock<std::mutex> lk(m_);
+    last_touch_ = std::chrono::steady_clock::now();   // active listener → keep prefetching
     const int64_t total = total_size_.load();
     if (total < 0 || offset >= total) return {};
     const int64_t end = std::min(offset + len, total);

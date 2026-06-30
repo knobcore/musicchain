@@ -1,0 +1,35 @@
+# systemd unit for the Bopwire web gateway.
+# Install: copy to /etc/systemd/system/, edit ExecStart to your checkout path,
+# then: systemctl daemon-reload && systemctl enable --now bopwire-web-gateway
+#
+# The binary loads librats (libmc_rats.so) from the build tree via RUNPATH, the
+# same way bopwire-node / bopwire-mini-node do — so running it straight out of
+# build-linux/ needs no LD_LIBRARY_PATH. If you relocate the binary, also copy
+# the .so and set Environment=LD_LIBRARY_PATH=/opt/bopwire.
+
+[Unit]
+Description=Bopwire web player gateway (librats <-> HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- adjust this path to your VPS checkout ---
+ExecStart=/opt/bopwire-src/bopwire/build-linux/bopwire-web-gateway
+WorkingDirectory=/opt/bopwire-src/bopwire/build-linux
+
+Environment=BOPWIRE_LISTEN_HOST=127.0.0.1
+Environment=BOPWIRE_LISTEN_PORT=8090
+Environment=BOPWIRE_VPS_HOST=85.239.238.226
+Environment=BOPWIRE_VPS_PORT=8080
+Environment=BOPWIRE_ALLOWED_ORIGINS=https://bopwire.com,https://www.bopwire.com
+Environment=BOPWIRE_CACHE_MB=512
+# Optional stable 40-hex identity (else a fresh one is generated each start):
+# Environment=BOPWIRE_GATEWAY_ID=00112233445566778899aabbccddeeff00112233
+
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

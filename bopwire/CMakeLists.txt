@@ -454,6 +454,32 @@ endif()
 
 # (h3_smoke removed — HTTP/3 surface gone)
 
+# bopwire-web-gateway — browser-facing HTTPS/JSON gateway for the web player
+# (webplayer/). A headless librats peer (mc_rats_quic) that joins the mini mesh,
+# serves the Discover feed + audio over plain HTTP (Caddy terminates TLS), and
+# runs play sessions so web plays mint the artist/seeder/mini reward. Source
+# lives under webplayer/gateway/ so the web player is self-contained.
+add_executable(bopwire-web-gateway
+  webplayer/gateway/src/main.cpp
+  webplayer/gateway/src/rats_link.cpp
+  webplayer/gateway/src/streamer.cpp)
+target_compile_features(bopwire-web-gateway PRIVATE cxx_std_17)
+target_include_directories(bopwire-web-gateway PRIVATE
+  ${CMAKE_SOURCE_DIR}/deps/librats/src      # librats_c.h, json.hpp
+  ${CMAKE_SOURCE_DIR}/deps/cpp-httplib)      # httplib.h (header-only, plain HTTP)
+# Link the real librats target directly (NOT the mc_rats_quic alias — QUIC was
+# scrapped and that alias is going away). `rats` is what deps/librats defines.
+target_link_libraries(bopwire-web-gateway PRIVATE rats)
+if(WIN32)
+  target_link_libraries(bopwire-web-gateway PRIVATE ws2_32 iphlpapi bcrypt)
+endif()
+if(NOT MSVC)
+  target_link_libraries(bopwire-web-gateway PRIVATE Threads::Threads)
+endif()
+if(NOT MSVC AND NOT APPLE AND NOT ANDROID)
+  target_link_options(bopwire-web-gateway PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
 if(NOT MC_MINI_NODE_ONLY)
 
 # Copy static bootstrap file next to the node executable so it can seed it

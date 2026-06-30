@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Bopwire — Discover</title>
+  <meta name="description" content="Discover and stream independent artists on the Bopwire P2P network." />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="apple-touch-icon" href="logo.png" />
+  <link rel="preconnect" href="https://api.bopwire.com" crossorigin />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ───────────────────────── Header ───────────────────────── -->
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="logo.png" alt="Bopwire" width="30" height="30" />
+      <span class="brand-name">bopwire</span>
+    </div>
+
+    <div class="search">
+      <input id="search" type="search" placeholder="Search songs, artists, genres…"
+             autocomplete="off" spellcheck="false" />
+    </div>
+
+    <div class="status" id="status" title="Network status">
+      <span class="dot" id="status-dot"></span>
+      <span class="status-text" id="status-text">connecting…</span>
+    </div>
+  </header>
+
+  <!-- ───────────────────── Discover controls ────────────────── -->
+  <section class="controls">
+    <div class="segmented" id="mode-toggle" role="tablist" aria-label="Browse mode">
+      <button class="seg" data-mode="artist" role="tab" aria-selected="true">
+        <span class="seg-ico">👤</span> Artist
+      </button>
+      <button class="seg" data-mode="genre" role="tab" aria-selected="false">
+        <span class="seg-ico">🏷</span> Genre
+      </button>
+    </div>
+
+    <nav class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></nav>
+  </section>
+
+  <!-- ─────────────────────── Two-pane body ──────────────────── -->
+  <main class="panes" id="panes">
+    <div class="pane pane-chips" id="chip-pane">
+      <div class="chips" id="chips"></div>
+      <div class="empty" id="chips-empty" hidden>No streamable songs right now.</div>
+    </div>
+
+    <div class="divider" id="divider" title="Drag to resize"></div>
+
+    <div class="pane pane-tracks" id="track-pane">
+      <div class="track-head" id="track-head" hidden></div>
+      <div class="tracks" id="tracks"></div>
+      <div class="empty" id="track-empty">Pick an album to see its tracks.</div>
+    </div>
+  </main>
+
+  <!-- ─────────────────────── Now playing ────────────────────── -->
+  <div class="nowplaying" id="nowplaying" hidden>
+    <div class="np-art">♪</div>
+    <div class="np-meta">
+      <div class="np-title" id="np-title">—</div>
+      <div class="np-artist" id="np-artist">—</div>
+    </div>
+    <div class="np-controls">
+      <button id="np-toggle" class="np-btn" aria-label="Play/Pause">▶</button>
+      <div class="np-seek">
+        <span id="np-cur">0:00</span>
+        <input id="np-bar" type="range" min="0" max="1000" value="0" step="1" />
+        <span id="np-dur">0:00</span>
+      </div>
+    </div>
+    <div class="np-spin" id="np-spin" hidden></div>
+    <audio id="audio" preload="none"></audio>
+  </div>
+
+  <!-- ───────────────────── Earn-crypto CTA ──────────────────── -->
+  <footer class="cta">
+    <span class="cta-text">
+      Want to earn crypto listening to artists with less than 10,000 plays?
+    </span>
+    <span class="cta-menu">
+      <button id="cta-link" class="cta-click" aria-haspopup="true" aria-expanded="false">
+        Click here
+      </button>
+      <div class="cta-dropdown" id="cta-dropdown" role="menu" hidden>
+        <a class="cta-opt" data-os="linux"   href="#" role="menuitem"><span>🐧</span> Linux</a>
+        <a class="cta-opt" data-os="android" href="#" role="menuitem"><span>🤖</span> Android</a>
+        <a class="cta-opt" data-os="windows" href="#" role="menuitem"><span>🪟</span> Windows</a>
+      </div>
+    </span>
+  </footer>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

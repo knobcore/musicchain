@@ -1,0 +1,22 @@
+# Caddy config for the Bopwire web gateway.
+# Caddy terminates TLS (auto Let's Encrypt) and reverse-proxies to the gateway,
+# which listens on plain HTTP at 127.0.0.1:8090. CORS is emitted by the gateway,
+# so Caddy just passes responses through.
+#
+# Prereq: an A record  api.bopwire.com -> 85.239.238.226  (Namecheap), and ports
+# 80 + 443 open on the VPS (Caddy needs 80/443 reachable to fetch the cert).
+
+api.bopwire.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8090
+
+	# Audio responses can be large; don't let Caddy buffer the whole body.
+	reverse_proxy 127.0.0.1:8090 {
+		flush_interval -1
+	}
+
+	log {
+		output file /var/log/caddy/bopwire-api.log
+		format console
+	}
+}

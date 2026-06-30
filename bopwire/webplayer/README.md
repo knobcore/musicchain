@@ -8,7 +8,7 @@ through a thin server-side **gateway** (the browser cannot speak librats directl
   Browser (bopwire.com, GitHub Pages)
         │  HTTPS / JSON + range-stream
         ▼
-  Caddy  ──TLS── api.bopwire.com            (VPS 85.239.238.226)
+  Caddy  ──TLS── api.bopwire.com            (VPS <your-vps-ip>)
         │  reverse_proxy 127.0.0.1:8090
         ▼
   bopwire-web-gateway  (this repo, C++ / librats)

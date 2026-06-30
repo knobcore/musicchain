@@ -20,7 +20,7 @@ WorkingDirectory=/opt/bopwire-src/bopwire/build-linux
 
 Environment=BOPWIRE_LISTEN_HOST=127.0.0.1
 Environment=BOPWIRE_LISTEN_PORT=8090
-Environment=BOPWIRE_VPS_HOST=85.239.238.226
+Environment=BOPWIRE_VPS_HOST=127.0.0.1
 Environment=BOPWIRE_VPS_PORT=8080
 Environment=BOPWIRE_ALLOWED_ORIGINS=https://bopwire.com,https://www.bopwire.com
 Environment=BOPWIRE_CACHE_MB=512

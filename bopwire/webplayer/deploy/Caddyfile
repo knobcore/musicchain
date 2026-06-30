@@ -3,7 +3,7 @@
 # which listens on plain HTTP at 127.0.0.1:8090. CORS is emitted by the gateway,
 # so Caddy just passes responses through.
 #
-# Prereq: an A record  api.bopwire.com -> 85.239.238.226  (Namecheap), and ports
+# Prereq: an A record  api.bopwire.com -> <your-vps-ip>  (Namecheap), and ports
 # 80 + 443 open on the VPS (Caddy needs 80/443 reachable to fetch the cert).
 
 api.bopwire.com {

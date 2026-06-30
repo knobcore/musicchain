@@ -3,7 +3,7 @@
 Two pieces ship independently:
 
 1. **Front-end** → GitHub Pages (`bopwire.com`). Static files, no build.
-2. **Gateway** → the VPS (`85.239.238.226`), reachable at `https://api.bopwire.com`
+2. **Gateway** → the VPS (`<your-vps-ip>`), reachable at `https://api.bopwire.com`
    via Caddy (auto-TLS). The browser talks only to the gateway.
 
 ---
@@ -14,15 +14,15 @@ Add an **A record** so the gateway subdomain points at the VPS:
 
 | Type | Host | Value | TTL |
 |------|------|-------|-----|
-| A Record | `api` | `85.239.238.226` | Automatic |
+| A Record | `api` | `<your-vps-ip>` | Automatic |
 
-That makes `api.bopwire.com → 85.239.238.226`. Leave the apex/`www` records as they
+That makes `api.bopwire.com → <your-vps-ip>`. Leave the apex/`www` records as they
 are (they point to GitHub Pages for the site itself). Open ports **80 and 443** on
 the VPS firewall — Caddy needs both to obtain and serve the Let's Encrypt cert.
 
 Verify once it propagates:
 ```
-nslookup api.bopwire.com 8.8.8.8     # should return 85.239.238.226
+nslookup api.bopwire.com 8.8.8.8     # should return <your-vps-ip>
 ```
 
 ## 2. Gateway on the VPS
@@ -100,7 +100,7 @@ pushes. The site is live at `https://bopwire.com` after Pages rebuilds (~1 min).
 |-----|---------|---------|
 | `BOPWIRE_LISTEN_HOST` | `127.0.0.1` | Bind host (keep on loopback behind Caddy). |
 | `BOPWIRE_LISTEN_PORT` | `8090` | Gateway HTTP port. |
-| `BOPWIRE_VPS_HOST` / `_PORT` | `85.239.238.226` / `8080` | **Bootstrap** mini only; the gateway then joins the whole mesh via `mininodes.list`. |
+| `BOPWIRE_VPS_HOST` / `_PORT` | `<your-vps-ip>` / `8080` | **Bootstrap** mini only; the gateway then joins the whole mesh via `mininodes.list`. |
 | `BOPWIRE_ALLOWED_ORIGINS` | `https://bopwire.com,https://www.bopwire.com` | CORS allow-list. |
 | `BOPWIRE_CACHE_MB` | `512` | In-memory audio cache cap. |
 | `BOPWIRE_GATEWAY_ID` | (auto) | Optional fixed 40-hex librats identity. |

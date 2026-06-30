@@ -121,7 +121,7 @@ private:
 
 // ─────────────────────────── main ─────────────────────────────
 int main() {
-    const std::string vps_host = env_or("BOPWIRE_VPS_HOST", "85.239.238.226");
+    const std::string vps_host = env_or("BOPWIRE_VPS_HOST", "127.0.0.1");
     const int         vps_port = env_int("BOPWIRE_VPS_PORT", 8080);
     const std::string gw_id    = env_or("BOPWIRE_GATEWAY_ID", "");       // 40-hex or auto
     const std::string host     = env_or("BOPWIRE_LISTEN_HOST", "127.0.0.1");

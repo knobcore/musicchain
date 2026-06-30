@@ -38,7 +38,9 @@ public:
 
 private:
     struct FetchOut { bool ok = false; std::string bytes; int64_t total = -1; std::string seeder; };
-    FetchOut swarm_fetch(int piece_start, int count);   // NO lock held; reads immutable members
+    // NO lock held; reads immutable members. seeder_start rotates which seeder is
+    // tried first, so concurrent fetches spread across seeders when there's > 1.
+    FetchOut swarm_fetch(int piece_start, int count, int seeder_start = 0);
     void     store_locked(int piece_start, const std::string& bytes);  // m_ held
     void     prefetch_loop();
 

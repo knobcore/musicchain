@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <utility>
 
 namespace bopwire::gw {
 
@@ -11,7 +13,8 @@ namespace {
 constexpr int     kPieceSize     = 64 * 1024;    // small => the first fetch (click-to-play) is ~64 KB, not 256 KB
 constexpr int     kInitialPieces = 1;            // 64 KB first => fast click-to-play
 constexpr int     kBatchPieces   = 16;           // 1 MB per prefetch fetch (16 * 64 KB; seeder caps count at 16)
-constexpr int64_t kAheadBytes    = 4 * 1024 * 1024;  // keep ~4 MB fetched ahead of playback
+constexpr int     kParallel      = 3;            // concurrent prefetch flows — saturates the seeder upload (a single flow underuses it) and spreads across seeders when there's > 1
+constexpr int64_t kAheadBytes    = 8 * 1024 * 1024;  // keep ~8 MB fetched ahead of playback (room for kParallel in flight)
 
 int wait_ms_for(int64_t range_len) { return static_cast<int>(range_len / 200 + 8000); }
 
@@ -92,10 +95,13 @@ bool PieceStore::open() {
     return true;
 }
 
-// One swarm.fetch range; tries seeders in turn. No PieceStore lock held.
-PieceStore::FetchOut PieceStore::swarm_fetch(int piece_start, int count) {
+// One swarm.fetch range; tries seeders in turn (starting at seeder_start so
+// concurrent fetches spread across them). No PieceStore lock held.
+PieceStore::FetchOut PieceStore::swarm_fetch(int piece_start, int count, int seeder_start) {
     FetchOut out;
-    for (const std::string& seeder : seeders_) {
+    const size_t n = seeders_.size();
+    for (size_t k = 0; k < n; ++k) {
+        const std::string& seeder = seeders_[(static_cast<size_t>(seeder_start) + k) % n];
         if (stop_.load()) return out;
         const uint32_t csid = link_.next_stream_id();
         auto sink = link_.register_stream(csid);
@@ -158,19 +164,39 @@ void PieceStore::prefetch_loop() {
                 continue;
             }
         }
-        FetchOut r = swarm_fetch(next, kBatchPieces);
-        if (stop_.load()) break;
-        std::unique_lock<std::mutex> lk(m_);
-        if (!r.ok) {                                  // transient failure: back off + retry
-            lk.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            continue;
+        // Fan out kParallel concurrent fetches over consecutive ranges. A single
+        // flow underutilizes the seeder's upload; several in flight saturate it
+        // (and spread across seeders when there's more than one).
+        std::vector<int> starts;
+        std::vector<std::future<FetchOut>> futs;
+        for (int i = 0; i < kParallel; ++i) {
+            const int ps = next + i * kBatchPieces;
+            if (total >= 0 && static_cast<int64_t>(ps) * piece_size_ >= total) break;
+            starts.push_back(ps);
+            futs.push_back(std::async(std::launch::async,
+                                      [this, ps, i] { return swarm_fetch(ps, kBatchPieces, i); }));
         }
-        store_locked(next, r.bytes);
-        if (r.total >= 0) total_size_.store(r.total);
-        if (seeder_.empty()) seeder_ = r.seeder;
-        prefetch_next_ = next + static_cast<int>((r.bytes.size() + piece_size_ - 1) / piece_size_);
+        // Collect ALL futures (never leave one dangling — its destructor would
+        // block). Advance prefetch_next_ past the leading contiguous successes;
+        // out-of-order successes are still cached and used by get_range.
+        int  advance    = next;
+        bool contiguous = true, anyFail = false;
+        for (size_t i = 0; i < futs.size(); ++i) {
+            FetchOut r = futs[i].get();
+            if (!r.ok) { anyFail = true; contiguous = false; continue; }
+            std::lock_guard<std::mutex> lk(m_);
+            store_locked(starts[i], r.bytes);
+            if (r.total >= 0) total_size_.store(r.total);
+            if (seeder_.empty()) seeder_ = r.seeder;
+            if (contiguous)
+                advance = starts[i] + static_cast<int>((r.bytes.size() + piece_size_ - 1) / piece_size_);
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (advance > prefetch_next_) prefetch_next_ = advance;
+        }
         cv_.notify_all();
+        if (anyFail && !stop_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }
 }
 

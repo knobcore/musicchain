@@ -60,11 +60,12 @@ Same item shape as `/api/songs`. → librats: `songs.search`.
 The audio bytes for a song. Supports HTTP `Range` (seeking / progressive `<audio>`).
 
 → librats: `stream.open(content_hash)` → `swarm.fetch` ranges from seeders →
-reassemble from binary frames → serve. `Content-Type` is sniffed from the container
-(audio/mpeg, audio/flac, audio/ogg, audio/mp4, …); falls back to
-`application/octet-stream`. The assembled file is cached (so a browser's range
-re-requests and seeks don't re-pull the swarm), and concurrent requests for the same
-song share one fetch.
+reassemble from binary frames. Streaming is **progressive**: the first piece(s) are
+fetched to learn size + `Content-Type` (sniffed: audio/mpeg, audio/flac, audio/ogg,
+audio/mp4, …), then the gateway streams via an HTTP content-provider, fetching further
+pieces **on demand** as the browser pulls bytes — so click-to-play is one piece fetch,
+not the whole file. Pieces are cached per song (seeks / range re-requests don't re-pull),
+and concurrent first-opens of the same song are de-duped.
 
 - `200` full body (or `206 Partial Content` for a range request)
 - `404` no seeders available right now (song fell out of the swarm)

@@ -49,21 +49,6 @@ static std::string random_addr() {
     return s;
 }
 
-// Sniff an audio container so the browser gets a sensible Content-Type.
-static std::string sniff_audio(const std::string& b) {
-    auto eq = [&](size_t off, const char* sig, size_t n) {
-        return b.size() >= off + n && std::memcmp(b.data() + off, sig, n) == 0;
-    };
-    if (eq(0, "ID3", 3)) return "audio/mpeg";
-    if (b.size() >= 2 && uint8_t(b[0]) == 0xFF && (uint8_t(b[1]) & 0xE0) == 0xE0)
-        return "audio/mpeg";
-    if (eq(0, "fLaC", 4)) return "audio/flac";
-    if (eq(0, "OggS", 4)) return "audio/ogg";
-    if (eq(0, "RIFF", 4) && eq(8, "WAVE", 4)) return "audio/wav";
-    if (eq(4, "ftyp", 4)) return "audio/mp4";
-    return "application/octet-stream";
-}
-
 static json normalize_song(const json& s) {
     return json{
         {"contentHash", s.value("content_hash", "")},
@@ -79,37 +64,59 @@ static json normalize_song(const json& s) {
     };
 }
 
-// ─────────────────────── song byte cache ──────────────────────
-struct CachedSong {
-    std::string bytes;
-    std::string content_type;
-    std::string seeder, mini, delivery_id;   // reward lanes for this play
-};
-
-class SongCache {
+// ───────────────── open-stream (PieceStore) cache ─────────────────
+// One opened PieceStore per song, reused across the browser's range requests
+// (so seeks/re-reads hit cached pieces). Concurrent first-opens are de-duped;
+// the least-recently-opened store is evicted past the cap.
+class StoreCache {
 public:
-    explicit SongCache(size_t cap_bytes) : cap_(cap_bytes) {}
-    std::shared_ptr<CachedSong> get(const std::string& h) {
+    StoreCache(RatsLink& link, size_t max_stores) : link_(link), cap_(max_stores) {}
+
+    std::shared_ptr<PieceStore> peek(const std::string& h) {
         std::lock_guard<std::mutex> lk(m_);
         auto it = map_.find(h);
         return it == map_.end() ? nullptr : it->second;
     }
-    void put(const std::string& h, std::shared_ptr<CachedSong> s) {
-        std::lock_guard<std::mutex> lk(m_);
-        if (map_.count(h)) return;
-        map_[h] = s; order_.push_back(h); bytes_ += s->bytes.size();
-        while (bytes_ > cap_ && !order_.empty()) {
-            const std::string& old = order_.front();
-            auto it = map_.find(old);
-            if (it != map_.end()) { bytes_ -= it->second->bytes.size(); map_.erase(it); }
-            order_.pop_front();
+
+    // Opened store (cached) or nullptr if it can't open (no swarm). Blocking on
+    // first open (stream.open + first piece); instant on subsequent calls.
+    std::shared_ptr<PieceStore> get(const std::string& h) {
+        if (auto s = peek(h)) return s;
+        std::shared_future<std::shared_ptr<PieceStore>> fut;
+        bool owner = false;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (auto it = map_.find(h); it != map_.end()) return it->second;
+            if (auto it = inflight_.find(h); it != inflight_.end()) fut = it->second;
+            else {
+                owner = true;
+                RatsLink* lk = &link_;
+                fut = std::async(std::launch::async, [lk, h] {
+                    auto ps = std::make_shared<PieceStore>(*lk, h);
+                    return ps->open() ? ps : std::shared_ptr<PieceStore>();
+                }).share();
+                inflight_[h] = fut;
+            }
         }
+        std::shared_ptr<PieceStore> ps;
+        try { ps = fut.get(); } catch (...) { ps = nullptr; }
+        if (owner) {
+            std::lock_guard<std::mutex> lk(m_);
+            inflight_.erase(h);
+            if (ps) {
+                map_[h] = ps; order_.push_back(h);
+                while (order_.size() > cap_) { map_.erase(order_.front()); order_.pop_front(); }
+            }
+        }
+        return ps;
     }
 private:
+    RatsLink& link_;
     std::mutex m_;
-    std::unordered_map<std::string, std::shared_ptr<CachedSong>> map_;
+    std::unordered_map<std::string, std::shared_ptr<PieceStore>> map_;
+    std::unordered_map<std::string, std::shared_future<std::shared_ptr<PieceStore>>> inflight_;
     std::deque<std::string> order_;
-    size_t cap_, bytes_ = 0;
+    size_t cap_;
 };
 
 // ─────────────────────────── main ─────────────────────────────
@@ -119,7 +126,7 @@ int main() {
     const std::string gw_id    = env_or("BOPWIRE_GATEWAY_ID", "");       // 40-hex or auto
     const std::string host     = env_or("BOPWIRE_LISTEN_HOST", "127.0.0.1");
     const int         port     = env_int("BOPWIRE_LISTEN_PORT", 8090);
-    const size_t      cache_mb = (size_t) env_int("BOPWIRE_CACHE_MB", 512);
+    const size_t      max_streams = (size_t) env_int("BOPWIRE_MAX_STREAMS", 24);
 
     // Allowed CORS origins (comma-separated).
     std::vector<std::string> origins;
@@ -135,8 +142,7 @@ int main() {
 
     RatsLink link(vps_host, vps_port, gw_id);
     if (!link.start()) { std::fprintf(stderr, "[gw] could not join the network\n"); return 1; }
-    Streamer streamer(link);
-    SongCache cache(cache_mb * 1024 * 1024);
+    StoreCache stores(link, max_streams);
 
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -158,45 +164,6 @@ int main() {
             if (s.value("swarm_size", 0) > 0) arr.push_back(normalize_song(s));
         cat_cache = arr; cat_at = now;
         return arr;
-    };
-
-    // in-flight fetch dedupe
-    std::mutex fl_mu;
-    std::unordered_map<std::string, std::shared_future<std::shared_ptr<CachedSong>>> inflight;
-
-    auto do_fetch = [&](std::string h) -> std::shared_ptr<CachedSong> {
-        FetchResult fr = streamer.fetch(h);
-        if (!fr.ok) return nullptr;
-        auto cs = std::make_shared<CachedSong>();
-        cs->bytes        = std::move(fr.bytes);
-        cs->content_type = sniff_audio(cs->bytes);
-        cs->seeder       = fr.seeder;
-        cs->mini         = fr.mini;
-        cs->delivery_id  = fr.delivery_id;
-        return cs;
-    };
-    auto get_song = [&](const std::string& h) -> std::shared_ptr<CachedSong> {
-        if (auto c = cache.get(h)) return c;
-        std::shared_future<std::shared_ptr<CachedSong>> fut;
-        bool owner = false;
-        {
-            std::lock_guard<std::mutex> lk(fl_mu);
-            if (auto c = cache.get(h)) return c;
-            auto it = inflight.find(h);
-            if (it != inflight.end()) fut = it->second;
-            else {
-                owner = true;
-                fut = std::async(std::launch::async, [&, h] { return do_fetch(h); }).share();
-                inflight[h] = fut;
-            }
-        }
-        std::shared_ptr<CachedSong> song;
-        try { song = fut.get(); } catch (...) { song = nullptr; }
-        if (owner) {
-            std::lock_guard<std::mutex> lk(fl_mu); inflight.erase(h);
-            if (song) cache.put(h, song);
-        }
-        return song;
     };
 
     // active play sessions (reward lifecycle)
@@ -256,35 +223,27 @@ int main() {
         } catch (const std::exception& e) { err(res, 503, e.what()); }
     });
 
-    // GET /api/stream/<64-hex> — audio bytes, with Range support.
+    // GET /api/stream/<64-hex> — audio, streamed progressively from the swarm.
+    // httplib's content provider handles Range (206) by driving `offset`; we
+    // pull ~256 KB per call from the on-demand PieceStore so first-byte latency
+    // is one piece fetch, not the whole file.
     svr.Get(R"(/api/stream/([0-9a-fA-F]{64}))",
             [&](const httplib::Request& req, httplib::Response& res) {
         const std::string h = req.matches[1];
-        auto song = get_song(h);
-        if (!song) { err(res, 404, "no seeders for this song right now"); return; }
-        const std::string& data = song->bytes;
-
-        if (req.has_header("Range")) {
-            // bytes=START-[END]
-            std::string r = req.get_header_value("Range");
-            size_t eq = r.find('='), dash = r.find('-', eq + 1);
-            if (eq != std::string::npos && dash != std::string::npos) {
-                int64_t start = std::atoll(r.substr(eq + 1, dash - eq - 1).c_str());
-                std::string ends = r.substr(dash + 1);
-                int64_t end = ends.empty() ? (int64_t)data.size() - 1 : std::atoll(ends.c_str());
-                if (start < 0) start = 0;
-                if (end >= (int64_t)data.size()) end = (int64_t)data.size() - 1;
-                if (start > end) { err(res, 416, "bad range"); return; }
-                res.status = 206;
-                res.set_header("Accept-Ranges", "bytes");
-                res.set_header("Content-Range", "bytes " + std::to_string(start) + "-" +
-                               std::to_string(end) + "/" + std::to_string(data.size()));
-                res.set_content(data.substr(start, end - start + 1), song->content_type);
-                return;
-            }
+        auto store = stores.get(h);
+        if (!store || store->total_size() <= 0) {
+            err(res, 404, "no seeders for this song right now"); return;
         }
         res.set_header("Accept-Ranges", "bytes");
-        res.set_content(data, song->content_type);
+        auto sp = store;   // keep the store alive for the streamed response
+        res.set_content_provider(
+            (size_t) store->total_size(), store->content_type(),
+            [sp](size_t offset, size_t length, httplib::DataSink& sink) -> bool {
+                const size_t want = std::min<size_t>(length, 256 * 1024);
+                std::string chunk = sp->get_range((int64_t) offset, (int64_t) want);
+                if (chunk.empty()) return false;          // EOF or fetch failure
+                return sink.write(chunk.data(), chunk.size());
+            });
     });
 
     // ── reward lifecycle (browser reports REAL playback) ──
@@ -327,9 +286,9 @@ int main() {
                    if (it == plays.end()) { err(res, 404, "no such play"); return; }
                    pl = it->second; plays.erase(it); }
         json body{{"session_id", sid}};
-        if (auto cs = cache.get(pl.hash)) {           // reward lanes from the fetch
-            if (!cs->seeder.empty()) body["seeder_address"]    = cs->seeder;
-            if (!cs->mini.empty())   body["mini_node_address"] = cs->mini;
+        if (auto st = stores.peek(pl.hash)) {         // reward lanes from the stream
+            if (!st->seeder().empty()) body["seeder_address"]    = st->seeder();
+            if (!st->mini().empty())   body["mini_node_address"] = st->mini();
         }
         try {
             json r = link.rpc_via_relay(pl.node, "session.complete", body, 12000);

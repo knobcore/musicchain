@@ -1,37 +1,54 @@
-// streamer.h — fetch a song's bytes from the swarm via the gateway's RatsLink.
+// streamer.h — on-demand piece store for progressive audio streaming.
 //
-// stream.open → seeder list + delivery_id + (optional) manifest, then a loop of
-// swarm.fetch ranges reassembled from binary frames. Resumes across seeders on
-// failure. Returns the whole file plus the seeder/mini used (for reward lanes).
+// Instead of downloading a whole song before serving (high click-to-play
+// latency), a PieceStore opens the swarm stream, fetches the first piece(s) to
+// learn the size + content type, then fetches further pieces ON DEMAND as the
+// HTTP layer pulls bytes. Pieces are cached, so seeks/re-reads don't re-fetch.
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "rats_link.h"
 
 namespace bopwire::gw {
 
-struct FetchResult {
-    bool        ok = false;
-    std::string bytes;        // assembled audio file
-    std::string seeder;       // peer that served the bytes (reward lane)
-    std::string mini;         // relay mini node (reward lane)
-    std::string delivery_id;  // broker-minted, for relay triangulation
-    std::string error;        // when !ok: no_swarm | unknown | fetch_failed | …
-};
-
-class Streamer {
+class PieceStore {
 public:
-    explicit Streamer(RatsLink& link) : link_(link) {}
+    PieceStore(RatsLink& link, std::string content_hash)
+        : link_(link), hash_(std::move(content_hash)) {}
 
-    // Blocking: pull the full file for content_hash. Picks a full node, opens the
-    // stream, fetches every range, and returns the bytes. Large files are bounded
-    // by max_bytes (0 = default cap).
-    FetchResult fetch(const std::string& content_hash, size_t max_bytes = 0);
+    // stream.open + fetch the first piece(s): learns total_size, content_type,
+    // seeders, and pins one mini for this play. false if no swarm / no node.
+    bool open();
+
+    // Bytes [offset, offset+len) clamped to total, fetching+caching pieces as
+    // needed. Empty at EOF or on a fetch failure.
+    std::string get_range(int64_t offset, int64_t len);
+
+    int64_t            total_size()   const { return total_size_; }
+    const std::string& content_type() const { return content_type_; }
+    const std::string& seeder()       const { return seeder_; }   // reward lane
+    const std::string& mini()         const { return mini_; }     // reward lane
 
 private:
-    RatsLink& link_;
+    bool fetch_batch(int piece_start, int count);   // caller holds m_
+
+    RatsLink&   link_;
+    std::string hash_;
+    std::mutex  m_;
+
+    int         piece_size_  = 256 * 1024;
+    int64_t     total_size_  = -1;
+    std::string delivery_id_;
+    std::string content_type_ = "application/octet-stream";
+    std::vector<std::string> seeders_;
+    std::string node_, mini_, seeder_;
+    std::map<int, std::string> pieces_;   // piece_index -> bytes
+    size_t      cached_bytes_ = 0;
 };
 
 } // namespace bopwire::gw

@@ -33,7 +33,7 @@ function Find-Vcpkg {
     $repo = Get-RepoRoot
     $candidates = @(
         $env:VCPKG_ROOT,
-        (Join-Path $repo 'musicchain\vcpkg'),
+        (Join-Path $repo 'bopwire\vcpkg'),
         'C:\vcpkg',
         'C:\dev\vcpkg'
     )
@@ -48,7 +48,7 @@ function Ensure-Vcpkg {
     if ($found) { return $found }
 
     $repo = Get-RepoRoot
-    $target = Join-Path $repo 'musicchain\vcpkg'
+    $target = Join-Path $repo 'bopwire\vcpkg'
     Write-Step ('vcpkg not found — cloning into ' + $target)
     git clone --depth 1 https://github.com/microsoft/vcpkg.git $target 2>&1
     if ($LASTEXITCODE -ne 0) { Fail 'git clone of vcpkg failed' }

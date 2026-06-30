@@ -2,15 +2,15 @@
 # ----------------------------------------------------------------------
 # install-node-linux.sh
 #
-# Install the FULL musicchain-node as a systemd service on Linux. Run
+# Install the FULL bopwire-node as a systemd service on Linux. Run
 # this AFTER ./scripts/build-node-linux.sh has produced the binary at
-# musicchain/build-linux/musicchain-node.
+# bopwire/build-linux/bopwire-node.
 #
 # What it does:
-#   * Copies the binary to /usr/local/bin/musicchain-node
-#   * Creates a `musicchain` system user (no shell, no home) if missing
-#   * Owns /var/lib/musicchain/{blockchain.db,blocks,keys,logs,audio,dmca,kyc}
-#   * Drops a /etc/systemd/system/musicchain-node.service unit
+#   * Copies the binary to /usr/local/bin/bopwire-node
+#   * Creates a `bopwire` system user (no shell, no home) if missing
+#   * Owns /var/lib/bopwire/{blockchain.db,blocks,keys,logs,audio,dmca,kyc}
+#   * Drops a /etc/systemd/system/bopwire-node.service unit
 #   * Enables + starts the service in --no-tui mode (daemon)
 #
 # Usage:
@@ -22,11 +22,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN_SRC="$REPO_ROOT/musicchain/build-linux/musicchain-node"
-BIN_DST="/usr/local/bin/musicchain-node"
-UNIT="/etc/systemd/system/musicchain-node.service"
-DATA_DIR="/var/lib/musicchain"
-USER="musicchain"
+BIN_SRC="$REPO_ROOT/bopwire/build-linux/bopwire-node"
+BIN_DST="/usr/local/bin/bopwire-node"
+UNIT="/etc/systemd/system/bopwire-node.service"
+DATA_DIR="/var/lib/bopwire"
+USER="bopwire"
 UNINSTALL=0
 
 while [[ $# -gt 0 ]]; do
@@ -51,8 +51,8 @@ step() { printf '\n==> %s\n' "$*"; }
 # ---- Uninstall path -------------------------------------------------
 
 if [[ $UNINSTALL -eq 1 ]]; then
-    step "stopping + disabling musicchain-node.service"
-    systemctl disable --now musicchain-node.service 2>/dev/null || true
+    step "stopping + disabling bopwire-node.service"
+    systemctl disable --now bopwire-node.service 2>/dev/null || true
     rm -f "$UNIT" "$BIN_DST"
     systemctl daemon-reload
     echo "  (chain data at $DATA_DIR left in place — remove manually if you want to wipe it)"
@@ -79,7 +79,7 @@ done
 step "writing unit file $UNIT"
 cat > "$UNIT" <<EOF
 [Unit]
-Description=musicchain full home node (chain + swarm + RPC)
+Description=bopwire full home node (chain + swarm + RPC)
 After=network-online.target
 Wants=network-online.target
 
@@ -113,7 +113,7 @@ chmod 0644 "$UNIT"
 
 step "reloading systemd and enabling service"
 systemctl daemon-reload
-systemctl enable --now musicchain-node.service
+systemctl enable --now bopwire-node.service
 
 step "status"
-systemctl --no-pager --full status musicchain-node.service | sed -n '1,15p'
+systemctl --no-pager --full status bopwire-node.service | sed -n '1,15p'

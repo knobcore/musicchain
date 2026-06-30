@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------
 # build-player-windows.ps1
 #
-# Clean-slate Flutter Windows desktop build of musicchain_player.
+# Clean-slate Flutter Windows desktop build of bopwire_player.
 #
 # Usage:
 #   .\scripts\build-player-windows.ps1
@@ -22,7 +22,7 @@ $ErrorActionPreference = 'Continue'
 . $PSScriptRoot\_common-windows.ps1
 
 $repo      = Get-RepoRoot
-$playerDir = Join-Path $repo 'musicchain_player'
+$playerDir = Join-Path $repo 'bopwire_player'
 $flutter   = Find-Flutter
 if (-not $flutter) {
     Fail 'Flutter SDK not found (download https://docs.flutter.dev/get-started/install/windows).'
@@ -49,7 +49,7 @@ try {
     # has an unconditional install rule that copies this dir; when no
     # plugin emits native assets the dir doesn't exist and CMake's
     # file(INSTALL TYPE DIRECTORY) returns a misleading "No error" —
-    # MSBuild then bubbles MSB3073 even though musicchain_player.exe is
+    # MSBuild then bubbles MSB3073 even though bopwire_player.exe is
     # already in place. Pre-creating the empty dir sidesteps it.
     $nativeAssets = Join-Path $playerDir 'build\native_assets\windows'
     New-Item -ItemType Directory -Path $nativeAssets -Force | Out-Null
@@ -75,9 +75,9 @@ if (-not $releaseDir) {
 # The build can return non-zero from the INSTALL step yet still produce
 # a complete Release\ folder. Treat the presence of the .exe as the
 # real success signal.
-$exe = Join-Path $releaseDir 'musicchain_player.exe'
+$exe = Join-Path $releaseDir 'bopwire_player.exe'
 if (-not (Test-Path $exe)) {
-    Fail "flutter build windows failed (rc=$rc): no musicchain_player.exe under $releaseDir"
+    Fail "flutter build windows failed (rc=$rc): no bopwire_player.exe under $releaseDir"
 }
 
 Write-Step 'Build artifacts'

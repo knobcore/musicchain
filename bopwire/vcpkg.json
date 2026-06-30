@@ -1,0 +1,33 @@
+{
+  "name": "bopwire",
+  "version": "0.1.0",
+  "dependencies": [
+    "openssl",
+    {
+      "name": "ffmpeg",
+      "features": ["avcodec", "avformat", "swresample", "swscale"]
+    },
+    "chromaprint",
+    "libogg",
+    "libvorbis",
+    "opus",
+    "opusfile",
+    "leveldb",
+    "libuv",
+    "nlohmann-json",
+    "cpp-httplib",
+    {
+      "name": "curl",
+      "features": ["ssl"]
+    },
+    "miniupnpc",
+    {
+      "name":     "pdcurses",
+      "platform": "windows"
+    },
+    {
+      "name":     "ncurses",
+      "platform": "!windows"
+    }
+  ]
+}

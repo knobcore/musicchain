@@ -2,7 +2,7 @@
 # ----------------------------------------------------------------------
 # build-node-linux.sh
 #
-# Clean-slate build of the FULL musicchain-node for Linux x86_64. The
+# Clean-slate build of the FULL bopwire-node for Linux x86_64. The
 # full node needs media deps (chromaprint + ffmpeg + ogg/vorbis/opus),
 # leveldb, and ncurses for the TUI. This script installs everything via
 # apt, then cmake-builds.
@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SRC_DIR="$REPO_ROOT/musicchain"
+SRC_DIR="$REPO_ROOT/bopwire"
 BUILD_DIR="$SRC_DIR/build-linux"
 OUTPUT_DIR=""
 CLEAN=0
@@ -65,11 +65,11 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
 
 # ---- Build ----------------------------------------------------------
 
-step "cmake --build (target musicchain-node)"
-cmake --build "$BUILD_DIR" --target musicchain-node -j"$(nproc)"
+step "cmake --build (target bopwire-node)"
+cmake --build "$BUILD_DIR" --target bopwire-node -j"$(nproc)"
 
-BIN="$BUILD_DIR/musicchain-node"
-[[ -f "$BIN" ]] || fail "musicchain-node not produced"
+BIN="$BUILD_DIR/bopwire-node"
+[[ -f "$BIN" ]] || fail "bopwire-node not produced"
 
 step "Build artifact"
 echo "  $BIN"
@@ -78,5 +78,5 @@ file "$BIN" 2>/dev/null || true
 if [[ -n "$OUTPUT_DIR" ]]; then
     mkdir -p "$OUTPUT_DIR"
     cp "$BIN" "$OUTPUT_DIR/"
-    step "Staged copy -> $OUTPUT_DIR/musicchain-node"
+    step "Staged copy -> $OUTPUT_DIR/bopwire-node"
 fi

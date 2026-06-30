@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------
 # build-node-windows.ps1
 #
-# Clean-slate build of musicchain-node.exe for Windows x64. Configures
+# Clean-slate build of bopwire-node.exe for Windows x64. Configures
 # vcpkg (cloning + bootstrapping it if missing), then cmake + MSVC.
 #
 # Usage:
@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Continue'
 . $PSScriptRoot\_common-windows.ps1
 
 $repo     = Get-RepoRoot
-$srcDir   = Join-Path $repo 'musicchain'
+$srcDir   = Join-Path $repo 'bopwire'
 $buildDir = Join-Path $srcDir 'build-win64'
 
 # ---- Prereqs ---------------------------------------------------------
@@ -52,17 +52,17 @@ if ($LASTEXITCODE -ne 0) { Fail 'cmake configure failed' }
 
 # ---- Build -----------------------------------------------------------
 
-Write-Step 'cmake --build (Release, target musicchain-node)'
-& $cmake --build $buildDir --config Release --target musicchain-node
+Write-Step 'cmake --build (Release, target bopwire-node)'
+& $cmake --build $buildDir --config Release --target bopwire-node
 if ($LASTEXITCODE -ne 0) { Fail 'build failed' }
 
 $releaseDir = Join-Path $buildDir 'Release'
-$exe        = Join-Path $releaseDir 'musicchain-node.exe'
-if (-not (Test-Path $exe)) { Fail 'musicchain-node.exe not produced' }
+$exe        = Join-Path $releaseDir 'bopwire-node.exe'
+if (-not (Test-Path $exe)) { Fail 'bopwire-node.exe not produced' }
 
 # librats's CMakeLists.txt writes the shared library to its own
 # bin\Release subdir instead of the parent project's Release dir.
-# Pull it (and any other rats-side DLLs) next to musicchain-node.exe
+# Pull it (and any other rats-side DLLs) next to bopwire-node.exe
 # so the runtime loader finds it.
 $librrelease = Join-Path $buildDir 'deps\librats\bin\Release'
 if (Test-Path $librrelease) {

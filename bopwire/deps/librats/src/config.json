@@ -1,0 +1,10 @@
+{
+    "created_at": 2906481,
+    "encryption_enabled": false,
+    "last_updated": 2912228,
+    "listen_port": 34967,
+    "max_peers": 10,
+    "peer_id": "56d5b1b38424b126d72e4e4a8f715afd5e765603",
+    "port_mapping_enabled": true,
+    "version": "1.0"
+}

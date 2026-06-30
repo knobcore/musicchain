@@ -1,0 +1,128 @@
+[
+    {
+        "ip": "85.239.238.226",
+        "is_outgoing": true,
+        "last_seen": 2912173,
+        "normalized_address": "85.239.238.226:8080",
+        "peer_id": "28b392f80bbc78df2a49afc75b984d3eaf92757a",
+        "port": 8080,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": true,
+        "last_seen": 2906912,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34633",
+        "peer_id": "593208ed1bad9bc0d96b034ce3b3cc02e18c7820",
+        "port": 34633,
+        "version": "1.0"
+    },
+    {
+        "ip": "2605:a141:2333:4750::1",
+        "is_outgoing": false,
+        "last_seen": 2911579,
+        "normalized_address": "[2605:a141:2333:4750::1]:9080",
+        "peer_id": "56070f43aa52aa06a231edf54755aaa621b1b45d",
+        "port": 9080,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2909241,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34547",
+        "peer_id": "0390083d555a392efa11b54ed9a4025db70db53c",
+        "port": 34547,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2909332,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34126",
+        "peer_id": "2d1c3fec849e2b2ac0d0ea0af5367ed347444a5e",
+        "port": 34126,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2909366,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:33643",
+        "peer_id": "ee80208b6db330f4bb95d7e654a57db3c586e01b",
+        "port": 33643,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2909403,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34038",
+        "peer_id": "31054d2e5f22a9400b9af6276d5197addfb85b23",
+        "port": 34038,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2911215,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:33304",
+        "peer_id": "592215c13a21ae0398fab4e95cf7bf51f88fa87c",
+        "port": 33304,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2910857,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34554",
+        "peer_id": "eac82b2c3e2351f54b9dc46506b8e47f35e5af28",
+        "port": 34554,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2911250,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:33674",
+        "peer_id": "c9f4739fcf0aece4c37d144e32f87875d07a6f0a",
+        "port": 33674,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2911266,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34280",
+        "peer_id": "90d6c09551208832e9ccfef4b84efc9955a593fa",
+        "port": 34280,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2911400,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:33488",
+        "peer_id": "13f325c495b5492d38450634e63927c85ef779ff",
+        "port": 33488,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2911578,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:33520",
+        "peer_id": "1a76235913aab30bb4c4e4740e28ebc9634e0d33",
+        "port": 33520,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2912226,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34168",
+        "peer_id": "e8de50c4bc5787d4c73049a5490f7036c2aa9446",
+        "port": 34168,
+        "version": "1.0"
+    }
+]

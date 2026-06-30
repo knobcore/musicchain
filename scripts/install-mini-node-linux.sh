@@ -2,15 +2,15 @@
 # ----------------------------------------------------------------------
 # install-mini-node-linux.sh
 #
-# Install musicchain-mini-node as a systemd service on Linux. Run this
+# Install bopwire-mini-node as a systemd service on Linux. Run this
 # AFTER ./scripts/build-mini-node-linux.sh has produced the binary at
-# musicchain/build-linux-mini/musicchain-mini-node.
+# bopwire/build-linux-mini/bopwire-mini-node.
 #
 # What it does:
-#   * Copies the binary to /usr/local/bin/musicchain-mini-node
-#   * Creates a `musicchain` system user (no shell, no home) if missing
-#   * Drops a /etc/systemd/system/musicchain-mini-node.service unit
-#   * Owns /var/lib/musicchain-mini-node/ as the data dir
+#   * Copies the binary to /usr/local/bin/bopwire-mini-node
+#   * Creates a `bopwire` system user (no shell, no home) if missing
+#   * Drops a /etc/systemd/system/bopwire-mini-node.service unit
+#   * Owns /var/lib/bopwire-mini-node/ as the data dir
 #   * Enables + starts the service
 #
 # Usage:
@@ -22,11 +22,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIN_SRC="$REPO_ROOT/musicchain/build-linux-mini/musicchain-mini-node"
-BIN_DST="/usr/local/bin/musicchain-mini-node"
-UNIT="/etc/systemd/system/musicchain-mini-node.service"
-DATA_DIR="/var/lib/musicchain-mini-node"
-USER="musicchain"
+BIN_SRC="$REPO_ROOT/bopwire/build-linux-mini/bopwire-mini-node"
+BIN_DST="/usr/local/bin/bopwire-mini-node"
+UNIT="/etc/systemd/system/bopwire-mini-node.service"
+DATA_DIR="/var/lib/bopwire-mini-node"
+USER="bopwire"
 PORT="9335"
 UNINSTALL=0
 
@@ -52,8 +52,8 @@ step() { printf '\n==> %s\n' "$*"; }
 # ---- Uninstall path -------------------------------------------------
 
 if [[ $UNINSTALL -eq 1 ]]; then
-    step "stopping + disabling musicchain-mini-node.service"
-    systemctl disable --now musicchain-mini-node.service 2>/dev/null || true
+    step "stopping + disabling bopwire-mini-node.service"
+    systemctl disable --now bopwire-mini-node.service 2>/dev/null || true
     rm -f "$UNIT" "$BIN_DST"
     systemctl daemon-reload
     echo "  (data dir $DATA_DIR left in place — remove manually if desired)"
@@ -78,7 +78,7 @@ install -d -m 0750 -o "$USER" -g "$USER" "$DATA_DIR"
 step "writing unit file $UNIT"
 cat > "$UNIT" <<EOF
 [Unit]
-Description=musicchain mini-node (VPS rendezvous)
+Description=bopwire mini-node (VPS rendezvous)
 After=network-online.target
 Wants=network-online.target
 
@@ -114,7 +114,7 @@ chmod 0644 "$UNIT"
 
 step "reloading systemd and enabling service"
 systemctl daemon-reload
-systemctl enable --now musicchain-mini-node.service
+systemctl enable --now bopwire-mini-node.service
 
 step "status"
-systemctl --no-pager --full status musicchain-mini-node.service | sed -n '1,12p'
+systemctl --no-pager --full status bopwire-mini-node.service | sed -n '1,12p'

@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------
 # build-player-android.ps1
 #
-# Clean-slate Flutter Android release APK build of musicchain_player.
+# Clean-slate Flutter Android release APK build of bopwire_player.
 # Gradle's external native build compiles librats + secp256k1 +
 # chromaprint_jni against the Android NDK. The prebuilt OpenSSL +
 # chromaprint .so files in android/app/src/main/jniLibs/arm64-v8a/
@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Continue'
 . $PSScriptRoot\_common-windows.ps1
 
 $repo      = Get-RepoRoot
-$playerDir = Join-Path $repo 'musicchain_player'
+$playerDir = Join-Path $repo 'bopwire_player'
 $flutter   = Find-Flutter
 $jdk       = Find-JDK17
 $sdk       = Find-AndroidSdk

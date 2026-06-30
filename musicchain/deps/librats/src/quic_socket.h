@@ -1,1 +1,0 @@
- C:\\Users\\lain\\blockchain\\musicchain\\build-win64\\Release\\musicchain-node.exe\ \start\ \--data-dir\ C:\Users\lain\Music\musicchain\

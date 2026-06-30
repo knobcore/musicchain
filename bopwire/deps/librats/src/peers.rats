@@ -1,0 +1,29 @@
+[
+    {
+        "ip": "2605:a141:2333:4750::1",
+        "is_outgoing": false,
+        "last_seen": 2912228,
+        "normalized_address": "[2605:a141:2333:4750::1]:9080",
+        "peer_id": "56070f43aa52aa06a231edf54755aaa621b1b45d",
+        "port": 9080,
+        "version": "1.0"
+    },
+    {
+        "ip": "2605:a141:2333:4750::1",
+        "is_outgoing": false,
+        "last_seen": 2912228,
+        "normalized_address": "[2605:a141:2333:4750::1]:8080",
+        "peer_id": "28b392f80bbc78df2a49afc75b984d3eaf92757a",
+        "port": 8080,
+        "version": "1.0"
+    },
+    {
+        "ip": "2601:602:8701:6977:cb3d:3b0:c7e2:8356",
+        "is_outgoing": false,
+        "last_seen": 2912228,
+        "normalized_address": "[2601:602:8701:6977:cb3d:3b0:c7e2:8356]:34168",
+        "peer_id": "e8de50c4bc5787d4c73049a5490f7036c2aa9446",
+        "port": 34168,
+        "version": "1.0"
+    }
+]

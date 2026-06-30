@@ -1,0 +1,1 @@
+ C:\\Users\\lain\\blockchain\\bopwire\\build-win64\\Release\\bopwire-node.exe\ \start\ \--data-dir\ C:\Users\lain\Music\bopwire\

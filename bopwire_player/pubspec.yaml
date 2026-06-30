@@ -1,0 +1,75 @@
+name: bopwire_player
+description: Bopwire cross-platform player with wallet and upload.
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+  flutter: ">=3.16.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # FFI for native library
+  ffi: ^2.1.0
+
+  # HTTP client
+  http: ^1.1.0
+
+  # App directories
+  path_provider: ^2.1.1
+
+  # State management
+  provider: ^6.1.1
+
+  # Settings storage
+  shared_preferences: ^2.2.2
+
+  # Secure wallet storage
+  flutter_secure_storage: ^9.0.0
+
+  # File picker for uploads
+  file_picker: ^8.0.0
+
+  # Permissions
+  permission_handler: ^11.1.0
+
+  # Local database for cache index
+  sqflite: ^2.3.0
+
+  # Cryptographic utilities
+  crypto: ^3.0.3
+
+  # Pointy Castle for ECDSA
+  pointycastle: ^3.7.3
+
+  # Audio playback (media_kit supports OGG/Vorbis on Windows via bundled libmpv)
+  media_kit: ^1.1.10
+  media_kit_libs_windows_audio: ^1.0.4
+  media_kit_libs_android_audio: ^1.0.0
+
+  # JSON serialization helpers
+  json_annotation: ^4.8.1
+
+  # Audio metadata (ID3 v1/v2, MP4, FLAC, Ogg Vorbis comments) — used
+  # by LibraryScanner to populate title/artist/album/genre/duration from
+  # the file's own tags instead of guessing from the filename.
+  audio_metadata_reader: ^1.4.0
+
+  # Background periodic task — re-runs the LibraryScanner so new files
+  # added to the user's folders get fingerprinted without requiring the
+  # app to be in the foreground.
+  workmanager: ^0.9.0+3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  build_runner: ^2.4.7
+  json_serializable: ^6.7.1
+  ffigen: ^10.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/

@@ -2,7 +2,7 @@
 # ----------------------------------------------------------------------
 # build-mini-node-linux.sh
 #
-# Clean-slate build of musicchain-mini-node for Linux x86_64. The
+# Clean-slate build of bopwire-mini-node for Linux x86_64. The
 # mini-node is the VPS rendezvous binary — it doesn't link any media
 # deps, just OpenSSL + the vendored librats. This script installs the
 # minimum apt packages it needs, then cmake-builds with the
@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SRC_DIR="$REPO_ROOT/musicchain"
+SRC_DIR="$REPO_ROOT/bopwire"
 BUILD_DIR="$SRC_DIR/build-linux-mini"
 OUTPUT_DIR=""
 CLEAN=0
@@ -63,11 +63,11 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
 
 # ---- Build ----------------------------------------------------------
 
-step "cmake --build (target musicchain-mini-node)"
-cmake --build "$BUILD_DIR" --target musicchain-mini-node -j"$(nproc)"
+step "cmake --build (target bopwire-mini-node)"
+cmake --build "$BUILD_DIR" --target bopwire-mini-node -j"$(nproc)"
 
-BIN="$BUILD_DIR/musicchain-mini-node"
-[[ -f "$BIN" ]] || fail "musicchain-mini-node not produced"
+BIN="$BUILD_DIR/bopwire-mini-node"
+[[ -f "$BIN" ]] || fail "bopwire-mini-node not produced"
 
 step "Build artifact"
 echo "  $BIN"
@@ -76,5 +76,5 @@ file "$BIN" 2>/dev/null || true
 if [[ -n "$OUTPUT_DIR" ]]; then
     mkdir -p "$OUTPUT_DIR"
     cp "$BIN" "$OUTPUT_DIR/"
-    step "Staged copy -> $OUTPUT_DIR/musicchain-mini-node"
+    step "Staged copy -> $OUTPUT_DIR/bopwire-mini-node"
 fi

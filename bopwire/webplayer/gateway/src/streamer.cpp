@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <utility>
@@ -10,9 +11,10 @@
 namespace bopwire::gw {
 
 namespace {
-constexpr int     kPieceSize     = 64 * 1024;    // small => the first fetch (click-to-play) is ~64 KB, not 256 KB
-constexpr int     kInitialPieces = 1;            // 64 KB first => fast click-to-play
-constexpr int     kBatchPieces   = 16;           // 1 MB per prefetch fetch (16 * 64 KB; seeder caps count at 16)
+constexpr int     kPieceSize     = 16 * 1024;    // 16 KB == one seeder frame => the click-to-play fetch is tiny
+constexpr int     kProbePieces   = 1;            // first fetch: 16 KB, just enough to read the ID3 header + sniff
+constexpr int     kInitialAudioPieces = 2;       // when audio starts past the probe (big ID3), grab 32 KB of it up front
+constexpr int     kBatchPieces   = 16;           // 256 KB per prefetch fetch (16 * 16 KB; seeder caps count at 16)
 constexpr int     kParallel      = 3;            // MAX concurrent prefetch flows; capped at seeder count so a single seeder gets ONE gentle flow (parallel flows to one upload just split it and starve the click-to-play open)
 constexpr int64_t kAheadBytes    = 4 * 1024 * 1024;  // keep ~4 MB fetched ahead of playback
 
@@ -46,10 +48,12 @@ bool PieceStore::open() {
     mini_ = link_.pick_mini();
     if (mini_.empty()) return false;
 
+    const auto t_open0 = std::chrono::steady_clock::now();
     json o;
     try {
         o = link_.rpc_relay(mini_, node_, "stream.open", json{{"content_hash", hash_}}, 10000);
     } catch (...) { return false; }
+    const auto t_open1 = std::chrono::steady_clock::now();
 
     const json body = o.value("body", json::object());
     for (const auto& p : body.value("peers", json::array())) {
@@ -64,13 +68,26 @@ bool PieceStore::open() {
     // the manifest, so its piece_size is irrelevant here.
     piece_size_ = kPieceSize;
 
-    FetchOut r = swarm_fetch(0, kInitialPieces);
-    if (!r.ok) return false;
+    // Probe the first piece (16 KB) to read the ID3 header + sniff the codec.
+    const auto t_probe0 = std::chrono::steady_clock::now();
+    FetchOut probe = swarm_fetch(0, kProbePieces);
+    const auto t_probe1 = std::chrono::steady_clock::now();
+    if (!probe.ok) return false;
+    {
+        using ms = std::chrono::milliseconds;
+        std::fprintf(stderr, "[open] %s stream.open(find seeders)=%lldms  first-fetch(%zuB)=%lldms  seeders=%zu\n",
+                     hash_.substr(0, 12).c_str(),
+                     (long long)std::chrono::duration_cast<ms>(t_open1 - t_open0).count(),
+                     probe.bytes.size(),
+                     (long long)std::chrono::duration_cast<ms>(t_probe1 - t_probe0).count(),
+                     seeders_.size());
+    }
+    int audio_piece = 0;
     {
         std::lock_guard<std::mutex> lk(m_);
-        store_locked(0, r.bytes);
-        if (r.total >= 0) total_size_.store(r.total);
-        seeder_ = r.seeder;
+        store_locked(0, probe.bytes);
+        if (probe.total >= 0) total_size_.store(probe.total);
+        seeder_ = probe.seeder;
         auto it = pieces_.find(0);
         if (it != pieces_.end()) {
             const std::string& p0 = it->second;
@@ -86,11 +103,30 @@ bool PieceStore::open() {
                 if (off > 0 && off < total_size_.load()) audio_offset_ = off;
             }
         }
-        // Prefetch from the audio's first piece, skipping the ID3 pieces entirely.
-        prefetch_next_ = std::max(1, static_cast<int>(audio_offset_ / piece_size_));
+        audio_piece = static_cast<int>(audio_offset_ / piece_size_);
         last_touch_ = std::chrono::steady_clock::now();
     }
     if (total_size_.load() - audio_offset_ <= 0) return false;
+
+    // Ensure the first AUDIO bytes are cached so the first get_range() is instant.
+    // If the ID3 tag pushes audio past the probe, fetch the audio's first pieces
+    // directly rather than waiting on a big prefetch batch.
+    int next_piece;
+    const int probe_pieces = static_cast<int>((probe.bytes.size() + piece_size_ - 1) / piece_size_);
+    if (audio_piece < probe_pieces) {
+        next_piece = probe_pieces;                       // audio already in the probe
+    } else {
+        FetchOut a = swarm_fetch(audio_piece, kInitialAudioPieces);
+        if (!a.ok) return false;
+        std::lock_guard<std::mutex> lk(m_);
+        store_locked(audio_piece, a.bytes);
+        if (a.total >= 0) total_size_.store(a.total);
+        next_piece = audio_piece + static_cast<int>((a.bytes.size() + piece_size_ - 1) / piece_size_);
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        prefetch_next_ = std::max(1, next_piece);
+    }
 
     prefetch_ = std::thread(&PieceStore::prefetch_loop, this);
     return true;

@@ -81,6 +81,15 @@
     async _pump(reader, gen) {
       try {
         while (this.playing && gen === this._gen) {
+          // Pace: stay within ~12 s of playback instead of scheduling the whole
+          // song at once (the gateway streams faster than realtime). Bounds the
+          // live source count so stop() can actually stop everything. Pausing the
+          // reader also backpressures the fetch, so the gateway stops over-pulling.
+          while (this.playing && gen === this._gen && this.ctx && this._next > 0 &&
+                 (this._next - this.ctx.currentTime) > 12) {
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          if (!this.playing || gen !== this._gen) break;
           const { done, value } = await reader.read();
           if (done || gen !== this._gen) break;
           let out;
@@ -107,8 +116,10 @@
       const t = Math.max(this._next, this.ctx.currentTime);
       try { src.start(t); } catch (_) { return; }
       this._next = t + buf.duration;
+      // prune each buffer once it finishes so the live set stays small but COMPLETE
+      // (every still-scheduled buffer is tracked, so stop() silences all of them)
+      src.onended = () => { const i = this._sources.indexOf(src); if (i >= 0) this._sources.splice(i, 1); };
       this._sources.push(src);
-      if (this._sources.length > 64) this._sources.splice(0, this._sources.length - 64);
     }
 
     _armEnd() {

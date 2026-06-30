@@ -68,11 +68,25 @@ bool PieceStore::open() {
         store_locked(0, r.bytes);
         if (r.total >= 0) total_size_.store(r.total);
         seeder_ = r.seeder;
-        prefetch_next_ = static_cast<int>((r.bytes.size() + piece_size_ - 1) / piece_size_);
         auto it = pieces_.find(0);
-        if (it != pieces_.end()) content_type_ = sniff_audio(it->second);
+        if (it != pieces_.end()) {
+            const std::string& p0 = it->second;
+            content_type_ = sniff_audio(p0);
+            // Skip a leading ID3v2 tag (often 100s of KB — even MBs — of embedded
+            // album art) so the browser gets AUDIO immediately rather than waiting
+            // to download the whole tag. The tag size is a synchsafe int at byte 6.
+            if (p0.size() >= 10 && std::memcmp(p0.data(), "ID3", 3) == 0) {
+                const unsigned char* b = reinterpret_cast<const unsigned char*>(p0.data());
+                const int64_t sz = (int64_t(b[6] & 0x7f) << 21) | (int64_t(b[7] & 0x7f) << 14)
+                                 | (int64_t(b[8] & 0x7f) << 7) | int64_t(b[9] & 0x7f);
+                const int64_t off = 10 + sz + ((b[5] & 0x10) ? 10 : 0);  // + optional footer
+                if (off > 0 && off < total_size_.load()) audio_offset_ = off;
+            }
+        }
+        // Prefetch from the audio's first piece, skipping the ID3 pieces entirely.
+        prefetch_next_ = std::max(1, static_cast<int>(audio_offset_ / piece_size_));
     }
-    if (total_size_.load() <= 0) return false;
+    if (total_size_.load() - audio_offset_ <= 0) return false;
 
     prefetch_ = std::thread(&PieceStore::prefetch_loop, this);
     return true;
@@ -161,6 +175,7 @@ void PieceStore::prefetch_loop() {
 }
 
 std::string PieceStore::get_range(int64_t offset, int64_t len) {
+    offset += audio_offset_;                 // served-stream offset -> file offset (skip ID3)
     std::unique_lock<std::mutex> lk(m_);
     const int64_t total = total_size_.load();
     if (total < 0 || offset >= total) return {};

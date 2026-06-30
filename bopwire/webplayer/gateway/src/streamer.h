@@ -30,7 +30,8 @@ public:
     bool open();                                   // stream.open + first piece + start prefetch
     std::string get_range(int64_t offset, int64_t len);
 
-    int64_t            total_size()   const { return total_size_.load(); }
+    // Served size = file size minus any skipped leading tag (e.g. ID3v2 art).
+    int64_t            total_size()   const { const int64_t t = total_size_.load(); return t < 0 ? t : (t - audio_offset_); }
     const std::string& content_type() const { return content_type_; }
     std::string        seeder();                   // copy under lock (reward lane)
     const std::string& mini()         const { return mini_; }
@@ -46,6 +47,7 @@ private:
 
     // set once in open() before the prefetcher starts → read without lock
     int         piece_size_   = 64 * 1024;
+    int64_t     audio_offset_ = 0;        // leading bytes to skip (ID3v2 tag) so the browser gets audio first
     std::string delivery_id_;
     std::string content_type_ = "application/octet-stream";
     std::vector<std::string> seeders_;

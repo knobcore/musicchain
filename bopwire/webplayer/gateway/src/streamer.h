@@ -45,7 +45,7 @@ private:
     std::string hash_;
 
     // set once in open() before the prefetcher starts → read without lock
-    int         piece_size_   = 256 * 1024;
+    int         piece_size_   = 64 * 1024;
     std::string delivery_id_;
     std::string content_type_ = "application/octet-stream";
     std::vector<std::string> seeders_;

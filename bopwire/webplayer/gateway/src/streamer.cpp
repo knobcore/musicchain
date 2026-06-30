@@ -8,9 +8,9 @@
 namespace bopwire::gw {
 
 namespace {
-constexpr int     kPieceSize     = 256 * 1024;
-constexpr int     kInitialPieces = 1;            // 256 KB first => fast click-to-play
-constexpr int     kBatchPieces   = 8;            // 2 MB per prefetch/on-demand fetch
+constexpr int     kPieceSize     = 64 * 1024;    // small => the first fetch (click-to-play) is ~64 KB, not 256 KB
+constexpr int     kInitialPieces = 1;            // 64 KB first => fast click-to-play
+constexpr int     kBatchPieces   = 16;           // 1 MB per prefetch fetch (16 * 64 KB; seeder caps count at 16)
 constexpr int64_t kAheadBytes    = 4 * 1024 * 1024;  // keep ~4 MB fetched ahead of playback
 
 int wait_ms_for(int64_t range_len) { return static_cast<int>(range_len / 200 + 8000); }
@@ -56,9 +56,10 @@ bool PieceStore::open() {
     if (seeders_.empty()) return false;
 
     delivery_id_ = body.value("delivery_id", "");
-    if (body.contains("manifest") && body["manifest"].is_object())
-        piece_size_ = body["manifest"].value("piece_size", kPieceSize);
-    if (piece_size_ <= 0 || piece_size_ > 512 * 1024) piece_size_ = kPieceSize;
+    // We choose the fetch granularity (the seeder serves whatever piece_size we
+    // ask for); a small piece keeps click-to-play fast. We don't verify against
+    // the manifest, so its piece_size is irrelevant here.
+    piece_size_ = kPieceSize;
 
     FetchOut r = swarm_fetch(0, kInitialPieces);
     if (!r.ok) return false;

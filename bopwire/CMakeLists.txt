@@ -278,7 +278,13 @@ endif()
 # PIC so it links into the bopwire SHARED lib.
 add_library(roaring STATIC deps/croaring/roaring.c)
 target_include_directories(roaring PUBLIC ${CMAKE_SOURCE_DIR}/deps/croaring)
-set_target_properties(roaring PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# croaring uses C11 _Static_assert / <stdalign.h> alignof; gcc defaults to gnu11
+# so Linux is fine, but MSVC needs the standard set explicitly or roaring.c fails
+# to compile (alignof/_Static_assert undefined).
+set_target_properties(roaring PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
 list(APPEND MC_LINK_LIBS roaring)
 list(APPEND MC_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/deps/croaring")
 

@@ -288,7 +288,12 @@
 
   function play(song) {
     if (!song) return;
-    if (wasm) wasm.unlock();        // resume AudioContext inside this click gesture
+    // Silence whatever is playing RIGHT NOW, synchronously, before the async
+    // startEngine for the new song runs — otherwise a quick second click leaves
+    // the first track playing underneath the new one.
+    audio.pause();
+    try { audio.removeAttribute('src'); audio.load(); } catch (_) {}
+    if (wasm) { wasm.unlock(); wasm.stop(); }   // unlock resumes the ctx in this gesture; stop silences the old song
     completePlay();                 // finalize the previous song's reward session
     state.playing = song.contentHash;
     $('nowplaying').hidden = false;
@@ -320,10 +325,10 @@
       let started = false;
       wasm.onplaying    = () => { started = true; if (state.playing === song.contentHash) { $('np-spin').hidden = true; npToggleIcon(); } };
       wasm.ontimeupdate = () => { if (state.playing === song.contentHash) npProgress(); };
-      wasm.onended      = () => onTrackEnded();
+      wasm.onended      = () => { if (state.playing === song.contentHash) onTrackEnded(); };
       try {
         await wasm.load(url, durSec);
-        if (state.playing !== song.contentHash) return;
+        if (state.playing !== song.contentHash) return;   // superseded by a newer click
         engine = 'wasm';
         setTimeout(() => {          // watchdog: no sound? drop to <audio>
           if (!started && engine === 'wasm' && state.playing === song.contentHash) {
@@ -332,6 +337,7 @@
         }, 5000);
         return;
       } catch (_) {                 // unsupported codec or decode error
+        if (state.playing !== song.contentHash) return;   // a newer song is loading — don't touch it
         try { await wasm.stop(); } catch (_) {}
       }
     }

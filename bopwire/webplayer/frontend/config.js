@@ -13,6 +13,6 @@ window.BOPWIRE = {
   downloads: {
     linux:   'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-linux-x86_64.AppImage',
     android: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-android.apk',
-    windows: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-windows-x64.zip',
+    windows: 'https://github.com/knobcore/bopwire/releases/latest/download/bopwire-windows-x64-setup.exe',
   },
 };

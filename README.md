@@ -88,7 +88,7 @@ On Windows, `bopwire/scripts/_visible-linux-player-build.sh` then `_visible-linu
 
 Pre-built player binaries live on the [GitHub Releases](https://github.com/knobcore/bopwire/releases/latest) page — the web player's download menu links straight at `releases/latest`:
 
-- **Windows player** — `bopwire-windows-x64.zip` (unzip, run `Bopwire\bopwire_player.exe`).
+- **Windows player** — `bopwire-windows-x64-setup.exe` (NSIS installer: Start-menu + Desktop shortcuts, uninstaller). Portable `bopwire-windows-x64.zip` also attached.
 - **Android player** — `bopwire-android.apk` (arm64-v8a; sideload, enable unknown sources).
 - **Linux player** — `bopwire-linux-x86_64.AppImage` (`chmod +x`, run; built on Ubuntu 22.04, needs glibc ≥ 2.35).
 

@@ -47,6 +47,8 @@ If you wish to submit a DMCA takedown request anyway, please have your lawyer su
             _EscrowClaimCard(),
             const SizedBox(height: 16),
             _ContactCard(),
+            const SizedBox(height: 16),
+            _TakedownFormCard(),
           ],
         ),
       ),
@@ -206,6 +208,200 @@ class _ContactCardState extends State<_ContactCard> {
                   ? 'Uploading…'
                   : 'Upload takedown PDF'),
               onPressed: _uploading ? null : _pickAndSubmit,
+            ),
+            if (_status.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(_status,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.outline)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Structured takedown form — parity with the web DMCA page. Search the
+// network for artists, add several, give contact + who you represent, and
+// submit to the node's dmca.submit inbox for moderator review.
+class _TakedownFormCard extends StatefulWidget {
+  @override
+  State<_TakedownFormCard> createState() => _TakedownFormCardState();
+}
+
+class _TakedownFormCardState extends State<_TakedownFormCard> {
+  final _artistCtrl = TextEditingController();
+  final _repCtrl    = TextEditingController();
+  final _phoneCtrl  = TextEditingController();
+  final _emailCtrl  = TextEditingController();
+  final Map<String, Set<String>> _selected = {};   // artist -> content hashes
+  bool   _searching  = false;
+  bool   _submitting = false;
+  String _status     = '';
+
+  @override
+  void dispose() {
+    _artistCtrl.dispose(); _repCtrl.dispose();
+    _phoneCtrl.dispose();  _emailCtrl.dispose();
+    super.dispose();
+  }
+
+  void _flash(String msg) => ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(msg)));
+
+  Future<void> _searchArtist() async {
+    final q = _artistCtrl.text.trim();
+    if (q.isEmpty) return;
+    setState(() => _searching = true);
+    try {
+      final pid = await NodeService.getRatsPeerId();
+      if (pid.isEmpty) throw Exception('No full node discovered yet.');
+      final client  = NodeClient(ratsPeerId: pid);
+      final results = await client.searchSongsByArtist(q);
+      if (results.isEmpty) { _flash('No songs found for "$q".'); return; }
+      setState(() {
+        for (final s in results) {
+          if (s.artist.trim().isEmpty || s.contentHash.isEmpty) continue;
+          (_selected[s.artist] ??= <String>{}).add(s.contentHash);
+        }
+        _artistCtrl.clear();
+      });
+    } catch (e) {
+      _flash('Search failed: $e');
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _submit() async {
+    final rep   = _repCtrl.text.trim();
+    final phone = _phoneCtrl.text.trim();
+    final email = _emailCtrl.text.trim();
+    if (_selected.isEmpty) { _flash('Add at least one artist to take down.'); return; }
+    if (rep.isEmpty)   { _flash('Enter the label or artist you represent.'); return; }
+    if (phone.isEmpty) { _flash('Enter a contact phone number.'); return; }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      _flash('Enter a valid email address.'); return;
+    }
+    setState(() { _submitting = true; _status = 'Submitting…'; });
+    try {
+      final pid = await NodeService.getRatsPeerId();
+      if (pid.isEmpty) throw Exception('No full node discovered yet.');
+      final client  = NodeClient(ratsPeerId: pid);
+      final targets = _selected.entries
+          .map((e) => {'artist': e.key, 'contentHashes': e.value.toList()})
+          .toList();
+      final storedAs = await client.submitDmcaForm(
+        representing: rep, phone: phone, email: email, targets: targets);
+      if (!mounted) return;
+      setState(() {
+        _status = 'Submitted as $storedAs';
+        _selected.clear();
+        _repCtrl.clear(); _phoneCtrl.clear(); _emailCtrl.clear();
+      });
+      _flash('Takedown submitted. Once a moderator approves, it takes '
+             '~5–10 minutes to take effect.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Submission failed.');
+      _flash('Submission failed: $e');
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.flag_outlined, color: theme.colorScheme.primary),
+                const SizedBox(width: 8),
+                Text('Report specific artists',
+                     style: theme.textTheme.titleMedium),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Search the network for the artists whose work you want removed, '
+              'add as many as you need, then tell us who you represent and how '
+              'to reach you. Once a moderator approves, the takedown usually '
+              'takes 5–10 minutes to take effect across the network.',
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _artistCtrl,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => _searchArtist(),
+                    decoration: const InputDecoration(
+                      labelText: 'Artist name',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _searching ? null : _searchArtist,
+                  child: _searching
+                      ? const SizedBox(width: 16, height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('Add'),
+                ),
+              ],
+            ),
+            if (_selected.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8, runSpacing: 4,
+                children: _selected.entries.map((e) => Chip(
+                  label: Text('${e.key}  (${e.value.length})'),
+                  onDeleted: () => setState(() => _selected.remove(e.key)),
+                )).toList(),
+              ),
+            ],
+            const SizedBox(height: 14),
+            TextField(
+              controller: _repCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Record label or artist you represent',
+                border: OutlineInputBorder(), isDense: true),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _phoneCtrl,
+              keyboardType: TextInputType.phone,
+              decoration: const InputDecoration(
+                labelText: 'Phone number',
+                border: OutlineInputBorder(), isDense: true),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _emailCtrl,
+              keyboardType: TextInputType.emailAddress,
+              decoration: const InputDecoration(
+                labelText: 'Email address',
+                border: OutlineInputBorder(), isDense: true),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              icon: _submitting
+                  ? const SizedBox(width: 16, height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.gavel_outlined),
+              label: Text(_submitting ? 'Submitting…' : 'Submit takedown request'),
+              onPressed: _submitting ? null : _submit,
             ),
             if (_status.isNotEmpty) ...[
               const SizedBox(height: 8),

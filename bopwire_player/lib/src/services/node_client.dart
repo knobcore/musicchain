@@ -145,6 +145,32 @@ class NodeClient {
     return (m['stored_as'] as String?) ?? filename;
   }
 
+  /// Submit a STRUCTURED takedown form (parity with the web DMCA page):
+  /// [targets] is a list of { 'artist': String, 'contentHashes': [64-hex…] }
+  /// plus who is representing and how to reach them. Lands as JSON in the
+  /// same `<data_dir>/dmca/` inbox the PDFs use; the moderator reviews it
+  /// with the TUI 'D' action. Returns the stored filename.
+  Future<String> submitDmcaForm({
+    required String representing,
+    required String phone,
+    required String email,
+    required List<Map<String, dynamic>> targets,
+  }) async {
+    final r = await _rpc(
+      'dmca.submit',
+      {
+        'representing': representing,
+        'phone':        phone,
+        'email':        email,
+        'source':       'player',
+        'targets':      targets,
+      },
+      timeout: const Duration(seconds: 20),
+    );
+    final m = Map<String, dynamic>.from(r as Map);
+    return (m['stored_as'] as String?) ?? 'submitted';
+  }
+
   /// Push a KYC form / ID scan to the full node so the moderator can
   /// match it to [fromAddress] when releasing that wallet's escrow.
   /// PDF, JPG and PNG are all accepted; node-side cap is 32 MB.

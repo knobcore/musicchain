@@ -1794,6 +1794,91 @@ void RatsApi::handle_request(const std::string& peer_id,
                 }
             }
         }
+        // ---- structured DMCA takedown form (web + player) --------------
+        //
+        // The web DMCA page (via the gateway) and the player's DMCA screen
+        // both POST a STRUCTURED request here instead of a lawyer's PDF:
+        //   { representing, phone, email, source, targets:[ {artist,
+        //     contentHashes:[...]} ] }
+        // We drop it as a JSON file into the SAME <data_dir>/dmca/ inbox
+        // the PDFs use — ECIES-encrypted to the active moderators (plaintext
+        // fallback pre-founder) — so the TUI's DMCA review screen lists both
+        // kinds and can hide the named content hashes on approval.
+        else if (type == "dmca.submit") {
+            const std::string email   = in.value("email", std::string());
+            const json        targets = in.value("targets", json::array());
+            if (email.empty() || !targets.is_array() || targets.empty()) {
+                reply = {{"req_id", req_id}, {"status", "invalid"},
+                         {"error", "email and a non-empty targets array are required"}};
+            } else {
+                const auto now = std::chrono::system_clock::now();
+                const auto t   = std::chrono::system_clock::to_time_t(now);
+                std::tm tm{};
+#ifdef _WIN32
+                gmtime_s(&tm, &t);
+#else
+                gmtime_r(&t, &tm);
+#endif
+                char ts[32];
+                std::snprintf(ts, sizeof(ts), "%04d%02d%02d_%02d%02d%02d_",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                              tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+                json submission = {
+                    {"kind",         "takedown_form"},
+                    {"submitted_ms", (uint64_t)std::chrono::duration_cast<
+                        std::chrono::milliseconds>(now.time_since_epoch()).count()},
+                    {"representing", in.value("representing", std::string())},
+                    {"phone",        in.value("phone", std::string())},
+                    {"email",        email},
+                    {"source",       in.value("source", std::string("player"))},
+                    {"targets",      targets},
+                };
+                const std::string body_str = submission.dump(2);
+                std::vector<uint8_t> bytes(body_str.begin(), body_str.end());
+
+                std::vector<std::pair<Address, PubKey33>> recipients;
+                for (const auto& a : db_.list_active_moderators()) {
+                    auto pk = db_.get_mod_pubkey(a);
+                    if (pk.has_value()) recipients.emplace_back(a, *pk);
+                }
+                std::vector<uint8_t> blob_to_write = bytes;
+                std::string suffix_marker;
+                if (!recipients.empty()) {
+                    auto encrypted = mc::crypto::ecies_encrypt(bytes, recipients);
+                    if (!encrypted.empty()) {
+                        blob_to_write = std::move(encrypted);
+                        suffix_marker = ".enc";
+                    }
+                }
+
+                std::filesystem::path inbox =
+                    std::filesystem::path(config_.data_dir) / "dmca";
+                std::error_code ec;
+                std::filesystem::create_directories(inbox, ec);
+                const std::string fname = std::string(ts) + "takedown.json";
+                auto final_path = inbox / fname;
+                if (!suffix_marker.empty()) final_path += suffix_marker;
+
+                std::ofstream f(final_path, std::ios::binary | std::ios::trunc);
+                if (!f) {
+                    reply = {{"req_id", req_id}, {"status", "error"},
+                             {"error",  "could not open inbox file"}};
+                } else {
+                    f.write(reinterpret_cast<const char*>(blob_to_write.data()),
+                            (std::streamsize)blob_to_write.size());
+                    f.close();
+                    std::cout << "[rats-api] dmca.submit: stored takedown form ("
+                              << targets.size() << " target(s)) as "
+                              << final_path.filename().string()
+                              << " (recipients=" << recipients.size() << ")\n";
+                    reply = {{"req_id", req_id}, {"status", "ok"},
+                             {"body", {{"stored_as", fname},
+                                       {"reportId",  fname},
+                                       {"targets",   targets.size()}}}};
+                }
+            }
+        }
         // ---- offline play-proof bundle ---------------------------------
         //
         // The player sends one of these on reconnect after running

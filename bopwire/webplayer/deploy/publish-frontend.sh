@@ -19,7 +19,7 @@ fi
 
 echo "[publish] copying frontend -> $DEST/player/"
 mkdir -p "$DEST/player/decoders"
-cp "$SRC/index.html" "$SRC/styles.css" "$SRC/app.js" "$SRC/config.js" "$SRC/wasm-player.js" \
+cp "$SRC/index.html" "$SRC/dmca.html" "$SRC/styles.css" "$SRC/app.js" "$SRC/config.js" "$SRC/wasm-player.js" \
    "$SRC/logo.png" "$SRC/favicon.png" "$DEST/player/"
 cp "$SRC"/decoders/*.js "$DEST/player/decoders/"
 

@@ -161,6 +161,11 @@ body {
 .cta-logo { display: block; width: 72px; height: 72px; margin: 8px auto 2px; border-radius: 14px; }
 .cta-dd-title { text-align: center; font-weight: 700; font-size: 12.5px; color: var(--text); opacity: .85; padding: 2px 6px 8px; }
 
+/* top-right DMCA link in the player header */
+.dmca-link { color: var(--muted, #93a1ad); text-decoration: none; font-size: 12px; font-weight: 700;
+  letter-spacing: .04em; border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; margin-left: 10px; white-space: nowrap; }
+.dmca-link:hover { color: var(--accent); border-color: var(--accent); }
+
 /* ───────── Toast ───────── */
 .toast {
   position: fixed; left: 50%; bottom: calc(var(--np-h) + var(--cta-h) + 16px);

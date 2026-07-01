@@ -298,6 +298,29 @@ int main() {
         } catch (const std::exception& e) { err(res, 502, e.what()); }
     });
 
+    // ── DMCA takedown form → node inbox (moderator review) ──
+    // The browser posts { representing, phone, email, targets:[{artist,
+    // contentHashes:[...]}] }; we relay it to the full node's dmca.submit
+    // verb, which drops a structured JSON into the same <data_dir>/dmca/
+    // inbox the PDF takedowns use. No listener reward, no chain write —
+    // human moderator review at the TUI is the gate.
+    svr.Post("/api/dmca", [&](const httplib::Request& req, httplib::Response& res) {
+        json in; try { in = json::parse(req.body); } catch (...) { err(res, 400, "bad json"); return; }
+        if (in.value("email", std::string()).empty() ||
+            !in.contains("targets") || !in["targets"].is_array() || in["targets"].empty()) {
+            err(res, 400, "email and at least one target required"); return;
+        }
+        const std::string node = link.pick_full_node();
+        if (node.empty()) { err(res, 503, "no_node"); return; }
+        try {
+            json r = link.rpc_via_relay(node, "dmca.submit", in, 12000);
+            if (r.value("status", std::string()) != "ok") {
+                err(res, 502, r.value("error", std::string("submit failed"))); return;
+            }
+            res.set_content(r.value("body", json::object()).dump(), "application/json");
+        } catch (const std::exception& e) { err(res, 502, e.what()); }
+    });
+
     std::printf("[gw] listening on http://%s:%d  (%zu mini(s) in mesh)\n",
                 host.c_str(), port, link.mini_count());
     svr.listen(host.c_str(), port);

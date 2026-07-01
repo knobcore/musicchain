@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Bopwire — DMCA Takedown Request</title>
+  <meta name="description" content="Submit a copyright (DMCA) takedown request for content on the Bopwire network." />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <style>
+    .dmca-wrap { max-width: 760px; margin: 0 auto; padding: 22px 16px 64px; }
+    .dmca-card {
+      background: var(--bg-elev2, #1b212b); border: 1px solid var(--line, #2a313b);
+      border-radius: var(--radius, 12px); padding: 22px 22px 26px; margin-top: 16px;
+    }
+    .dmca-title { font-size: 22px; font-weight: 800; margin: 4px 0 2px; }
+    .dmca-sub { color: var(--muted, #93a1ad); font-size: 13.5px; line-height: 1.55; margin: 8px 0 0; }
+    .field { margin-top: 20px; }
+    .field > label { display: block; font-weight: 700; font-size: 13.5px; margin-bottom: 7px; }
+    .field .req { color: var(--accent, #19c98e); }
+    .hint { color: var(--muted, #93a1ad); font-size: 12px; margin: 4px 0 0; }
+    input[type=text], input[type=tel], input[type=email], .search-in {
+      width: 100%; box-sizing: border-box; background: var(--bg-elev, #12171e);
+      border: 1px solid var(--line, #2a313b); border-radius: 9px; color: var(--text, #e8edf2);
+      font: inherit; padding: 11px 13px; outline: none;
+    }
+    input:focus, .search-in:focus { border-color: var(--accent, #19c98e); }
+    /* artist picker */
+    .picker { position: relative; }
+    .dropdown {
+      position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0;
+      background: var(--bg-elev2, #1b212b); border: 1px solid var(--line, #2a313b);
+      border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,.5); max-height: 260px;
+      overflow-y: auto; padding: 5px;
+    }
+    .dropdown[hidden] { display: none; }
+    .opt { display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      padding: 9px 11px; border-radius: 7px; cursor: pointer; font-size: 14px; }
+    .opt:hover, .opt.active { background: var(--bg-elev, #12171e); }
+    .opt .cnt { color: var(--muted, #93a1ad); font-size: 12px; white-space: nowrap; }
+    .opt-empty { padding: 10px 11px; color: var(--muted, #93a1ad); font-size: 13px; }
+    /* selected chips */
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .chip { display: inline-flex; align-items: center; gap: 8px; background: var(--bg-elev, #12171e);
+      border: 1px solid var(--line, #2a313b); border-radius: 999px; padding: 6px 8px 6px 13px; font-size: 13px; }
+    .chip .csong { color: var(--muted, #93a1ad); font-size: 11.5px; }
+    .chip button { background: transparent; border: 0; color: var(--muted, #93a1ad); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 0 4px; border-radius: 50%; }
+    .chip button:hover { color: #ff6b6b; }
+    .chips-empty { color: var(--muted, #93a1ad); font-size: 12.5px; margin-top: 10px; }
+    /* attest + submit */
+    .attest { display: flex; gap: 10px; align-items: flex-start; margin-top: 22px; font-size: 12.5px;
+      color: var(--muted, #93a1ad); line-height: 1.5; }
+    .attest input { margin-top: 2px; }
+    .actions { margin-top: 22px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .btn-submit { background: var(--accent, #19c98e); color: #06231a; border: 0; border-radius: 10px;
+      font: inherit; font-weight: 800; padding: 12px 22px; cursor: pointer; }
+    .btn-submit:disabled { opacity: .5; cursor: not-allowed; }
+    .msg { font-size: 13.5px; }
+    .msg.ok { color: var(--accent, #19c98e); } .msg.bad { color: #ff6b6b; }
+    .back { color: var(--muted, #93a1ad); text-decoration: none; font-size: 13.5px; }
+    .back:hover { color: var(--text, #e8edf2); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="logo.png" alt="Bopwire" width="30" height="30" />
+      <span class="brand-name">bopwire</span>
+    </div>
+    <a class="back" href="index.html">← Back to player</a>
+  </header>
+
+  <div class="dmca-wrap">
+    <div class="dmca-card">
+      <div class="dmca-title">Copyright takedown (DMCA) request</div>
+      <p class="dmca-sub">
+        Use this form to report content on the Bopwire network that infringes a copyright
+        you own or represent. Submissions go to the node moderators' inbox for review. A hidden
+        track is delisted from Discover; approved requests take effect once a moderator confirms them.
+        Filing knowingly false claims may carry legal liability.
+      </p>
+
+      <form id="dmca-form" autocomplete="on" novalidate>
+        <!-- Artists to take down -->
+        <div class="field">
+          <label>Artists / works to take down <span class="req">*</span></label>
+          <div class="picker">
+            <input class="search-in" id="artist-search" type="text" role="combobox"
+                   aria-expanded="false" aria-autocomplete="list"
+                   placeholder="Search artists from Discover…" spellcheck="false" />
+            <div class="dropdown" id="artist-dd" role="listbox" hidden></div>
+          </div>
+          <p class="hint" id="catalog-hint">Loading the Discover catalog…</p>
+          <div class="chips" id="chips"></div>
+          <div class="chips-empty" id="chips-empty">No artists added yet — search above and click to add. You can add several.</div>
+        </div>
+
+        <!-- Representing -->
+        <div class="field">
+          <label for="representing">Record label or artist you represent <span class="req">*</span></label>
+          <input id="representing" type="text" placeholder="e.g. Acme Records, or the artist's legal name" />
+        </div>
+
+        <!-- Phone -->
+        <div class="field">
+          <label for="phone">Phone number <span class="req">*</span></label>
+          <input id="phone" type="tel" placeholder="+1 555 123 4567" />
+        </div>
+
+        <!-- Email -->
+        <div class="field">
+          <label for="email">Email address <span class="req">*</span></label>
+          <input id="email" type="email" placeholder="legal@example.com" />
+        </div>
+
+        <label class="attest">
+          <input id="attest" type="checkbox" />
+          <span>I have a good-faith belief that the use of the material identified above is not
+          authorized by the copyright owner, its agent, or the law, and the information in this
+          request is accurate.</span>
+        </label>
+
+        <div class="actions">
+          <button class="btn-submit" id="submit" type="submit">Submit takedown request</button>
+          <span class="msg" id="msg"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script>
+  (function () {
+    const GW = (window.BOPWIRE && window.BOPWIRE.gateway) || 'https://api.bopwire.com';
+    const $ = (id) => document.getElementById(id);
+    const norm = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[^\w\s]/g, '').trim();
+
+    // artistName -> { hashes:Set, count }
+    const index = new Map();
+    let artists = [];            // sorted unique names
+    const selected = new Map();  // artistName -> {hashes:[], count}
+
+    // ── Load the Discover catalog to power the search ──────────────
+    fetch(GW + '/api/songs').then(r => r.json()).then((songs) => {
+      if (!Array.isArray(songs)) throw new Error('bad catalog');
+      for (const s of songs) {
+        const a = (s.artist || '').trim();
+        if (!a) continue;
+        if (!index.has(a)) index.set(a, { hashes: new Set(), count: 0 });
+        const e = index.get(a);
+        if (s.contentHash) e.hashes.add(s.contentHash);
+        e.count++;
+      }
+      artists = [...index.keys()].sort((x, y) => x.localeCompare(y));
+      $('catalog-hint').textContent = artists.length
+        ? `${artists.length} artists on Discover — search to add.`
+        : 'No artists are currently on Discover.';
+    }).catch(() => {
+      $('catalog-hint').textContent = 'Could not reach the catalog — you can still type an artist name to add it.';
+    });
+
+    // ── Search dropdown ────────────────────────────────────────────
+    const search = $('artist-search'), dd = $('artist-dd');
+    let matches = [], active = -1;
+
+    function renderDD() {
+      const q = norm(search.value);
+      if (!q) { dd.hidden = true; search.setAttribute('aria-expanded', 'false'); return; }
+      matches = artists.filter(a => norm(a).includes(q) && !selected.has(a)).slice(0, 12);
+      // allow adding a free-typed name that isn't in the catalog
+      const exactCatalog = artists.some(a => norm(a) === q);
+      dd.innerHTML = '';
+      if (!matches.length && !exactCatalog) {
+        const d = document.createElement('div'); d.className = 'opt-empty';
+        d.textContent = `Add "${search.value.trim()}" (not on Discover)`;
+        d.style.cursor = 'pointer';
+        d.onmousedown = (e) => { e.preventDefault(); addArtist(search.value.trim()); };
+        dd.appendChild(d);
+      }
+      matches.forEach((a, i) => {
+        const e = index.get(a);
+        const row = document.createElement('div');
+        row.className = 'opt' + (i === active ? ' active' : '');
+        row.setAttribute('role', 'option');
+        row.innerHTML = `<span>${escapeHtml(a)}</span><span class="cnt">${e ? e.count : 0} track${e && e.count === 1 ? '' : 's'}</span>`;
+        row.onmousedown = (ev) => { ev.preventDefault(); addArtist(a); };
+        dd.appendChild(row);
+      });
+      dd.hidden = false; search.setAttribute('aria-expanded', 'true');
+    }
+
+    function addArtist(name) {
+      name = (name || '').trim();
+      if (!name || selected.has(name)) return;
+      const e = index.get(name);
+      selected.set(name, { hashes: e ? [...e.hashes] : [], count: e ? e.count : 0 });
+      search.value = ''; matches = []; active = -1; dd.hidden = true;
+      renderChips();
+    }
+
+    function removeArtist(name) { selected.delete(name); renderChips(); }
+
+    function renderChips() {
+      const chips = $('chips'); chips.innerHTML = '';
+      $('chips-empty').style.display = selected.size ? 'none' : 'block';
+      for (const [name, info] of selected) {
+        const c = document.createElement('span'); c.className = 'chip';
+        c.innerHTML = `<span>${escapeHtml(name)}</span>` +
+          (info.count ? `<span class="csong">${info.count} track${info.count === 1 ? '' : 's'}</span>` : '') +
+          `<button type="button" aria-label="Remove ${escapeHtml(name)}">×</button>`;
+        c.querySelector('button').onclick = () => removeArtist(name);
+        chips.appendChild(c);
+      }
+    }
+
+    function escapeHtml(s) { return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+    search.addEventListener('input', () => { active = -1; renderDD(); });
+    search.addEventListener('keydown', (e) => {
+      if (dd.hidden) { if (e.key === 'Enter' && search.value.trim()) { e.preventDefault(); addArtist(search.value.trim()); } return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, matches.length - 1); renderDD(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); renderDD(); }
+      else if (e.key === 'Enter') { e.preventDefault(); if (active >= 0 && matches[active]) addArtist(matches[active]); else if (search.value.trim()) addArtist(search.value.trim()); }
+      else if (e.key === 'Escape') { dd.hidden = true; }
+    });
+    document.addEventListener('click', (e) => { if (!e.target.closest('.picker')) dd.hidden = true; });
+
+    // ── Submit ─────────────────────────────────────────────────────
+    const msg = $('msg');
+    function setMsg(t, ok) { msg.textContent = t; msg.className = 'msg ' + (ok ? 'ok' : 'bad'); }
+
+    $('dmca-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const representing = $('representing').value.trim();
+      const phone = $('phone').value.trim();
+      const email = $('email').value.trim();
+      if (!selected.size) return setMsg('Add at least one artist / work to take down.', false);
+      if (!representing)   return setMsg('Enter the label or artist you represent.', false);
+      if (!phone)          return setMsg('Enter a contact phone number.', false);
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return setMsg('Enter a valid email address.', false);
+      if (!$('attest').checked) return setMsg('Please confirm the good-faith attestation.', false);
+
+      const targets = [...selected.entries()].map(([artist, info]) => ({ artist, contentHashes: info.hashes }));
+      const payload = { representing, phone, email, attest: true, source: 'web', targets };
+
+      const btn = $('submit'); btn.disabled = true; setMsg('Submitting…', true);
+      try {
+        const r = await fetch(GW + '/api/dmca', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+        setMsg('Request submitted' + (j.reportId ? ` (ref ${j.reportId})` : '') + '. Moderators will review it.', true);
+        $('dmca-form').reset(); selected.clear(); renderChips();
+      } catch (err) {
+        setMsg('Could not submit: ' + err.message, false);
+      } finally { btn.disabled = false; }
+    });
+
+    renderChips();
+  })();
+  </script>
+</body>
+</html>

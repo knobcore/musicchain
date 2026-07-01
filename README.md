@@ -28,6 +28,8 @@ Every shipping binary has its own script. Each script wipes its own build dir on
 | Linux mini node | `scripts/build-mini-node-linux.sh` | `bopwire/build-linux-mini/bopwire-mini-node` |
 | Windows player | `scripts\build-player-windows.ps1` | `bopwire_player\build\windows\x64\runner\Release\` |
 | Android APK | `scripts\build-player-android.ps1` | `bopwire_player\build\app\outputs\flutter-apk\app-release.apk` |
+| Linux desktop player | `bopwire_player/scripts/build-linux-player.sh` | `bopwire_player/build/linux/x64/release/bundle/` |
+| Linux AppImage | `bopwire_player/scripts/build-linux-appimage.sh` | `bopwire_player/build/*.AppImage` |
 
 Common flags:
 
@@ -52,16 +54,42 @@ The shell scripts run `apt-get install` for everything they need, so you just ne
 
 ### Android prerequisites
 
-`build-player-android.ps1` expects the prebuilt OpenSSL and chromaprint `.so` files to already be staged under `bopwire_player/android/app/src/main/jniLibs/arm64-v8a/`. The OpenSSL build helper is at `bopwire/build_openssl_android.sh` (Linux/WSL) or `bopwire/build_openssl_android_win.sh` (Windows MSYS2). Chromaprint cross-compile artifacts live at `chromaprint-android-arm64/` in the repo root.
+`build-player-android.ps1` expects the prebuilt OpenSSL and chromaprint `.so` files to already be staged under `bopwire_player/android/app/src/main/jniLibs/arm64-v8a/`. The OpenSSL build helper is at `bopwire/build_openssl_android.sh` (Linux/WSL) or `bopwire/build_openssl_android_win.sh` (Windows MSYS2). Chromaprint cross-compile artifacts live at `chromaprint-android-arm64/` in the repo root — `libchromaprint.so` from there is copied into `jniLibs/arm64-v8a/` (the imported prebuilt the NDK links against).
+
+### Linux desktop / AppImage prerequisites
+
+Built with the Flutter **Linux** SDK + GTK3. On Windows this runs under **WSL**
+(Ubuntu 22.04). Install the desktop toolchain and the same native deps the Linux
+full node uses:
+
+```
+sudo apt-get install -y ninja-build libgtk-3-dev clang cmake pkg-config \
+  libssl-dev libchromaprint-dev libavcodec-dev libavformat-dev libavutil-dev \
+  libswresample-dev libogg-dev libvorbis-dev libopus-dev libopusfile-dev \
+  libleveldb-dev libminiupnpc-dev nlohmann-json3-dev libncurses-dev
+```
+
+The player `dlopen`s the native core at runtime, so build it first, then package:
+
+1. **Core libs** — `cmake -S bopwire -B bopwire/build-linux-sys -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build bopwire/build-linux-sys --target bopwire rats` → `libbopwire.so` + `libmc_rats.so`.
+2. **Flutter bundle** — `bopwire_player/scripts/build-linux-player.sh` (`flutter build linux --release`).
+3. **Package** — `bopwire_player/scripts/build-linux-appimage.sh` copies the core libs + `libchromaprint.so` + their non-system deps into the bundle and runs `appimagetool` → one relocatable `*.AppImage`. Point it at the core build with `MC_LIB_DIR`.
+
+On Windows, `bopwire/scripts/_visible-linux-player-build.sh` then `_visible-linux-appimage.sh` run steps 2–3 from WSL in a visible terminal (they strip the Windows `PATH`, add the WSL Flutter SDK, and set `MC_LIB_DIR`/`APPIMAGETOOL`).
+
+## Web player
+
+`bopwire/webplayer/` is the browser client for **bopwire.com** — the Discover feed + streaming, listen-only (a web play still rewards the artist/seeder/mini, just not the listener). Two pieces deploy independently; full steps in [`bopwire/webplayer/deploy/README.md`](bopwire/webplayer/deploy/README.md):
+
+- **Front-end** (`webplayer/frontend/`) — vanilla JS/HTML + WASM audio decoders, no build step. Publish to GitHub Pages under `/player/` with `webplayer/deploy/publish-frontend.sh`.
+- **Gateway** (`webplayer/gateway/`) — a headless librats peer bridging the browser (HTTPS via Caddy auto-TLS at `api.bopwire.com`) to the swarm. Build the `bopwire-web-gateway` CMake target with `webplayer/deploy/build-gateway.sh`; run it behind the `bopwire-web-gateway.service` unit + `Caddyfile` in that dir.
 
 ## Releases
 
-Pre-built binaries live on the GitHub Releases page:
+Pre-built player binaries live on the [GitHub Releases](https://github.com/knobcore/bopwire/releases/latest) page — the web player's download menu links straight at `releases/latest`:
 
-- **Windows full node** — `bopwire-node.exe` + DLLs.
-- **Linux full node** — `bopwire-node` (Ubuntu 22.04 toolchain).
-- **Linux mini node** — `bopwire-mini-node` (statically linked where possible).
-- **Windows player** — `bopwire_player.exe` + DLLs.
-- **Android player** — `app-release.apk`.
+- **Windows player** — `bopwire-windows-x64.zip` (unzip, run `Bopwire\bopwire_player.exe`).
+- **Android player** — `bopwire-android.apk` (arm64-v8a; sideload, enable unknown sources).
+- **Linux player** — `bopwire-linux-x86_64.AppImage` (`chmod +x`, run; built on Ubuntu 22.04, needs glibc ≥ 2.35).
 
-The release artifacts are produced from the same scripts above — there's no separate CI build.
+All artifacts are produced from the scripts above — there's no separate CI build.

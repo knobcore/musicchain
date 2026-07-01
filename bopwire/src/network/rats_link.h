@@ -89,6 +89,20 @@ public:
     // is_busy + net_bps to pick the lightest full node.
     void set_load_monitor(LoadMonitor* lm) { load_monitor_ = lm; }
 
+    // Provide this node's wallet keypair so every published route is SIGNED.
+    // The wire form becomes an envelope {route, pubkey, sig}; the mini-node
+    // verifies the ECDSA signature AND that address_from_pubkey(pubkey)
+    // equals the route's node_id (== wallet address) before trusting or
+    // relaying it. The private key never leaves the signing node — the VPS
+    // mini only ever sees the *public* key carried inside each route, so no
+    // private key is needed on the rendezvous host to verify.
+    void set_signing_key(const std::vector<uint8_t>& priv,
+                         const mc::PubKey33& pub) {
+        sign_priv_ = priv;
+        sign_pub_  = pub;
+        can_sign_  = (priv.size() == 32);
+    }
+
 private:
     uint16_t       listen_port_;
     std::string    node_id_hex_;
@@ -100,6 +114,14 @@ private:
     std::string    public_addr_;
     std::string    rats_peer_id_;
     LoadMonitor*   load_monitor_ = nullptr;
+
+    // Route-signing identity (see set_signing_key). Empty until wired.
+    std::vector<uint8_t> sign_priv_;      // 32-byte wallet private key
+    mc::PubKey33         sign_pub_{};      // matching compressed pubkey
+    bool                 can_sign_ = false;
+    // Build the outgoing route message: a signed {route,pubkey,sig} envelope
+    // when a key is wired, else the bare legacy route json.
+    std::string build_route_message() const;
 
     // List of bootstrap mini-nodes (VPSes) we dial at startup and re-dial
     // from the watchdog whenever validated_peer_count() == 0. Populated

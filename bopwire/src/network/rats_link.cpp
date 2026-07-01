@@ -1,6 +1,7 @@
 #include "rats_link.h"
 #include "../audio/fingerprint.h"  // base64_encode / base64_decode
 #include "../crypto/hash.h"        // to_hex / from_hex helpers
+#include "../crypto/signature.h"   // sign_data — signs published routes
 
 // librats (deps/librats) is plain TCP — its stock socket layer. The old QUIC
 // bridge (mc_rats_quic / quic_socket.cpp) was removed; we link librats' C
@@ -168,6 +169,30 @@ std::string RatsLink::build_route_json() const {
     return ss.str();
 }
 
+// Wrap build_route_json() in a signed envelope {route,pubkey,sig} when a
+// signing key is wired. The signature covers a domain-separated preimage of
+// the EXACT inner route bytes, which the mini re-verifies over verbatim (it
+// never re-serializes), so float/formatting can't desync signer & verifier.
+std::string RatsLink::build_route_message() const {
+    const std::string inner = build_route_json();
+    if (!can_sign_) return inner;  // no key wired -> legacy unsigned route
+
+    // Domain prefix so a route signature can't be replayed as a signature for
+    // any other message kind. Constant on both sides; NOT transmitted.
+    static const std::string kRouteSigDomain = "bopwire-route-v1:";
+    const std::string preimage = kRouteSigDomain + inner;
+
+    const mc::Sig64 sig = mc::crypto::sign_data(
+        reinterpret_cast<const uint8_t*>(preimage.data()), preimage.size(),
+        sign_priv_);
+
+    nlohmann::json env;
+    env["route"]  = inner;   // exact bytes the mini verifies over
+    env["pubkey"] = mc::crypto::to_hex(sign_pub_.data(), sign_pub_.size());
+    env["sig"]    = mc::crypto::to_hex(sig.data(), sig.size());
+    return env.dump();
+}
+
 std::string RatsLink::rats_peer_id() const {
     std::lock_guard<std::mutex> lk(pub_mu_);
     return rats_peer_id_;
@@ -175,7 +200,7 @@ std::string RatsLink::rats_peer_id() const {
 
 void RatsLink::publish_route_now() {
     if (!client_) return;
-    const auto json = build_route_json();
+    const auto json = build_route_message();
 
     // Send directly to every validated peer instead of relying on the
     // GossipSub mesh — librats' GossipSub layer needs a mesh form-up

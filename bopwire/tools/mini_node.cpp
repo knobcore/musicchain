@@ -162,6 +162,11 @@ struct RouteEntry {
     float        cpu_load   = 0.0f;
     uint64_t     net_bps    = 0;
     bool         is_busy    = false;
+    // Verbatim signed envelope {route,pubkey,sig} this route arrived in, or
+    // empty for a legacy unsigned route. Kept so catch-up replication to a
+    // freshly-joined mini forwards a route the peer can independently verify,
+    // and so the replay guard knows this entry came from a signed source.
+    std::string  signed_envelope;
 };
 
 std::atomic<bool>  g_running{true};
@@ -267,6 +272,20 @@ std::mutex                            g_route_gossip_mu;
 std::unordered_map<size_t, uint64_t>  g_route_gossip_seen; // body-hash -> last-fwd ms
 constexpr uint64_t kRouteGossipDedupMs = 5 * 60 * 1000;    // re-flood window
 constexpr size_t   kRouteGossipSeenCap = 8192;             // prune above this
+
+// ---- Route authentication -------------------------------------------
+//
+// Full nodes sign every published route (envelope {route,pubkey,sig}); the
+// mini verifies address_from_pubkey(pubkey) == node_id + the ECDSA sig
+// before trusting or relaying it. A bad signature is ALWAYS dropped. When
+// `g_require_signed_routes` is on, unsigned (legacy) routes are dropped too;
+// default off so a mixed fleet keeps working during rollout. Verification
+// needs only the public key carried in the route — no private key on the VPS.
+bool g_require_signed_routes = false;
+// Replay window for signed routes (their `ts` is unix seconds). Republish is
+// every ~15 min, so 30 min tolerates one missed cycle; 5 min covers skew.
+constexpr uint64_t kRouteMaxAgeSec       = 30 * 60;
+constexpr uint64_t kRouteFutureSkewSec   = 5 * 60;
 
 // CLI-seeded list of mini-nodes to dial at startup. Lets a fresh VPS bootstrap
 // onto an existing mesh by knowing one already-running peer.
@@ -411,6 +430,36 @@ bool chat_verify_canon(const std::vector<uint8_t>& canon,
     // Require the pubkey to actually derive the claimed wallet address.
     if (mc::crypto::address_from_pubkey(pub) != claimed) return false;
     return mc::crypto::verify_data(canon.data(), canon.size(), sig, pub);
+}
+
+// Verify a signed route envelope. `inner_route` is the exact route JSON the
+// publisher signed; `node_id_hex` is its node_id (== the publisher's 40-hex
+// wallet address). Returns true iff the pubkey/sig are well-formed, the
+// pubkey derives node_id, and the ECDSA sig covers the domain-separated
+// inner bytes. Same trust model as chat: identity is bound to the wallet
+// key, so a peer cannot forge a route for a node_id it doesn't control, nor
+// tamper with any signed field in transit. Domain prefix must match the
+// signer in rats_link.cpp::build_route_message.
+bool route_verify(const std::string& inner_route,
+                  const std::string& node_id_hex,
+                  const std::string& pubkey_hex,
+                  const std::string& sig_hex) {
+    if (pubkey_hex.size() != 66 || sig_hex.size() != 128) return false;
+    auto pk_bytes  = mc::crypto::from_hex(pubkey_hex);
+    auto sig_bytes = mc::crypto::from_hex(sig_hex);
+    if (pk_bytes.size() != 33 || sig_bytes.size() != 64) return false;
+    mc::Address claimed{};
+    if (!mc::crypto::parse_address_checksummed(node_id_hex, claimed)) return false;
+    mc::PubKey33 pub{};
+    std::copy(pk_bytes.begin(), pk_bytes.end(), pub.begin());
+    mc::Sig64 sig{};
+    std::copy(sig_bytes.begin(), sig_bytes.end(), sig.begin());
+    if (mc::crypto::address_from_pubkey(pub) != claimed) return false;
+    static const std::string kRouteSigDomain = "bopwire-route-v1:";
+    const std::string preimage = kRouteSigDomain + inner_route;
+    return mc::crypto::verify_data(
+        reinterpret_cast<const uint8_t*>(preimage.data()), preimage.size(),
+        sig, pub);
 }
 
 // Append a u64 little-endian to a byte vector.
@@ -853,18 +902,55 @@ void chat_refresh_global_mods_if_stale();
 constexpr uint64_t kProbeMinIntervalMs = 60'000;
 
 void ingest_route(const std::string& body, const char* peer_id) {
+    // --- Route authentication (see route_verify / g_require_signed_routes).
+    // A signed route arrives as an envelope {route,pubkey,sig} where `route`
+    // is the exact inner JSON the publisher signed. Verify before trusting.
+    // Legacy full nodes still send the bare inner JSON — accepted only while
+    // enforcement is off.
+    std::string inner = body;   // the route JSON we parse below
+    std::string signed_env;     // verified envelope, kept for re-replication
+    {
+        bool is_env = false;
+        nlohmann::json outer;
+        try {
+            outer = nlohmann::json::parse(body);
+            is_env = outer.is_object() && outer.contains("route") &&
+                     outer["route"].is_string() && outer.contains("pubkey") &&
+                     outer.contains("sig");
+        } catch (...) { /* not JSON -> handled as legacy below */ }
+
+        if (is_env) {
+            const std::string route_str = outer["route"].get<std::string>();
+            const std::string pubkey    = outer.value("pubkey", std::string());
+            const std::string sig       = outer.value("sig",    std::string());
+            const std::string claimed   = json_get_string(route_str, "node_id");
+            if (!route_verify(route_str, claimed, pubkey, sig)) {
+                if (!g_quiet)
+                    std::cout << "[routes] DROP bad-signature route node="
+                              << claimed.substr(0, 12) << "\n";
+                return;   // forged/tampered — never accept, even when lenient
+            }
+            inner      = route_str;   // verified bytes
+            signed_env = body;        // verbatim envelope for re-forwarding
+        } else if (g_require_signed_routes) {
+            if (!g_quiet)
+                std::cout << "[routes] DROP unsigned route (enforcing)\n";
+            return;
+        }
+    }
+
     RouteEntry e;
-    e.node_id        = json_get_string(body, "node_id");
-    e.rats_peer_id   = json_get_string(body, "rats_peer_id");
-    e.public_address = json_get_string(body, "public_address");
-    e.api_port       = static_cast<int>(json_get_uint(body, "api_port"));
-    e.ts             = json_get_uint(body, "ts");
-    e.received_at_ms = mono_ms(); // (#8) drives the route TTL — monotonic
-    // Load fields — present in routes from the new full-node build.
-    // Parse via nlohmann::json so floats and bools work, the
+    e.node_id         = json_get_string(inner, "node_id");
+    e.rats_peer_id    = json_get_string(inner, "rats_peer_id");
+    e.public_address  = json_get_string(inner, "public_address");
+    e.api_port        = static_cast<int>(json_get_uint(inner, "api_port"));
+    e.ts              = json_get_uint(inner, "ts");
+    e.received_at_ms  = mono_ms(); // (#8) drives the route TTL — monotonic
+    e.signed_envelope = signed_env;
+    // Load fields — parse via nlohmann::json so floats and bools work, the
     // hand-rolled json_get_string used above is string-only.
     try {
-        auto j = nlohmann::json::parse(body);
+        auto j = nlohmann::json::parse(inner);
         if (j.contains("load_score") && j["load_score"].is_number())
             e.load_score = j["load_score"].get<float>();
         if (j.contains("cpu_load")   && j["cpu_load"].is_number())
@@ -880,6 +966,18 @@ void ingest_route(const std::string& body, const char* peer_id) {
 
     if (e.node_id.empty()) return;
 
+    // Replay guard for signed routes: reject stale / far-future timestamps so
+    // a captured old envelope can't be re-injected. (`ts` is unix seconds.)
+    if (!signed_env.empty()) {
+        const uint64_t now_s = now_ms() / 1000;
+        if (e.ts + kRouteMaxAgeSec < now_s || e.ts > now_s + kRouteFutureSkewSec) {
+            if (!g_quiet)
+                std::cout << "[routes] DROP stale/future signed route node="
+                          << e.node_id.substr(0, 12) << "\n";
+            return;
+        }
+    }
+
     bool need_probe = false;
     {
         std::lock_guard<std::mutex> lk(g_routes_mu);
@@ -887,6 +985,10 @@ void ingest_route(const std::string& body, const char* peer_id) {
         if (it == g_routes.end()) {
             need_probe = true;
         } else {
+            // Replay guard: never let an older signed route overwrite a newer
+            // signed one we already trust (lock released by RAII on return).
+            if (!it->second.signed_envelope.empty() && e.ts < it->second.ts)
+                return;
             // Preserve last probe result + only re-probe if stale.
             e.reachability             = it->second.reachability;
             e.reachability_tested_at_ms = it->second.reachability_tested_at_ms;
@@ -1155,6 +1257,14 @@ void replicate_routes_to_peer(const std::string& peer_id) {
         for (const auto& kv : g_routes) snapshot.push_back(kv.second);
     }
     for (const auto& e : snapshot) {
+        // Forward the verbatim signed envelope when we have one so the peer
+        // can independently verify; fall back to the flat legacy record for
+        // unsigned routes (which the peer only keeps if it isn't enforcing).
+        if (!e.signed_envelope.empty()) {
+            rats_send_message(g_client, peer_id.c_str(), kRoutesTopic,
+                              e.signed_envelope.c_str());
+            continue;
+        }
         nlohmann::json r = {
             {"node_id",        e.node_id},
             {"rats_peer_id",   e.rats_peer_id},
@@ -2987,6 +3097,8 @@ int main(int argc, char** argv) {
             g_mesh_fanout = std::atoi(argv[++i]);
         } else if (a == "--mininodes-list-max" && i + 1 < argc) {
             g_mininodes_list_max = std::atoi(argv[++i]);
+        } else if (a == "--require-signed-routes") {
+            g_require_signed_routes = true;
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: mini-node [--rats-port N] [--quiet]\n"
                       << "  --rats-port          librats TCP port (default " << kDefaultRatsPort << ")\n"
@@ -2996,7 +3108,8 @@ int main(int argc, char** argv) {
                       << "  --sparse-mesh        bounded-degree epidemic gossip instead of full mesh\n"
                       << "                       (for thousands of minis; default off)\n"
                       << "  --mesh-fanout N      peers per gossip round when --sparse-mesh (default 16)\n"
-                      << "  --mininodes-list-max N  cap mininodes.list to N sampled peers (default 64)\n";
+                      << "  --mininodes-list-max N  cap mininodes.list to N sampled peers (default 64)\n"
+                      << "  --require-signed-routes  drop routes without a valid signature (default off)\n";
             return 0;
         } else {
             // legacy --http-port flag is silently accepted+ignored so existing
@@ -3054,6 +3167,10 @@ int main(int argc, char** argv) {
                         j.contains("mininodes_list_max") &&
                         j["mininodes_list_max"].is_number_integer())
                         g_mininodes_list_max = j["mininodes_list_max"].get<int>();
+                    if (!g_require_signed_routes &&
+                        j.contains("require_signed_routes") &&
+                        j["require_signed_routes"].is_boolean())
+                        g_require_signed_routes = j["require_signed_routes"].get<bool>();
                 } catch (...) { /* keep CLI / default values */ }
             }
         }
@@ -3072,9 +3189,10 @@ int main(int argc, char** argv) {
             lm["disable_net_metric"]   = load_cfg.disable_net_metric;
             lm["disable_cpu_metric"]   = load_cfg.disable_cpu_metric;
             j["load_monitor"] = lm;
-            j["sparse_mesh"]        = g_sparse_mesh;
-            j["mesh_fanout"]        = g_mesh_fanout;
-            j["mininodes_list_max"] = g_mininodes_list_max;
+            j["sparse_mesh"]           = g_sparse_mesh;
+            j["mesh_fanout"]           = g_mesh_fanout;
+            j["mininodes_list_max"]    = g_mininodes_list_max;
+            j["require_signed_routes"] = g_require_signed_routes;
             std::ofstream of(save_path);
             of << j.dump(2);
         } catch (...) {}
@@ -3086,7 +3204,9 @@ int main(int argc, char** argv) {
     std::cout << "[mini-node] mesh="
               << (g_sparse_mesh ? "sparse" : "full")
               << " fanout=" << g_mesh_fanout
-              << " list_max=" << g_mininodes_list_max << "\n";
+              << " list_max=" << g_mininodes_list_max
+              << " require_signed=" << (g_require_signed_routes ? "on" : "off")
+              << "\n";
 
     g_load_mon = std::make_unique<mc::net::LoadMonitor>(load_cfg);
     g_load_mon->start();

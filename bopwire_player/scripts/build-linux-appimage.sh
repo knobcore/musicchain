@@ -57,11 +57,46 @@ for f in libbopwire.so libmc_rats.so; do
     [ -f "$src" ] && cp -f "$src" "$APPDIR/usr/lib/$f"
 done
 
+# --- Secret Service (gnome-keyring) + session D-Bus ------------------------
+# flutter_secure_storage -> libsecret needs a running Secret Service on the
+# session D-Bus. GNOME/KDE desktops provide one; non-GNOME / minimal / headless
+# distros don't ("failed to launch keyring"), so the wallet can't store keys.
+# Bundle gnome-keyring-daemon + dbus so AppRun can bring one up on those hosts.
+# (apt install -y gnome-keyring dbus-x11  in the build environment.)
+for b in gnome-keyring-daemon dbus-launch dbus-daemon; do
+    p="$(command -v "$b" 2>/dev/null || true)"
+    if [ -n "$p" ]; then cp -f "$p" "$APPDIR/usr/bin/$b"; echo "[appimage] bundled $b ($p)";
+    else echo "[appimage] WARN: $b not on build host — 'apt install gnome-keyring dbus-x11'"; fi
+done
+
 # AppRun wrapper.
 cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
 export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/bin/lib:${LD_LIBRARY_PATH:-}"
+export PATH="$HERE/usr/bin:${PATH:-}"
+
+# --- Wallet secure storage (Secret Service) --------------------------------
+# flutter_secure_storage uses libsecret, which needs a Secret Service on the
+# session D-Bus. GNOME/KDE provide one; non-GNOME / minimal / headless distros
+# don't -> "failed to launch keyring" and the wallet can't unlock. Bring up our
+# bundled gnome-keyring when none is present. Safe when the host already has a
+# keyring: `gnome-keyring-daemon --start` connects to the existing daemon rather
+# than double-registering the org.freedesktop.secrets name.
+if [ -x "$HERE/usr/bin/gnome-keyring-daemon" ]; then
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -x "$HERE/usr/bin/dbus-launch" ]; then
+        eval "$("$HERE/usr/bin/dbus-launch" --sh-syntax 2>/dev/null)" || true
+        export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+    fi
+    # Empty password unlocks (or first-run creates) a passwordless 'login'
+    # keyring and starts the secrets component. NOTE: a passwordless keyring is
+    # about as protected as a local file — fine for functionality; a desktop
+    # with its own locked keyring still takes precedence over this fallback.
+    eval "$(printf '' | "$HERE/usr/bin/gnome-keyring-daemon" \
+              --start --unlock --components=secrets 2>/dev/null)" || true
+    export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+fi
+
 exec "$HERE/usr/bin/bopwire_player" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
@@ -109,7 +144,11 @@ fi
 
 if [ -n "${LINUXDEPLOY:-}" ] && [ -x "$LINUXDEPLOY" ]; then
     echo "[appimage] running linuxdeploy to bundle runtime libs"
-    "$LINUXDEPLOY" --appdir "$APPDIR" --executable "$APPDIR/usr/bin/bopwire_player"
+    LD_EXECS=(--executable "$APPDIR/usr/bin/bopwire_player")
+    for b in gnome-keyring-daemon dbus-launch dbus-daemon; do
+        [ -f "$APPDIR/usr/bin/$b" ] && LD_EXECS+=(--executable "$APPDIR/usr/bin/$b")
+    done
+    "$LINUXDEPLOY" --appdir "$APPDIR" "${LD_EXECS[@]}"
 fi
 
 OUTPUT="build/bopwire-player-${VERSION}-x86_64.AppImage"
